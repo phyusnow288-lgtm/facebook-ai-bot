@@ -84,7 +84,7 @@ def get_ai_reply(message):
 
 
 def send_facebook_message(recipient_id, message_text):
-    url = "https://graph.facebook.com/v23.0/me/messages"
+    url = "https://graph.facebook.com/v25.0/me/messages"
 
     params = {
         "access_token": PAGE_ACCESS_TOKEN
