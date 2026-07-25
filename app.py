@@ -30,7 +30,6 @@ def verify_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-
     print("=== WEBHOOK POST RECEIVED ===", flush=True)
 
     data = request.get_json(silent=True)
@@ -46,33 +45,14 @@ def webhook():
         return "EVENT_RECEIVED", 200
 
     for entry in data.get("entry", []):
-
         for messaging_event in entry.get("messaging", []):
 
-            sender_id = messaging_event.get(
-                "sender", {}
-            ).get("id")
+            sender_id = messaging_event.get("sender", {}).get("id")
+            message = messaging_event.get("message", {}).get("text")
 
-            message = messaging_event.get(
-                "message", {}
-            ).get("text")
-
-            print(
-                "=== CUSTOMER MESSAGE ===",
-                flush=True
-            )
-
-            print(
-                "SENDER ID:",
-                sender_id,
-                flush=True
-            )
-
-            print(
-                "MESSAGE:",
-                message,
-                flush=True
-            )
+            print("=== CUSTOMER MESSAGE ===", flush=True)
+            print("SENDER ID:", sender_id, flush=True)
+            print("MESSAGE:", message, flush=True)
 
             if sender_id and message:
 
@@ -83,40 +63,15 @@ def webhook():
 
                 reply = get_ai_reply(message)
 
-                print(
-                    "=== AI REPLY ===",
-                    flush=True
-                )
-
-                print(
-                    reply,
-                    flush=True
-                )
+                print("=== AI REPLY ===", flush=True)
+                print(reply, flush=True)
 
                 send_facebook_message(
                     sender_id,
                     reply
                 )
 
-                send_facebook_message(
-    sender_id,
-    reply
-)
-
-if (
-    "order" in message.lower()
-    or "မှာယူ" in message
-(sad)
-
-    send_telegram_message(
-        f"📦 New Order\n\n"
-        f"Customer: {sender_id}\n"
-        f"Message: {message}"
-    )
-                    
-                    
-    
-
+                if "order" in message.lower() or "မှာယူ" in message:
                     send_telegram_message(
                         f"📦 New Order\n\n"
                         f"Customer: {sender_id}\n"
@@ -127,14 +82,9 @@ if (
 
 
 def get_ai_reply(message):
-
-    print(
-        "=== CALLING OPENAI API ===",
-        flush=True
-    )
+    print("=== CALLING OPENAI API ===", flush=True)
 
     if not OPENAI_API_KEY:
-
         print(
             "ERROR: OPENAI_API_KEY IS MISSING",
             flush=True
@@ -145,23 +95,16 @@ def get_ai_reply(message):
             "AI စနစ်ကို ချိတ်ဆက်၍မရသေးပါ။"
         )
 
-    url = (
-        "https://api.openai.com/v1/chat/completions"
-    )
+    url = "https://api.openai.com/v1/chat/completions"
 
     headers = {
-        "Authorization": (
-            f"Bearer {OPENAI_API_KEY}"
-        ),
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json"
     }
 
     payload = {
-
         "model": "gpt-4o-mini",
-
         "messages": [
-
             {
                 "role": "system",
                 "content": (
@@ -172,7 +115,6 @@ def get_ai_reply(message):
                     "and orders."
                 )
             },
-
             {
                 "role": "user",
                 "content": message
@@ -181,7 +123,6 @@ def get_ai_reply(message):
     }
 
     try:
-
         response = requests.post(
             url,
             headers=headers,
@@ -202,13 +143,9 @@ def get_ai_reply(message):
         )
 
         if response.status_code == 200:
-
             result = response.json()
 
-            return (
-                result["choices"][0]
-                ["message"]["content"]
-            )
+            return result["choices"][0]["message"]["content"]
 
         return (
             "တောင်းပန်ပါတယ်။ "
@@ -216,7 +153,6 @@ def get_ai_reply(message):
         )
 
     except Exception as e:
-
         print(
             "OPENAI EXCEPTION:",
             str(e),
@@ -229,32 +165,23 @@ def get_ai_reply(message):
         )
 
 
-def send_facebook_message(
-    recipient_id,
-    message_text
-(sad)
-
-    url = (
-        "https://graph.facebook.com/v25.0/me/messages"
-    )
+def send_facebook_message(recipient_id, message_text):
+    url = "https://graph.facebook.com/v25.0/me/messages"
 
     params = {
         "access_token": PAGE_ACCESS_TOKEN
     }
 
     data = {
-
         "recipient": {
             "id": recipient_id
         },
-
         "message": {
             "text": message_text
         }
     }
 
     try:
-
         response = requests.post(
             url,
             params=params,
@@ -275,7 +202,6 @@ def send_facebook_message(
         )
 
     except Exception as e:
-
         print(
             "FACEBOOK SEND ERROR:",
             str(e),
@@ -284,21 +210,17 @@ def send_facebook_message(
 
 
 def send_telegram_message(message):
-
     url = (
         f"https://api.telegram.org/"
         f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     )
 
     data = {
-
         "chat_id": TELEGRAM_CHAT_ID,
-
         "text": message
     }
 
     try:
-
         response = requests.post(
             url,
             json=data,
@@ -318,7 +240,6 @@ def send_telegram_message(message):
         )
 
     except Exception as e:
-
         print(
             "TELEGRAM ERROR:",
             str(e),
@@ -327,7 +248,6 @@ def send_telegram_message(message):
 
 
 if __name__ == "__main__":
-
     port = int(
         os.environ.get(
             "PORT",
@@ -339,4 +259,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
-
