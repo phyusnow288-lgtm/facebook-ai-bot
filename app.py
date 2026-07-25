@@ -30,6 +30,7 @@ def verify_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+
     print("=== WEBHOOK POST RECEIVED ===", flush=True)
 
     data = request.get_json(silent=True)
@@ -41,64 +42,123 @@ def webhook():
         print("NO DATA RECEIVED", flush=True)
         return "EVENT_RECEIVED", 200
 
-    if data.get("object") == "page":
+    if data.get("object") != "page":
+        return "EVENT_RECEIVED", 200
 
-        for entry in data.get("entry", []):
+    for entry in data.get("entry", []):
 
-            for messaging_event in entry.get("messaging", []):
+        for messaging_event in entry.get("messaging", []):
 
-                sender_id = messaging_event.get("sender", {}).get("id")
-                message = messaging_event.get("message", {}).get("text")
+            sender_id = messaging_event.get(
+                "sender", {}
+            ).get("id")
 
-                print("=== CUSTOMER MESSAGE ===", flush=True)
-                print("SENDER ID:", sender_id, flush=True)
-                print("MESSAGE:", message, flush=True)
+            message = messaging_event.get(
+                "message", {}
+            ).get("text")
 
-                if sender_id and message:
+            print(
+                "=== CUSTOMER MESSAGE ===",
+                flush=True
+            )
 
-                    print("=== PROCESSING CUSTOMER MESSAGE ===", flush=True)
+            print(
+                "SENDER ID:",
+                sender_id,
+                flush=True
+            )
 
-                    reply = get_ai_reply(message)
+            print(
+                "MESSAGE:",
+                message,
+                flush=True
+            )
 
-                    print("=== AI REPLY ===", flush=True)
-                    print(reply, flush=True)
+            if sender_id and message:
 
-                    send_facebook_message(
-                        sender_id,
-                        reply
+                print(
+                    "=== PROCESSING CUSTOMER MESSAGE ===",
+                    flush=True
+                )
+
+                reply = get_ai_reply(message)
+
+                print(
+                    "=== AI REPLY ===",
+                    flush=True
+                )
+
+                print(
+                    reply,
+                    flush=True
+                )
+
+                send_facebook_message(
+                    sender_id,
+                    reply
+                )
+
+                if (
+                    "order" in message.lower()
+                    or "မှာယူ" in message
+                (sad)
+
+                    send_telegram_message(
+                        f"📦 New Order\n\n"
+                        f"Customer: {sender_id}\n"
+                        f"Message: {message}"
                     )
-
-                    if "order" in message.lower() or "မှာယူ" in message:
-
-                        send_telegram_message(
-                            f"📦 New Order\n\n"
-                            f"Customer: {sender_id}\n"
-                            f"Message: {message}"
-                        )
 
     return "EVENT_RECEIVED", 200
 
 
 def get_ai_reply(message):
 
-    url = "https://api.openai.com/v1/chat/completions"
+    print(
+        "=== CALLING OPENAI API ===",
+        flush=True
+    )
+
+    if not OPENAI_API_KEY:
+
+        print(
+            "ERROR: OPENAI_API_KEY IS MISSING",
+            flush=True
+        )
+
+        return (
+            "တောင်းပန်ပါတယ်။ "
+            "AI စနစ်ကို ချိတ်ဆက်၍မရသေးပါ။"
+        )
+
+    url = (
+        "https://api.openai.com/v1/chat/completions"
+    )
 
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Authorization": (
+            f"Bearer {OPENAI_API_KEY}"
+        ),
         "Content-Type": "application/json"
     }
 
-    data = {
+    payload = {
+
         "model": "gpt-4o-mini",
+
         "messages": [
+
             {
                 "role": "system",
                 "content": (
-                    "You are a helpful sales assistant for a Myanmar online shop. "
+                    "You are a helpful sales assistant "
+                    "for a Myanmar online shop. "
                     "Reply politely in Burmese. "
-                    "Help customers with product questions and orders."
+                    "Help customers with product questions "
+                    "and orders."
                 )
             },
+
             {
                 "role": "user",
                 "content": message
@@ -106,65 +166,107 @@ def get_ai_reply(message):
         ]
     }
 
-    response = requests.post(
-        url,
-        headers=headers,
-        json=data
+    try:
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        print(
+            "OPENAI STATUS:",
+            response.status_code,
+            flush=True
+        )
+
+        print(
+            "OPENAI RESPONSE:",
+            response.text,
+            flush=True
+        )
+
+        if response.status_code == 200:
+
+            result = response.json()
+
+            return (
+                result["choices"][0]
+                ["message"]["content"]
+            )
+
+        return (
+            "တောင်းပန်ပါတယ်။ "
+            "ခဏနေရင် ပြန်လည်ဖြေကြားပေးပါမယ်။"
+        )
+
+    except Exception as e:
+
+        print(
+            "OPENAI EXCEPTION:",
+            str(e),
+            flush=True
+        )
+
+        return (
+            "တောင်းပန်ပါတယ်။ "
+            "ခဏနေရင် ပြန်လည်ဖြေကြားပေးပါမယ်။"
+        )
+
+
+def send_facebook_message(
+    recipient_id,
+    message_text
+(sad)
+
+    url = (
+        "https://graph.facebook.com/v25.0/me/messages"
     )
-
-    print(
-        "OPENAI STATUS:",
-        response.status_code,
-        flush=True
-    )
-
-    if response.status_code == 200:
-
-        return response.json()["choices"][0]["message"]["content"]
-
-    print(
-        "OPENAI ERROR:",
-        response.text,
-        flush=True
-    )
-
-    return "တောင်းပန်ပါတယ်။ ခဏနေရင် ပြန်လည်ဖြေကြားပေးပါမယ်။"
-
-
-def send_facebook_message(recipient_id, message_text):
-
-    url = "https://graph.facebook.com/v25.0/me/messages"
 
     params = {
         "access_token": PAGE_ACCESS_TOKEN
     }
 
     data = {
+
         "recipient": {
             "id": recipient_id
         },
+
         "message": {
             "text": message_text
         }
     }
 
-    response = requests.post(
-        url,
-        params=params,
-        json=data
-    )
+    try:
 
-    print(
-        "FACEBOOK SEND STATUS:",
-        response.status_code,
-        flush=True
-    )
+        response = requests.post(
+            url,
+            params=params,
+            json=data,
+            timeout=30
+        )
 
-    print(
-        "FACEBOOK SEND RESPONSE:",
-        response.text,
-        flush=True
-    )
+        print(
+            "FACEBOOK SEND STATUS:",
+            response.status_code,
+            flush=True
+        )
+
+        print(
+            "FACEBOOK SEND RESPONSE:",
+            response.text,
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            "FACEBOOK SEND ERROR:",
+            str(e),
+            flush=True
+        )
 
 
 def send_telegram_message(message):
@@ -175,26 +277,39 @@ def send_telegram_message(message):
     )
 
     data = {
+
         "chat_id": TELEGRAM_CHAT_ID,
+
         "text": message
     }
 
-    response = requests.post(
-        url,
-        json=data
-    )
+    try:
 
-    print(
-        "TELEGRAM STATUS:",
-        response.status_code,
-        flush=True
-    )
+        response = requests.post(
+            url,
+            json=data,
+            timeout=30
+        )
 
-    print(
-        "TELEGRAM RESPONSE:",
-        response.text,
-        flush=True
-    )
+        print(
+            "TELEGRAM STATUS:",
+            response.status_code,
+            flush=True
+        )
+
+        print(
+            "TELEGRAM RESPONSE:",
+            response.text,
+            flush=True
+        )
+
+    except Exception as e:
+
+        print(
+            "TELEGRAM ERROR:",
+            str(e),
+            flush=True
+        )
 
 
 if __name__ == "__main__":
