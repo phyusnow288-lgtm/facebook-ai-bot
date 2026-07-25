@@ -98,10 +98,24 @@ def webhook():
                     reply
                 )
 
-                if (
-                    "order" in message.lower()
-                    or "မှာယူ" in message
-                (sad)
+                send_facebook_message(
+    sender_id,
+    reply
+)
+
+if (
+    "order" in message.lower()
+    or "မှာယူ" in message
+(sad)
+
+    send_telegram_message(
+        f"📦 New Order\n\n"
+        f"Customer: {sender_id}\n"
+        f"Message: {message}"
+    )
+                    
+                    
+    
 
                     send_telegram_message(
                         f"📦 New Order\n\n"
