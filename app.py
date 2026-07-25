@@ -197,7 +197,7 @@ def send_telegram_message(message):
     )
 
 
-if name == "main":
+if __name__ == "__main__":
 
     port = int(
         os.environ.get(
