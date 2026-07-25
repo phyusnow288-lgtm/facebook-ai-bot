@@ -30,9 +30,12 @@ def verify_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    print("POST WEBHOOK HIT", flush=True)
+    print("=== WEBHOOK POST RECEIVED ===", flush=True)
+
     data = request.get_json(silent=True)
-    print("WEBHOOK DATA:", data, flush=True)
+    print("DATA:", data, flush=True)
+
+    return "EVENT_RECEIVED", 200
 
     if data.get("object") == "page":
         for entry in data.get("entry", []):
