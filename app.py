@@ -327,7 +327,7 @@ Never invent a product code.
             
             ""
         ).replace(
-            "
+            
 ",
             ""
         ).strip()
