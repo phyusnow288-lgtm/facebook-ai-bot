@@ -1,6 +1,7 @@
 import os
 import requests
 from flask import Flask, request
+import csv
 
 app = Flask(__name__)
 
@@ -9,8 +10,34 @@ PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+GOOGLE_SHEET_URL = os.environ.get("GOOGLE_SHEET_URL")
+PRODUCTS = {}
+def load_products():
+    global PRODUCTS
+    try:
+        url = GOOGLE_SHEET_URL
+        if "/edit" in url:
+            url = url.split("/edit")[0] + "/export?format=csv"
 
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
 
+        lines = response.text.splitlines()
+        reader = csv.DictReader(lines)
+
+        PRODUCTS = {}
+        for row in reader:
+            code = str(row.get("Code", "")).strip()
+            if code:
+                PRODUCTS[code] = row
+
+        print("PRODUCTS LOADED:", len(PRODUCTS), flush=True)
+
+    except Exception as e:
+        print("SHEET ERROR:", e, flush=True)
+        
+load_products()
+        
 @app.route("/", methods=["GET"])
 def home():
     return "Facebook AI Bot is running!", 200
