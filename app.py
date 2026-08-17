@@ -323,10 +323,7 @@ Never invent a product code.
             .strip()
         )
 
-        answer = answer.replace(
-            
-            ""
-       answer = answer.strip()
+        answer = answer.strip()
         result = json.loads(answer)
 
         code = result.get("code")
