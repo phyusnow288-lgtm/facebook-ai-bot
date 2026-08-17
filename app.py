@@ -446,14 +446,7 @@ Never invent a code.
             .strip()
         )
 
-        answer = answer.replace(
-            "
-            ""
-        ).replace(
-            "
-",
-            ""
-        ).strip()
+     answer = answer.strip()
 
         result = json.loads(answer)
 
