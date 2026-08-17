@@ -123,11 +123,11 @@ def get_ai_reply(message):
         )
         for code, product in PRODUCTS.items():
             if code in message:
-            name = product.get("Product Name", "")
-            price = product.get("Price", "")
-            yangon = product.get("Yangon Delivery", "")
-            other = product.get("Other City Delivery", "")
-            status = product.get("Stock status", "").strip().lower()
+               name = product.get("Product Name", "")
+               price = product.get("Price", "")
+               yangon = product.get("Yangon Delivery", "")
+               other = product.get("Other City Delivery", "")
+               status = product.get("Stock status", "").strip().lower()
 
             if status == "out of stock":
                 return f"Code {code} {name} လက်ရှိပစ္စည်းကုန်နေပါတယ်ရှင်။"
