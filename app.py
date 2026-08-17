@@ -132,6 +132,69 @@ def product_catalog_for_ai():
     return "\n".join(rows)
 
 
+def google_drive_direct_url(url):
+    url = str(url or "").strip()
+    if not url:
+        return ""
+
+    match = re.search(r"/file/d/([^/]+)", url)
+    if match:
+        file_id = match.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    match = re.search(r"[?&]id=([^&]+)", url)
+    if match:
+        file_id = match.group(1)
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+    return url
+
+
+def image_catalog_for_ai(limit=16):
+    items = []
+    for code, product in PRODUCTS.items():
+        image_url = (
+            product.get("Image URL", "")
+            or product.get("ImageURL", "")
+            or product.get("image_url", "")
+        )
+        image_url = google_drive_direct_url(image_url)
+        if not image_url:
+            continue
+
+        items.append(
+            {
+                "code": code,
+                "name": str(product.get("Product Name", "")).strip(),
+                "image_url": image_url,
+            }
+        )
+
+        if len(items) >= limit:
+            break
+
+    return items
+
+
+def download_image_as_data_url(url):
+    if not url:
+        return ""
+
+    try:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "image/jpeg")
+        if not content_type.startswith("image/"):
+            content_type = "image/jpeg"
+
+        import base64
+        encoded = base64.b64encode(response.content).decode("ascii")
+        return f"data:{content_type};base64,{encoded}"
+    except Exception as e:
+        print("IMAGE DOWNLOAD ERROR:", str(e), flush=True)
+        return ""
+
+
 def product_reply(code, product):
     name = str(product.get("Product Name", "")).strip()
     price = str(product.get("Price", "")).strip()
@@ -240,23 +303,50 @@ def ai_find_product_from_image(image_url, caption=""):
     if not OPENAI_API_KEY:
         return None, None
 
-    catalog = product_catalog_for_ai()
-    instruction = f"""
-A customer sent this image to an online shop.
-Identify which product from the catalog is shown.
-It may be a product photo, Facebook screenshot, Burmese text,
-English text, Chinese text, product code, or advertisement.
+    customer_data_url = download_image_as_data_url(image_url)
+    if not customer_data_url:
+        return None, None
 
-PRODUCT CATALOG:
-{catalog}
+    catalog_items = image_catalog_for_ai()
 
-Customer text:
-{caption}
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "You are matching a customer's product image to this shop's catalog. "
+                "First inspect the CUSTOMER IMAGE. Then compare it with the REFERENCE "
+                "IMAGES below. Return only one JSON object with a code field. "
+                "If no reference is a confident match, use null. Never invent a code. "
+                f"Customer text: {caption}"
+            ),
+        },
+        {
+            "type": "text",
+            "text": "CUSTOMER IMAGE:",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": customer_data_url},
+        },
+    ]
 
-Return only a JSON object containing the matching code.
-If uncertain, return a null code.
-Never invent a product code.
-"""
+    for item in catalog_items:
+        ref_data_url = download_image_as_data_url(item["image_url"])
+        if not ref_data_url:
+            continue
+
+        content.append(
+            {
+                "type": "text",
+                "text": f'REFERENCE PRODUCT: Code {item["code"]} | {item["name"]}',
+            }
+        )
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": ref_data_url},
+            }
+        )
 
     payload = {
         "model": "gpt-4o-mini",
@@ -264,10 +354,7 @@ Never invent a product code.
         "messages": [
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": instruction},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ],
+                "content": content,
             }
         ],
         "max_tokens": 100,
@@ -281,7 +368,7 @@ Never invent a product code.
                 "Content-Type": "application/json",
             },
             json=payload,
-            timeout=45,
+            timeout=60,
         )
 
         print("IMAGE AI STATUS:", response.status_code, flush=True)
@@ -479,4 +566,7 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
+
+
 
