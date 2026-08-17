@@ -1,4 +1,3 @@
-
 import os
 import re
 import csv
@@ -138,6 +137,13 @@ def product_reply(code, product):
     price = str(product.get("Price", "")).strip()
     yangon = str(product.get("Yangon Delivery", "")).strip()
     other = str(product.get("Other City Delivery", "")).strip()
+
+    # Fallback delivery fees if the Google Sheet cell/header is blank.
+    if not yangon:
+        yangon = "5000"
+    if not other:
+        other = "7500"
+
     status = str(product.get("Stock status", "")).strip().lower()
 
     if status in ("out of stock", "sold out"):
@@ -473,3 +479,4 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
+
