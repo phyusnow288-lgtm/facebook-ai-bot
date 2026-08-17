@@ -15,6 +15,8 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GOOGLE_SHEET_URL = os.environ.get("GOOGLE_SHEET_URL")
 
 PRODUCTS = {}
+ORDER_SESSIONS = {}
+
 
 
 def normalize_code(value):
@@ -195,34 +197,40 @@ def download_image_as_data_url(url):
         return ""
 
 
+def get_product_image_url(product):
+    image_url = (
+        product.get("Image URL", "")
+        or product.get("ImageURL", "")
+        or product.get("image_url", "")
+    )
+    return google_drive_direct_url(image_url)
+
+
 def product_reply(code, product):
     name = str(product.get("Product Name", "")).strip()
-    price = str(product.get("Price", "")).strip()
-    yangon = str(product.get("Yangon Delivery", "")).strip()
-    other = str(product.get("Other City Delivery", "")).strip()
 
-    # Fallback delivery fees if the Google Sheet cell/header is blank.
-    if not yangon:
-        yangon = "5000"
-    if not other:
-        other = "7500"
+    def amount(key, default):
+        try:
+            return int(float(str(product.get(key, default)).replace(",", "").strip() or default))
+        except Exception:
+            return default
 
-    status = str(product.get("Stock status", "")).strip().lower()
+    price = amount("Price", 0)
+    yangon_delivery = amount("Yangon Delivery", 5000)
+    other_delivery = amount("Other City Delivery", 7500)
 
-    if status in ("out of stock", "sold out"):
-        return f"Code {code} {name}\nလက်ရှိ ပစ္စည်းကုန်နေပါတယ်ရှင်။"
+    yangon_total = price + yangon_delivery
+    other_total = price + other_delivery
 
-    if status == "coming soon":
-        return f"Code {code} {name}\nလက်ရှိ ပစ္စည်းမရောက်သေးပါရှင်။"
-
-    reply = f"Code {code} {name}\nဈေးနှုန်း - {price} Ks"
-    if yangon:
-        reply += f"\nရန်ကုန်ပိုခ - {yangon} Ks"
-    if other:
-        reply += f"\nနယ်ပိုခ - {other} Ks"
-    reply += "\nပစ္စည်းရောက်မှ ငွေချေ (COD) ရပါတယ်ရှင်။"
-    return reply
-
+    return (
+        f"Code {code} {name}\n\n"
+        f"ဈေးနှုန်း - {price:,} Ks\n\n"
+        f"ရန်ကုန်ပို့ခ - {yangon_delivery:,} Ks\n"
+        f"ရန်ကုန် စုစုပေါင်း - {yangon_total:,} Ks\n\n"
+        f"နယ်ပို့ခ - {other_delivery:,} Ks\n"
+        f"နယ် စုစုပေါင်း - {other_total:,} Ks\n\n"
+        "ပစ္စည်းရောက်မှ ငွေချေ (COD) ရပါတယ်ရှင်။"
+    )
 
 def parse_json_answer(answer):
     answer = str(answer or "").strip()
@@ -453,34 +461,306 @@ def get_reply(message=None, image_url=None):
         code, product = find_product_by_code(message)
         if product:
             print("PRODUCT FOUND BY CODE:", code, flush=True)
-            return product_reply(code, product)
+            return {
+                "type": "product",
+                "code": code,
+                "product": product,
+            }
 
         code, product = find_product_by_name(message)
         if product:
             print("PRODUCT FOUND BY NAME:", code, flush=True)
-            return product_reply(code, product)
+            return {
+                "type": "product",
+                "code": code,
+                "product": product,
+            }
 
     if image_url:
         code, product = ai_find_product_from_image(image_url, message)
         if product:
             print("PRODUCT FOUND FROM IMAGE:", code, flush=True)
-            return product_reply(code, product)
+            return {
+                "type": "product",
+                "code": code,
+                "product": product,
+            }
 
-        return (
-            "ပုံထဲကပစ္စည်းကို သေချာမခွဲနိုင်သေးပါရှင်။ "
-            "ပစ္စည်းနာမည် သို့မဟုတ် Code လေးပို့ပေးပါရှင်။"
-        )
+        return {
+            "type": "text",
+            "text": (
+                "ပုံထဲကပစ္စည်းကို သေချာမခွဲနိုင်သေးပါရှင်။ "
+                "ပစ္စည်းနာမည် သို့မဟုတ် Code လေးပို့ပေးပါရှင်။"
+            ),
+        }
 
     if message:
         code, product = ai_find_product(message)
         if product:
             print("PRODUCT FOUND BY AI:", code, flush=True)
-            return product_reply(code, product)
+            return {
+                "type": "product",
+                "code": code,
+                "product": product,
+            }
 
-    return normal_ai_reply(message)
+    return {
+        "type": "text",
+        "text": normal_ai_reply(message),
+    }
 
 
-def send_facebook_message(recipient_id, message_text):
+
+
+def get_order_session(sender_id):
+    return ORDER_SESSIONS.setdefault(
+        sender_id,
+        {
+            "name": "",
+            "address": "",
+            "phone": "",
+            "delivery_area": "",
+            "items": {},
+            "last_product_code": "",
+        },
+    )
+
+
+def parse_int_amount(value, default=0):
+    try:
+        return int(float(str(value or default).replace(",", "").strip()))
+    except Exception:
+        return default
+
+
+def product_price(code):
+    product = PRODUCTS.get(code, {})
+    return parse_int_amount(product.get("Price", 0), 0)
+
+
+def delivery_fee_for_area(area):
+    area = str(area or "").lower().strip()
+    if area == "yangon":
+        return 5000
+    if area == "other":
+        return 7500
+    return 0
+
+
+def find_codes_and_quantities(text):
+    text = str(text or "")
+    found = {}
+
+    # Examples supported:
+    # 0002, 0002 x2, 0002*2, 0002 2pcs, 0002 2ခု, 0002 နှစ်ခု
+    for code in PRODUCTS.keys():
+        if code not in text:
+            continue
+
+        qty = 1
+        escaped = re.escape(code)
+        patterns = [
+            rf"{escaped}\s*[xX*]\s*(\d+)",
+            rf"{escaped}\s+(\d+)\s*(?:pcs|pc|ခု|စုံ)",
+            rf"{escaped}\s*[-:]\s*(\d+)",
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                qty = max(1, int(match.group(1)))
+                break
+
+        found[code] = qty
+
+    return found
+
+
+def extract_order_fields_with_ai(message):
+    if not OPENAI_API_KEY or not message:
+        return {}
+
+    catalog_lines = []
+    for code, product in PRODUCTS.items():
+        catalog_lines.append(
+            f'{code}: {product.get("Product Name", "")}'
+        )
+
+    prompt = f"""
+Extract order information from this Burmese/English customer message.
+
+PRODUCTS:
+{chr(10).join(catalog_lines)}
+
+Return only one JSON object using this shape:
+{{
+  "name": "",
+  "address": "",
+  "phone": "",
+  "delivery_area": "",
+  "items": [{{"code": "0001", "quantity": 1}}]
+}}
+
+Rules:
+- delivery_area must be "yangon", "other", or "".
+- Use "yangon" only when the address clearly indicates Yangon.
+- Use "other" when the address clearly indicates outside Yangon.
+- If unknown, use "".
+- quantity must be an integer at least 1.
+- Never invent customer details or product codes.
+- If a field is absent, leave it empty.
+"""
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": str(message)},
+        ],
+        "max_tokens": 250,
+    }
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+
+        if response.status_code != 200:
+            print("ORDER EXTRACT STATUS:", response.status_code, flush=True)
+            print("ORDER EXTRACT RESPONSE:", response.text, flush=True)
+            return {}
+
+        answer = response.json()["choices"][0]["message"]["content"]
+        result = parse_json_answer(answer)
+        return result if isinstance(result, dict) else {}
+
+    except Exception as e:
+        print("ORDER EXTRACT ERROR:", str(e), flush=True)
+        return {}
+
+
+def merge_order_message(sender_id, message):
+    session = get_order_session(sender_id)
+
+    # Direct code/quantity parsing first.
+    for code, qty in find_codes_and_quantities(message).items():
+        session["items"][code] = qty
+
+    # AI extraction for name/address/phone/area and more flexible item wording.
+    extracted = extract_order_fields_with_ai(message)
+
+    for field in ("name", "address", "phone", "delivery_area"):
+        value = str(extracted.get(field, "") or "").strip()
+        if value:
+            session[field] = value
+
+    for item in extracted.get("items", []) or []:
+        code = normalize_code(item.get("code", ""))
+        if code in PRODUCTS:
+            try:
+                qty = max(1, int(item.get("quantity", 1)))
+            except Exception:
+                qty = 1
+            session["items"][code] = qty
+
+    return session
+
+
+def order_missing_fields(session):
+    missing = []
+    if not session.get("name"):
+        missing.append("အမည်")
+    if not session.get("address"):
+        missing.append("လိပ်စာ")
+    if not session.get("phone"):
+        missing.append("ဖုန်းနံပါတ်")
+    if not session.get("items"):
+        missing.append("ပစ္စည်း")
+    if not session.get("delivery_area"):
+        missing.append("ရန်ကုန်/နယ်")
+    return missing
+
+
+def build_telegram_order(session):
+    delivery_area = session.get("delivery_area", "")
+    delivery_fee = delivery_fee_for_area(delivery_area)
+
+    name = session.get("name", "")
+    address = session.get("address", "")
+    phone = session.get("phone", "")
+
+    # First line exactly in the requested compact style.
+    first_line = f"{name} / {address} / {phone}"
+
+    item_parts = []
+    subtotal = 0
+    total_pcs = 0
+
+    for code, qty in session.get("items", {}).items():
+        product = PRODUCTS.get(code, {})
+        item_name = str(product.get("Product Name", "")).strip()
+        unit_price = product_price(code)
+        item_total = unit_price * qty
+        subtotal += item_total
+        total_pcs += qty
+
+        if qty == 1:
+            item_parts.append(
+                f"{code} {item_name} {unit_price:,} Ks"
+            )
+        else:
+            item_parts.append(
+                f"{code} {item_name} x{qty} = {item_total:,} Ks"
+            )
+
+    grand_total = subtotal + delivery_fee
+
+    if len(item_parts) == 1:
+        item_text = item_parts[0]
+    else:
+        item_text = " + ".join(item_parts)
+
+    second_line = (
+        f"{item_text} + Deli {delivery_fee:,} Ks "
+        f"= Total {grand_total:,} Ks"
+    )
+
+    if len(session.get("items", {})) > 1:
+        cod_text = f"COD {len(session['items'])} Items"
+        if total_pcs != len(session["items"]):
+            cod_text += f" / {total_pcs} PCS"
+    elif total_pcs > 1:
+        cod_text = f"COD {total_pcs} PCS"
+    else:
+        cod_text = "COD"
+
+    return f"{first_line} / {second_line} / {cod_text}"
+
+
+
+def order_prompt_for_missing(missing):
+    if not missing:
+        return ""
+
+    if "ရန်ကုန်/နယ်" in missing:
+        return "ပို့ရမယ့်နေရာက ရန်ကုန်လား၊ နယ်လားရှင်။"
+
+    return (
+        "အော်ဒါအတွက် "
+        + " / ".join(missing)
+        + " လေးပို့ပေးပါရှင်။"
+    )
+
+
+
+def send_facebook_text(recipient_id, message_text):
     if not PAGE_ACCESS_TOKEN:
         print("PAGE_ACCESS_TOKEN MISSING", flush=True)
         return
@@ -495,10 +775,47 @@ def send_facebook_message(recipient_id, message_text):
             },
             timeout=30,
         )
-        print("FACEBOOK SEND STATUS:", response.status_code, flush=True)
-        print("FACEBOOK SEND RESPONSE:", response.text, flush=True)
+        print("FACEBOOK TEXT STATUS:", response.status_code, flush=True)
+        print("FACEBOOK TEXT RESPONSE:", response.text, flush=True)
     except Exception as e:
-        print("FACEBOOK SEND ERROR:", str(e), flush=True)
+        print("FACEBOOK TEXT ERROR:", str(e), flush=True)
+
+
+def send_facebook_image(recipient_id, image_url):
+    if not PAGE_ACCESS_TOKEN or not image_url:
+        return
+
+    try:
+        response = requests.post(
+            "https://graph.facebook.com/v25.0/me/messages",
+            params={"access_token": PAGE_ACCESS_TOKEN},
+            json={
+                "recipient": {"id": recipient_id},
+                "message": {
+                    "attachment": {
+                        "type": "image",
+                        "payload": {
+                            "url": image_url,
+                            "is_reusable": True,
+                        },
+                    }
+                },
+            },
+            timeout=30,
+        )
+        print("FACEBOOK IMAGE STATUS:", response.status_code, flush=True)
+        print("FACEBOOK IMAGE RESPONSE:", response.text, flush=True)
+    except Exception as e:
+        print("FACEBOOK IMAGE ERROR:", str(e), flush=True)
+
+
+def send_product_response(recipient_id, code, product):
+    image_url = get_product_image_url(product)
+    if image_url:
+        send_facebook_image(recipient_id, image_url)
+
+    send_facebook_text(recipient_id, product_reply(code, product))
+
 
 
 def send_telegram_message(message):
@@ -526,6 +843,16 @@ def webhook():
     if not data or data.get("object") != "page":
         return "EVENT_RECEIVED", 200
 
+    order_words = (
+        "order",
+        "မှာယူ",
+        "မှာမယ်",
+        "ယူမယ်",
+        "အော်ဒါ",
+        "ယူပါမယ်",
+        "လိုချင်တယ်",
+    )
+
     for entry in data.get("entry", []):
         for event in entry.get("messaging", []):
             sender_id = event.get("sender", {}).get("id")
@@ -548,17 +875,76 @@ def webhook():
             print("TEXT:", text, flush=True)
             print("IMAGE:", image_url, flush=True)
 
-            if sender_id and (text or image_url):
-                reply = get_reply(text, image_url)
-                print("BOT REPLY:", reply, flush=True)
-                send_facebook_message(sender_id, reply)
+            if not sender_id or not (text or image_url):
+                continue
 
-                lower_text = str(text).lower()
-                order_words = ("order", "မှာယူ", "မှာမယ်", "ယူမယ်")
-                if any(word in lower_text for word in order_words):
-                    send_telegram_message(
-                        f"New Order\n\nCustomer ID: {sender_id}\nMessage: {text}"
+            session = get_order_session(sender_id)
+
+            # First identify/respond to the product.
+            reply = get_reply(text, image_url)
+            print("BOT REPLY:", reply, flush=True)
+
+            if reply.get("type") == "product":
+                code = reply["code"]
+                product = reply["product"]
+                session["last_product_code"] = code
+                send_product_response(sender_id, code, product)
+            else:
+                send_facebook_text(
+                    sender_id,
+                    reply.get("text", "ခဏလေးစောင့်ပေးပါရှင်။"),
+                )
+
+            lower_text = str(text).lower()
+            is_order_message = any(word in lower_text for word in order_words)
+
+            # If there is already an active order, keep collecting details
+            # from following messages too.
+            active_order = bool(
+                session.get("items")
+                or session.get("name")
+                or session.get("address")
+                or session.get("phone")
+            )
+
+            if is_order_message or active_order:
+                session = merge_order_message(sender_id, text)
+
+                # "ယူမယ်" after viewing a product means 1 of last viewed item.
+                if (
+                    is_order_message
+                    and not session["items"]
+                    and session.get("last_product_code") in PRODUCTS
+                ):
+                    session["items"][session["last_product_code"]] = 1
+
+                missing = order_missing_fields(session)
+
+                if missing:
+                    send_facebook_text(
+                        sender_id,
+                        order_prompt_for_missing(missing),
                     )
+                else:
+                    telegram_text = build_telegram_order(session)
+                    send_telegram_message(telegram_text)
+
+                    send_facebook_text(
+                        sender_id,
+                        "အော်ဒါတင်ပြီးပါပြီရှင်။ ကျေးဇူးတင်ပါတယ်ရှင်။",
+                    )
+
+                    # Clear completed order so the next order starts fresh.
+                    ORDER_SESSIONS[sender_id] = {
+                        "name": "",
+                        "address": "",
+                        "phone": "",
+                        "delivery_area": "",
+                        "items": {},
+                        "last_product_code": session.get(
+                            "last_product_code", ""
+                        ),
+                    }
 
     return "EVENT_RECEIVED", 200
 
@@ -566,7 +952,3 @@ def webhook():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
