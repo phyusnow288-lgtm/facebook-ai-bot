@@ -122,7 +122,7 @@ def get_ai_reply(message):
             "AI စနစ်ကို ချိတ်ဆက်၍မရသေးပါ။"
         )
         for code, product in PRODUCTS.items():
-        if code in message:
+            if code in message:
             name = product.get("Product Name", "")
             price = product.get("Price", "")
             yangon = product.get("Yangon Delivery", "")
