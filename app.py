@@ -108,8 +108,10 @@ def get_ai_reply(message):
             {
                 "role": "system",
                 "content": (
-                  "Always reply in Burmese. Keep replies very short. If the customer has not clearly specified a product or product code, reply only: 'ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင့်။' Do not explain anything extra."
-                )
+                  "Always reply in Burmese. Keep every reply very short. "
+"If the customer has not clearly said which product they want, reply exactly: "
+"ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။ "
+"Do not explain extra information unless the customer specifically asks for it."
             },
             {
                 "role": "user",
