@@ -108,11 +108,7 @@ def get_ai_reply(message):
             {
                 "role": "system",
                 "content": (
-                    "You are a helpful sales assistant "
-                    "for a Myanmar online shop. "
-                    "Reply politely in Burmese. "
-                    "Help customers with product questions "
-                    "and orders."
+                  "Always reply in Burmese. Keep replies very short. If the customer has not clearly specified a product or product code, reply only: 'ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင့်။' Do not explain anything extra."
                 )
             },
             {
