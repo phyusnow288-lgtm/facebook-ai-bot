@@ -16,6 +16,8 @@ GOOGLE_SHEET_URL = os.environ.get("GOOGLE_SHEET_URL")
 
 PRODUCTS = {}
 ORDER_SESSIONS = {}
+PROCESSED_MESSAGE_IDS = set()
+
 
 
 
@@ -315,16 +317,22 @@ def ai_find_product_from_image(image_url, caption=""):
     if not customer_data_url:
         return None, None
 
+    catalog_text = product_catalog_for_ai()
     catalog_items = image_catalog_for_ai()
 
     content = [
         {
             "type": "text",
             "text": (
-                "You are matching a customer's product image to this shop's catalog. "
-                "First inspect the CUSTOMER IMAGE. Then compare it with the REFERENCE "
-                "IMAGES below. Return only one JSON object with a code field. "
-                "If no reference is a confident match, use null. Never invent a code. "
+                "Identify which product from this shop catalog is shown in the CUSTOMER IMAGE. "
+                "The customer may send a direct product photo, screenshot, or a photo of another screen. "
+                "Use BOTH visual understanding and the catalog text below. "
+                "If reference images are provided, use them as extra evidence, but do not require an exact pixel match. "
+                "Return only one JSON object with a code field. "
+                "If one catalog product is the best clear match, return its code. "
+                "Only return null when the image truly cannot be matched. "
+                "Never invent a code.\n\n"
+                f"CATALOG:\n{catalog_text}\n\n"
                 f"Customer text: {caption}"
             ),
         },
@@ -338,6 +346,7 @@ def ai_find_product_from_image(image_url, caption=""):
         },
     ]
 
+    # Add available reference images as supporting evidence.
     for item in catalog_items:
         ref_data_url = download_image_as_data_url(item["image_url"])
         if not ref_data_url:
@@ -346,7 +355,7 @@ def ai_find_product_from_image(image_url, caption=""):
         content.append(
             {
                 "type": "text",
-                "text": f'REFERENCE PRODUCT: Code {item["code"]} | {item["name"]}',
+                "text": f'REFERENCE: Code {item["code"]} | {item["name"]}',
             }
         )
         content.append(
@@ -400,7 +409,6 @@ def ai_find_product_from_image(image_url, caption=""):
         print("IMAGE AI ERROR:", str(e), flush=True)
 
     return None, None
-
 
 def normal_ai_reply(message):
     if not OPENAI_API_KEY:
@@ -834,6 +842,27 @@ def send_telegram_message(message):
         print("TELEGRAM ERROR:", str(e), flush=True)
 
 
+
+def is_duplicate_message(message_data):
+    message_id = str(message_data.get("mid", "") or "").strip()
+
+    if not message_id:
+        return False
+
+    if message_id in PROCESSED_MESSAGE_IDS:
+        print("DUPLICATE MESSAGE IGNORED:", message_id, flush=True)
+        return True
+
+    PROCESSED_MESSAGE_IDS.add(message_id)
+
+    # Prevent unbounded memory growth on a long-running service.
+    if len(PROCESSED_MESSAGE_IDS) > 5000:
+        PROCESSED_MESSAGE_IDS.clear()
+        PROCESSED_MESSAGE_IDS.add(message_id)
+
+    return False
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True)
@@ -859,6 +888,9 @@ def webhook():
             message_data = event.get("message", {})
 
             if message_data.get("is_echo"):
+                continue
+
+            if is_duplicate_message(message_data):
                 continue
 
             text = message_data.get("text", "")
