@@ -326,12 +326,9 @@ Never invent a product code.
         answer = answer.replace(
             
             ""
-        ).replace(
-            
-",
-            ""
-        ).strip()
-
+        answer = answer.replace("
+json", "").replace("
+", "").strip()
         result = json.loads(answer)
 
         code = result.get("code")
