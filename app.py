@@ -324,7 +324,7 @@ Never invent a product code.
         )
 
         answer = answer.replace(
-            "
+            
             ""
         ).replace(
             "
