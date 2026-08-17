@@ -121,6 +121,27 @@ def get_ai_reply(message):
             "တောင်းပန်ပါတယ်။ "
             "AI စနစ်ကို ချိတ်ဆက်၍မရသေးပါ။"
         )
+        for code, product in PRODUCTS.items():
+        if code in message:
+            name = product.get("Product Name", "")
+            price = product.get("Price", "")
+            yangon = product.get("Yangon Delivery", "")
+            other = product.get("Other City Delivery", "")
+            status = product.get("Stock status", "").strip().lower()
+
+            if status == "out of stock":
+                return f"Code {code} {name} လက်ရှိပစ္စည်းကုန်နေပါတယ်ရှင်။"
+
+            if status == "coming soon":
+                return f"Code {code} {name} လက်ရှိမရောက်သေးပါရှင်။"
+
+            return (
+                f"Code {code} {name}\n"
+                f"ဈေးနှုန်း - {price} Ks\n"
+                f"ရန်ကုန်ပိုခ - {yangon} Ks\n"
+                f"နယ်ပိုခ - {other} Ks\n"
+                f"ပစ္စည်းရောက်မှ ငွေချေ (COD) ရပါတယ်ရှင်။"
+            )
 
     url = "https://api.openai.com/v1/chat/completions"
 
