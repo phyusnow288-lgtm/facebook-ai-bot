@@ -116,7 +116,7 @@ def load_products(force=False):
         return
 
     try:
-        response = requests.get(sheet_export_url(GOOGLE_SHEET_URL), timeout=60)
+        response = requests.get(sheet_export_url(GOOGLE_SHEET_URL), timeout=20)
         response.raise_for_status()
 
         reader = csv.DictReader(response.text.splitlines())
@@ -1013,15 +1013,16 @@ def build_telegram_order(session):
     delivery_area = str(session.get("delivery_area", "")).strip().lower()
     delivery_fee = delivery_fee_for_area(delivery_area)
 
-    name = session.get("name", "")
-    address = session.get("address", "")
-    phone = session.get("phone", "")
+    name = str(session.get("name", "") or "").strip()
+    address = str(session.get("address", "") or "").strip()
+    phone = str(session.get("phone", "") or "").strip()
 
     item_parts = []
     subtotal = 0
     total_pcs = 0
 
     for code, qty in session.get("items", {}).items():
+        code = normalize_code(code)
         product = PRODUCTS.get(code, {})
 
         item_name = str(
@@ -1034,35 +1035,31 @@ def build_telegram_order(session):
         subtotal += item_total
         total_pcs += qty
 
-        if qty == 1:
+        if qty > 1:
             item_parts.append(
-                f"{code} {item_name} {unit_price:,} Ks"
+                f"(Code {code}) {item_name} စျေးနှုန်း {unit_price} Ks * {qty}"
             )
         else:
             item_parts.append(
-                f"{code} {item_name} x{qty} = {item_total:,} Ks"
+                f"(Code {code}) {item_name} စျေးနှုန်း {unit_price} Ks"
             )
 
     grand_total = subtotal + delivery_fee
-
     items_text = " + ".join(item_parts)
 
-    if len(session.get("items", {})) > 1:
-        cod_text = f"COD {len(session['items'])} Items"
+    if delivery_area == "yangon":
+        delivery_text = f"ပို့ဆောင်ခ ရန်ကုန် {delivery_fee}Ks"
+    else:
+        delivery_text = f"ပို့ဆောင်ခ နယ် {delivery_fee}Ks"
 
-        if total_pcs != len(session["items"]):
-            cod_text += f" / {total_pcs} PCS"
-
-    elif total_pcs > 1:
+    if total_pcs > 1:
         cod_text = f"COD {total_pcs} PCS"
-
     else:
         cod_text = "COD"
 
     return (
-        f"{name} / {address} / {phone} / "
-        f"{items_text} + Deli {delivery_fee:,} Ks "
-        f"= Total {grand_total:,} Ks / {cod_text}"
+        f"{name}/{address}/{phone}/"
+        f"{items_text} + {delivery_text} = {grand_total}Ks / {cod_text}"
     )
 
 
@@ -1088,6 +1085,27 @@ GREETING_WORDS = (
     "ဟလို",
 )
 
+ADMIN_TRIGGER_WORDS = (
+    "admin",
+    "အက်မင်",
+    "လူနဲ့ပြော",
+    "လူနဲ့ပြောမယ်",
+    "လူနဲ့ပြောချင်",
+    "လူနဲ့ဆက်သွယ်",
+    "ဝန်ထမ်း",
+    "တာဝန်ရှိသူ",
+    "ပိုင်ရှင်",
+    "ဖုန်းပြော",
+    "ဖုန်းဆက်",
+    "complaint",
+    "တိုင်မယ်",
+)
+
+
+def wants_admin(text):
+    lower = str(text or "").lower()
+    return any(word in lower for word in ADMIN_TRIGGER_WORDS)
+
 
 def is_order_message(text):
     lower = str(text or "").lower()
@@ -1106,10 +1124,11 @@ def simple_greeting(text):
 def handoff_to_admin(sender_id):
     send_facebook_text(
         sender_id,
-        "Admin ကို လွှဲပေးထားပါတယ်ရှင်။"
+        "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
     )
 
-    # Stay out of the conversation while admin handles it.
+    # After this exact sentence is sent, a human Admin should take over.
+    # The bot stays silent for ADMIN_PAUSE_MINUTES after a manual Page reply.
     pause_for_admin(sender_id)
 
 
@@ -1162,20 +1181,21 @@ def webhook():
     print("=== WEBHOOK POST RECEIVED ===", flush=True)
     print(data, flush=True)
 
-   if not data or data.get("object") != "page":
-         return {
+    if not data or data.get("object") != "page":
+        return {
             "version": "v2",
             "content": {
                 "messages": [
                     {
                         "type": "text",
-                        "text": "EVENT_RECEIVED"
+                        "text": "EVENT_RECEIVED",
                     }
                 ]
-            }
+            },
         }, 200
 
     load_products()
+
     for entry in data.get("entry", []):
         for event in entry.get("messaging", []):
             message_data = event.get("message", {})
@@ -1250,19 +1270,20 @@ def webhook():
                 code, product = ai_find_product_from_text(text)
 
             # ---------------------------------
-            # PRODUCT FOUND
+            # EXPLICIT ADMIN REQUEST
+            # ---------------------------------
+            if wants_admin(text):
+                handoff_to_admin(sender_id)
+                continue
+
+            # ---------------------------------
+            # PRODUCT / ORDER HANDLING
+            # Keep one customer-facing text reply per incoming message.
+            # Product photo + its single text reply still count as one product response.
             # ---------------------------------
             if product:
                 session["last_product_code"] = code
-                send_product_response(sender_id, code, product)
 
-                # If the same message also says "ယူမယ် / order", start order.
-                if is_order_message(text):
-                    session["items"].setdefault(code, 1)
-
-            # ---------------------------------
-            # ORDER COLLECTION
-            # ---------------------------------
             active_order = bool(
                 session.get("items")
                 or session.get("name")
@@ -1270,10 +1291,15 @@ def webhook():
                 or session.get("phone")
             )
 
-            if is_order_message(text) or active_order:
+            order_intent = is_order_message(text) or active_order
+
+            if order_intent:
+                if product and is_order_message(text):
+                    session["items"].setdefault(code, 1)
+
                 session = merge_order_message(sender_id, text)
 
-                # Customer says "ယူမယ်" after viewing a product.
+                # Customer says "ယူမယ်" after previously viewing a product.
                 if (
                     is_order_message(text)
                     and not session["items"]
@@ -1284,12 +1310,10 @@ def webhook():
                 missing = order_missing_fields(session)
 
                 if missing:
-                    # If product details were already sent, this is the only extra line.
                     send_facebook_text(
                         sender_id,
                         order_prompt_for_missing(missing),
                     )
-
                 else:
                     telegram_text = build_telegram_order(session)
 
@@ -1298,15 +1322,13 @@ def webhook():
                             sender_id,
                             "အော်ဒါတင်ပြီးပါပြီရှင်။ ကျေးဇူးတင်ပါတယ်ရှင်။",
                         )
-
                         ORDER_SESSIONS[sender_id] = new_order_session()
 
                 continue
 
-            # ---------------------------------
-            # IF PRODUCT WAS FOUND, WE ARE DONE.
-            # ---------------------------------
+            # Product question only: send product image + one text reply.
             if product:
+                send_product_response(sender_id, code, product)
                 continue
 
             # ---------------------------------
@@ -1319,8 +1341,8 @@ def webhook():
                 continue
 
             # ---------------------------------
-            # ANY OTHER QUESTION -> ADMIN
-            # No extra product-use explanation from AI.
+            # SHOPPING-UNRELATED / UNKNOWN -> ADMIN
+            # Bot does not improvise unrelated answers.
             # ---------------------------------
             handoff_to_admin(sender_id)
 
@@ -1334,4 +1356,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
-
