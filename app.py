@@ -1162,7 +1162,7 @@ def webhook():
     print("=== WEBHOOK POST RECEIVED ===", flush=True)
     print(data, flush=True)
 
-   if not data or data.get("object") != "page":
+  if not data or data.get("object") != "page":
         return {
             "version": "v2",
             "content": {
@@ -1176,7 +1176,6 @@ def webhook():
         }, 200
 
     load_products()
-
     for entry in data.get("entry", []):
         for event in entry.get("messaging", []):
             message_data = event.get("message", {})
