@@ -1154,28 +1154,9 @@ def manychat_text(text):
 
 
 def manychat_product_response(code, product):
-    messages = []
-
-    image_url = product_image_url(product)
-    if image_url:
-        # ManyChat Dynamic Block accepts HTTPS image URLs.
-        image_url = google_drive_view_url(image_url)
-        messages.append(
-            {
-                "type": "image",
-                "url": image_url,
-                "buttons": [],
-            }
-        )
-
-    messages.append(
-        {
-            "type": "text",
-            "text": product_reply(code, product),
-        }
-    )
-
-    return manychat_response(messages)
+    # TEMP TEST: text-only response to isolate ManyChat live Dynamic Block errors.
+    # If this works in Messenger, the remaining issue is the image URL / image payload.
+    return manychat_text(product_reply(code, product))
 
 
 def handle_manychat_request(data):
