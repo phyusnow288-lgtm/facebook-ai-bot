@@ -1132,6 +1132,154 @@ def handoff_to_admin(sender_id):
     pause_for_admin(sender_id)
 
 
+
+# =========================
+# MANYCHAT DYNAMIC BLOCK
+# =========================
+def manychat_response(messages=None):
+    return {
+        "version": "v2",
+        "content": {
+            "messages": messages or [],
+            "actions": [],
+            "quick_replies": [],
+        },
+    }
+
+
+def manychat_text(text):
+    return manychat_response(
+        [{"type": "text", "text": str(text or "")}]
+    )
+
+
+def manychat_product_response(code, product):
+    messages = []
+
+    image_url = product_image_url(product)
+    if image_url:
+        # ManyChat Dynamic Block accepts HTTPS image URLs.
+        image_url = google_drive_view_url(image_url)
+        messages.append(
+            {
+                "type": "image",
+                "url": image_url,
+                "buttons": [],
+            }
+        )
+
+    messages.append(
+        {
+            "type": "text",
+            "text": product_reply(code, product),
+        }
+    )
+
+    return manychat_response(messages)
+
+
+def handle_manychat_request(data):
+    """
+    ManyChat POST body:
+    {
+        "message": "<Last Text Input>",
+        "contact_id": "<Contact Id>"
+    }
+    """
+    load_products()
+
+    message = str(data.get("message", "") or "").strip()
+    contact_id = str(data.get("contact_id", "") or "").strip()
+
+    if not contact_id:
+        return manychat_text(
+            "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
+        )
+
+    # After handoff, bot stays silent while Admin handles the contact.
+    if admin_is_active(contact_id):
+        print("MANYCHAT ADMIN ACTIVE - BOT SILENT:", contact_id, flush=True)
+        return manychat_response([])
+
+    session = get_order_session(contact_id)
+
+    # Explicit request for a human.
+    if wants_admin(message):
+        pause_for_admin(contact_id)
+        return manychat_text(
+            "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
+        )
+
+    # 1) Code
+    code, product = find_product_by_code(message)
+
+    # 2) Product name
+    if not product:
+        code, product = find_product_by_name(message)
+
+    # 3) Flexible Burmese / English / Chinese / description matching
+    if not product and message:
+        code, product = ai_find_product_from_text(message)
+
+    if product:
+        session["last_product_code"] = code
+
+    active_order = bool(
+        session.get("items")
+        or session.get("name")
+        or session.get("address")
+        or session.get("phone")
+    )
+
+    order_intent = is_order_message(message) or active_order
+
+    # Order collection: return only ONE text reply for this incoming message.
+    if order_intent:
+        if product and is_order_message(message):
+            session["items"].setdefault(code, 1)
+
+        session = merge_order_message(contact_id, message)
+
+        if (
+            is_order_message(message)
+            and not session["items"]
+            and session.get("last_product_code") in PRODUCTS
+        ):
+            session["items"][session["last_product_code"]] = 1
+
+        missing = order_missing_fields(session)
+
+        if missing:
+            return manychat_text(order_prompt_for_missing(missing))
+
+        telegram_text = build_telegram_order(session)
+
+        if send_telegram_message(telegram_text):
+            ORDER_SESSIONS[contact_id] = new_order_session()
+            return manychat_text(
+                "အော်ဒါတင်ပြီးပါပြီရှင်။ ကျေးဇူးတင်ပါတယ်ရှင်။"
+            )
+
+        pause_for_admin(contact_id)
+        return manychat_text(
+            "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
+        )
+
+    # Product question: image + one product text reply.
+    if product:
+        return manychat_product_response(code, product)
+
+    greeting = simple_greeting(message)
+    if greeting:
+        return manychat_text(greeting)
+
+    # Anything unrelated to shopping or unclear goes to Admin.
+    pause_for_admin(contact_id)
+    return manychat_text(
+        "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
+    )
+
+
 # =========================
 # DEDUP
 # =========================
@@ -1181,18 +1329,13 @@ def webhook():
     print("=== WEBHOOK POST RECEIVED ===", flush=True)
     print(data, flush=True)
 
+    # ManyChat Dynamic Block request.
+    if isinstance(data, dict) and "message" in data and "contact_id" in data:
+        return handle_manychat_request(data), 200
+
+    # Unknown non-Meta request.
     if not data or data.get("object") != "page":
-        return {
-            "version": "v2",
-            "content": {
-                "messages": [
-                    {
-                        "type": "text",
-                        "text": "EVENT_RECEIVED",
-                    }
-                ]
-            },
-        }, 200
+        return manychat_text("EVENT_RECEIVED"), 200
 
     load_products()
 
@@ -1356,3 +1499,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
+
