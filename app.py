@@ -330,14 +330,12 @@ def merge_extracted_order_data(session, extracted):
 
 
 def buyer_order_confirmation(session):
-    """
-    Buyer sees the same copy-ready slash-separated order summary that is sent
-    to Telegram, plus a short confirmation line.
-    """
     return (
         build_telegram_order(session)
         + "\n\nအော်ဒါတင်ပြီးပါပြီရှင်။ ကျေးဇူးတင်ပါတယ်ရှင်။"
     )
+
+
 
 def download_image_bytes(url):
     url = google_drive_direct_url(url)
@@ -512,7 +510,7 @@ def openai_chat(messages, max_tokens=200, temperature=0):
                 "messages": messages,
                 "max_tokens": max_tokens,
             },
-            timeout=60,
+            timeout=8,
         )
 
         print("OPENAI STATUS:", response.status_code, flush=True)
@@ -707,9 +705,13 @@ def product_detail(product):
             "Details",
             "Product Detail",
             "Product Details",
+            "Description Myanmar",
+            "Myanmar Description",
+            "အသေးစိတ်",
         )
         or ""
     ).strip()
+
 
 
 def product_reply(code, product):
@@ -872,7 +874,7 @@ def send_facebook_image_url(recipient_id, image_url):
 
 
 def send_product_response(recipient_id, code, product):
-    # Requested order: image -> Google Sheet detail -> separate price/delivery/COD.
+    # Reply order: image -> Sheet detail -> price/delivery/COD -> order info prompt.
     image_url = product_image_url(product)
 
     if image_url:
@@ -896,6 +898,19 @@ def send_product_response(recipient_id, code, product):
 
     send_facebook_text(recipient_id, product_reply(code, product))
 
+    send_facebook_text(
+        recipient_id,
+        (
+            "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် / "
+            "အရေအတွက် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။ "
+            "အချက်အလက်ပြည့်စုံမှ အော်ဒါတင်ပြီး ပို့ဆောင်ပေးလို့ရပါတယ်ရှင်။"
+        ),
+    )
+
+
+# =========================
+# TELEGRAM
+# =========================
 
 # =========================
 # TELEGRAM
@@ -963,10 +978,12 @@ def admin_is_active(customer_id):
 
 def handle_echo_message(event, message_data):
     """
-    A Page-sent message creates an echo webhook event.
-    Bot-sent message IDs are tracked and ignored.
-    Any other Page-sent message is treated as a manual Admin reply,
-    so the bot pauses for that customer.
+    Page/Admin outgoing message handling.
+
+    Messages sent directly by this Python bot are tracked by message id and
+    ignored here. Any other Page-sent echo is treated as a human Admin reply.
+    The bot pauses for that customer for ADMIN_PAUSE_MINUTES. Every new manual
+    Admin reply refreshes the pause window.
     """
     mid = str(message_data.get("mid", "") or "").strip()
 
@@ -980,14 +997,20 @@ def handle_echo_message(event, message_data):
         or event.get("sender", {}).get("id")
     )
 
+    if not customer_id:
+        return
+
     pause_for_admin(customer_id)
 
-    print("MANUAL ADMIN MESSAGE DETECTED:", customer_id, flush=True)
+    print(
+        "MANUAL ADMIN MESSAGE DETECTED - BOT PAUSED:",
+        customer_id,
+        f"{ADMIN_PAUSE_MINUTES} minutes",
+        flush=True,
+    )
 
 
-# =========================
-# ORDER SESSION
-# =========================
+
 def new_order_session():
     return {
         "name": "",
@@ -1090,14 +1113,124 @@ Rules:
     return result if isinstance(result, dict) else {}
 
 
+
+def detect_delivery_area_from_text(value):
+    low = str(value or "").lower()
+
+    yangon_words = (
+        "ရန်ကုန်", "တာမွေ", "တောင်ဥက္ကလာ", "မြောက်ဥက္ကလာ",
+        "သင်္ဃန်းကျွန်း", "သဃ်ကျွန်း", "သင်္ဃန်း", "လှိုင်", "ကမာရွတ်",
+        "မရမ်းကုန်း", "အင်းစိန်", "သာကေတ", "ဒဂုံ", "လမ်းမတော်",
+        "ပန်းဘဲတန်း", "ကျောက်တံတား", "ဗဟန်း", "စမ်းချောင်း",
+        "မင်္ဂလာတောင်ညွန့်", "ကြည့်မြင်တိုင်", "အလုံ", "လှိုင်သာယာ",
+        "ရွှေပြည်သာ", "ဒလ", "မှော်ဘီ", "ထောက်ကြန့်",
+        "yangon", "tarmwe", "tamwe", "thingangyun",
+    )
+    if any(word in low for word in yangon_words):
+        return "yangon"
+
+    other_words = (
+        "မန္တလေး", "နေပြည်တော်", "ပဲခူး", "မော်လမြိုင်", "တောင်ကြီး",
+        "မကွေး", "စစ်ကိုင်း", "ပုသိမ်", "ပြည်", "မုံရွာ", "မိတ္ထီလာ",
+        "မြိတ်", "ထားဝယ်", "ဘားအံ", "လားရှိုး", "ကျိုင်းတုံ",
+        "mandalay", "naypyidaw", "bago", "mawlamyine",
+    )
+    if any(word in low for word in other_words):
+        return "other"
+
+    return ""
+
+
+def extract_order_fields_locally(message):
+    """
+    Fast deterministic parser for normal text orders.
+    Avoids an OpenAI call in the live ManyChat request path.
+    """
+    value = str(message or "").strip()
+    result = {
+        "name": "",
+        "address": "",
+        "phone": "",
+        "delivery_area": "",
+        "items": [],
+    }
+    if not value:
+        return result
+
+    # Normalize common separators but preserve Burmese text.
+    parts = [p.strip() for p in re.split(r"[/\n|]+", value) if p.strip()]
+
+    # Phone: Myanmar-style 09... or any 9-12 digit phone-like number.
+    phone_match = re.search(r"(?<!\d)(09[\d\s-]{7,12}\d)(?!\d)", value)
+    if not phone_match:
+        phone_match = re.search(r"(?<!\d)(\d[\d\s-]{8,13}\d)(?!\d)", value)
+    if phone_match:
+        result["phone"] = re.sub(r"[^\d+]", "", phone_match.group(1))
+
+    # Find any explicit product code/quantity in the message.
+    for code, qty in find_codes_and_quantities(value).items():
+        if code in PRODUCTS:
+            result["items"].append({"code": code, "quantity": qty})
+
+    # Remove phone-only and obvious item-only segments before assigning name/address.
+    clean_parts = []
+    for part in parts:
+        if result["phone"] and result["phone"] in re.sub(r"[^\d+]", "", part):
+            continue
+        if find_codes_and_quantities(part):
+            continue
+        clean_parts.append(part)
+
+    # First short segment is usually the customer name.
+    if clean_parts:
+        first = clean_parts[0].strip()
+        if len(first) <= 80 and not looks_like_order_details(first):
+            result["name"] = first
+            clean_parts = clean_parts[1:]
+
+    # Everything else becomes address.
+    if clean_parts:
+        result["address"] = " / ".join(clean_parts).strip()
+
+    # If line 1 looked address-like but line 0 is still likely a name, recover.
+    if not result["name"] and parts:
+        candidate = parts[0].strip()
+        digit_count = len(re.sub(r"\D", "", candidate))
+        if digit_count < 5 and len(candidate) <= 80:
+            result["name"] = candidate
+            remaining = [p for p in parts[1:] if result["phone"] not in re.sub(r"[^\d+]", "", p)]
+            if remaining:
+                result["address"] = " / ".join(remaining).strip()
+
+    result["delivery_area"] = detect_delivery_area_from_text(
+        result["address"] or value
+    )
+    return result
+
+
 def merge_order_message(sender_id, message):
     session = get_order_session(sender_id)
 
-    for code, qty in find_codes_and_quantities(message).items():
-        session["items"][code] = qty
+    # Fast local extraction first so ManyChat does not wait on OpenAI.
+    local = extract_order_fields_locally(message)
+    session = merge_extracted_order_data(session, local)
 
-    extracted = extract_order_fields_with_ai(message)
-    return merge_extracted_order_data(session, extracted)
+    # If key fields are still missing, AI may fill them, but only after local parsing.
+    still_missing_core = (
+        not session.get("name")
+        or not session.get("address")
+        or not session.get("phone")
+        or not session.get("delivery_area")
+    )
+
+    if still_missing_core and OPENAI_API_KEY:
+        try:
+            extracted = extract_order_fields_with_ai(message)
+            session = merge_extracted_order_data(session, extracted)
+        except Exception as e:
+            print("ORDER AI FALLBACK ERROR:", str(e), flush=True)
+
+    return session
 
 
 
@@ -1155,93 +1288,47 @@ def build_telegram_order(session):
     delivery_area = str(session.get("delivery_area", "")).strip().lower()
     delivery_fee = delivery_fee_for_area(delivery_area)
 
-    name = str(session.get("name", "") or "").strip()
-    address = str(session.get("address", "") or "").strip()
-    phone = str(session.get("phone", "") or "").strip()
+    name = str(session.get("name", "")).strip()
+    address = str(session.get("address", "")).strip()
+    phone = str(session.get("phone", "")).strip()
 
     item_parts = []
     subtotal = 0
     total_pcs = 0
 
     for code, qty in session.get("items", {}).items():
-        code = normalize_code(code)
         product = PRODUCTS.get(code, {})
-
         item_name = str(
             get_row_value(product, "Product Name", "Name")
         ).strip()
 
         unit_price = product_price(code)
         item_total = unit_price * qty
-
         subtotal += item_total
         total_pcs += qty
 
-        if qty > 1:
+        if qty == 1:
             item_parts.append(
-                f"(Code {code}) {item_name} စျေးနှုန်း {unit_price} Ks * {qty}"
+                f"Code {code} {item_name} {unit_price:,} Ks"
             )
         else:
             item_parts.append(
-                f"(Code {code}) {item_name} စျေးနှုန်း {unit_price} Ks"
+                f"Code {code} {item_name} {unit_price:,} Ks x {qty} = {item_total:,} Ks"
             )
 
     grand_total = subtotal + delivery_fee
     items_text = " + ".join(item_parts)
 
-    if delivery_area == "yangon":
-        delivery_text = f"ပို့ဆောင်ခ ရန်ကုန် {delivery_fee}Ks"
-    else:
-        delivery_text = f"ပို့ဆောင်ခ နယ် {delivery_fee}Ks"
-
+    cod_text = "COD"
     if total_pcs > 1:
         cod_text = f"COD {total_pcs} PCS"
-    else:
-        cod_text = "COD"
 
     return (
-        f"{name}/{address}/{phone}/"
-        f"{items_text} + {delivery_text} = {grand_total}Ks / {cod_text}"
+        f"{name} / {address} / {phone} / "
+        f"{items_text} + ပို့ဆောင်ခ {delivery_fee:,} Ks = "
+        f"{grand_total:,} Ks / {cod_text}"
     )
 
-
-# =========================
-# INTENT / HANDOFF
-# =========================
-ORDER_WORDS = (
-    "order",
-    "မှာယူ",
-    "မှာမယ်",
-    "ယူမယ်",
-    "အော်ဒါ",
-    "ယူပါမယ်",
-    "လိုချင်တယ်",
-    "လိုချင်ပါတယ်",
-    "ယူချင်တယ်",
-)
-
-GREETING_WORDS = (
-    "hi",
-    "hello",
-    "မင်္ဂလာပါ",
-    "ဟလို",
-)
-
-ADMIN_TRIGGER_WORDS = (
-    "admin",
-    "အက်မင်",
-    "လူနဲ့ပြော",
-    "လူနဲ့ပြောမယ်",
-    "လူနဲ့ပြောချင်",
-    "လူနဲ့ဆက်သွယ်",
-    "ဝန်ထမ်း",
-    "တာဝန်ရှိသူ",
-    "ပိုင်ရှင်",
-    "ဖုန်းပြော",
-    "ဖုန်းဆက်",
-    "complaint",
-    "တိုင်မယ်",
-)
 
 
 def wants_admin(text):
@@ -1296,10 +1383,11 @@ def manychat_text(text):
 
 
 def manychat_product_response(code, product):
-    # Requested order:
+    # Reply order:
     # 1) product image
     # 2) Google Sheet detail/description
-    # 3) separate price + delivery + COD message
+    # 3) price + delivery + COD
+    # 4) ask for complete order information
     messages = []
 
     image_url = product_public_image_url(code, product)
@@ -1328,8 +1416,68 @@ def manychat_product_response(code, product):
         }
     )
 
+    messages.append(
+        {
+            "type": "text",
+            "text": (
+                "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် / "
+                "အရေအတွက် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။ "
+                "အချက်အလက်ပြည့်စုံမှ အော်ဒါတင်ပြီး ပို့ဆောင်ပေးလို့ရပါတယ်ရှင်။"
+            ),
+        }
+    )
+
     return manychat_response(messages)
 
+
+
+def asks_delivery_time(text):
+    low = str(text or "").strip().lower()
+
+    phrases = (
+        "ဘယ်လောက်ကြာ",
+        "ဘယ်နှရက်",
+        "ဘယ်နရက်",
+        "ဘယ်တော့ရောက်",
+        "ဘယ်တော့ရောက်မလဲ",
+        "ဘယ်အချိန်ရောက်",
+        "ကြာမလား",
+        "ရောက်ဖို့ကြာ",
+        "delivery time",
+        "how long",
+        "how many days",
+        "when arrive",
+        "when will arrive",
+    )
+
+    return any(phrase in low for phrase in phrases)
+
+
+def delivery_time_reply(text):
+    low = str(text or "").lower()
+
+    yangon_words = (
+        "ရန်ကုန်", "တာမွေ", "တောင်ဥက္ကလာ", "မြောက်ဥက္ကလာ",
+        "သင်္ဃန်းကျွန်း", "လှိုင်", "ကမာရွတ်", "မရမ်းကုန်း",
+        "yangon", "tamwe", "tarmwe", "thingangyun",
+    )
+
+    other_words = (
+        "နယ်", "မန္တလေး", "နေပြည်တော်", "ပဲခူး", "မော်လမြိုင်",
+        "တောင်ကြီး", "မကွေး", "စစ်ကိုင်း", "ပုသိမ်", "ပြည်",
+        "mandalay", "naypyidaw", "bago", "mawlamyine",
+    )
+
+    if any(word in low for word in yangon_words):
+        return "ရန်ကုန်ဆို ၃ ရက်မှ ၅ ရက်အတွင်း ရောက်ပါတယ်ရှင်။"
+
+    if any(word in low for word in other_words):
+        return "နယ်ဆို ၄ ရက်မှ ၁၀ ရက်အတွင်း ရောက်ပါတယ်ရှင်။"
+
+    return (
+        "ရန်ကုန်ဆို ၃ ရက်မှ ၅ ရက်အတွင်း၊ "
+        "နယ်ဆို ၄ ရက်မှ ၁၀ ရက်အတွင်း ရောက်ပါတယ်ရှင်။"
+    )
 
 
 def handle_manychat_request(data):
@@ -1351,7 +1499,10 @@ def handle_manychat_request(data):
     incoming_image_url = str(
         data.get("image_url", "")
         or data.get("attachment_url", "")
+        or data.get("last_image_url", "")
+        or data.get("customer_image_url", "")
         or data.get("image", "")
+        or data.get("file_url", "")
         or ""
     ).strip()
 
@@ -1366,11 +1517,20 @@ def handle_manychat_request(data):
 
     session = get_order_session(contact_id)
 
+    print(
+        "MANYCHAT INPUT:",
+        {"message": message, "contact_id": contact_id, "image_url": incoming_image_url},
+        flush=True,
+    )
+
     if wants_admin(message):
         pause_for_admin(contact_id)
         return manychat_text(
             "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
         )
+
+    if asks_delivery_time(message):
+        return manychat_text(delivery_time_reply(message))
 
     # -------- Product recognition --------
     code, product = find_product_by_code(message)
@@ -1417,7 +1577,9 @@ def handle_manychat_request(data):
             session["items"][session["last_product_code"]] = 1
 
         if message:
+            print("ORDER TEXT RECEIVED:", message, flush=True)
             session = merge_order_message(contact_id, message)
+            print("ORDER SESSION AFTER TEXT:", session, flush=True)
 
         if incoming_image_url:
             extracted_from_image = extract_order_fields_from_image(
@@ -1441,11 +1603,13 @@ def handle_manychat_request(data):
                 session["items"][session["last_product_code"]] = max(1, qty)
 
         missing = order_missing_fields(session)
+        print("ORDER MISSING:", missing, flush=True)
 
         if missing:
             return manychat_text(order_prompt_for_missing(missing))
 
         telegram_text = build_telegram_order(session)
+        print("TELEGRAM ORDER TEXT:", telegram_text, flush=True)
 
         if send_telegram_message(telegram_text):
             buyer_text = buyer_order_confirmation(session)
@@ -1465,7 +1629,14 @@ def handle_manychat_request(data):
     if greeting:
         return manychat_text(greeting)
 
-    # Unknown / shopping-unrelated / explicit unresolved image -> Admin.
+    # If ManyChat triggered on a non-text message but did not pass the actual
+    # attachment URL, we cannot inspect the image. Do not hallucinate a product.
+    if not message and not incoming_image_url:
+        return manychat_text(
+            "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"
+        )
+
+    # Unknown / shopping-unrelated / unresolved image -> Admin.
     pause_for_admin(contact_id)
     return manychat_text(
         "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
@@ -1634,6 +1805,13 @@ def webhook():
                 handoff_to_admin(sender_id)
                 continue
 
+            if asks_delivery_time(text):
+                send_facebook_text(
+                    sender_id,
+                    delivery_time_reply(text),
+                )
+                continue
+
             # ---------------------------------
             # PRODUCT / ORDER HANDLING
             # Keep one customer-facing text reply per incoming message.
@@ -1729,6 +1907,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
+
 
 
 
