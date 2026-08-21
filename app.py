@@ -314,7 +314,9 @@ def merge_extracted_order_data(session, extracted):
         if value:
             session[field] = value
 
-    for item in extracted.get("items", []) or []:
+    extracted_items = extracted.get("items", []) or []
+
+    for item in extracted_items:
         code = normalize_code(item.get("code", ""))
         if code not in PRODUCTS:
             continue
@@ -326,7 +328,13 @@ def merge_extracted_order_data(session, extracted):
 
         session["items"][code] = qty
 
+    # Image/AI extraction only confirms quantity if an item/quantity was
+    # actually present in the order data, not merely because a product was viewed.
+    if extracted_items:
+        session["quantity_confirmed"] = True
+
     return session
+
 
 
 def buyer_order_confirmation(session):
@@ -874,12 +882,10 @@ def send_facebook_image_url(recipient_id, image_url):
 
 
 def send_product_response(recipient_id, code, product):
-    # Reply order: image -> Sheet detail -> price/delivery/COD -> order info prompt.
     image_url = product_image_url(product)
 
     if image_url:
         image_bytes, content_type = download_image_bytes(image_url)
-
         sent = False
 
         if image_bytes:
@@ -901,12 +907,16 @@ def send_product_response(recipient_id, code, product):
     send_facebook_text(
         recipient_id,
         (
-            "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် / "
-            "အရေအတွက် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။ "
-            "အချက်အလက်ပြည့်စုံမှ အော်ဒါတင်ပြီး ပို့ဆောင်ပေးလို့ရပါတယ်ရှင်။"
+            "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို "
+            "အပြည့်အစုံရေးပို့ပေးပါရှင်။ အရေအတွက် မရေးထားရင် 1 ခုအဖြစ် "
+            "အော်ဒါတင်ပေးပါမယ်ရှင်။ 2 ခုနှင့်အထက်ဆို x2 / 2 ခု လို့ရေးပေးပါရှင်။"
         ),
     )
 
+
+# =========================
+# TELEGRAM
+# =========================
 
 # =========================
 # TELEGRAM
@@ -1019,7 +1029,9 @@ def new_order_session():
         "delivery_area": "",
         "items": {},
         "last_product_code": "",
+        "quantity_confirmed": False,
     }
+
 
 
 def get_order_session(sender_id):
@@ -1058,6 +1070,51 @@ def find_codes_and_quantities(text):
         found[code] = qty
 
     return found
+
+
+def extract_explicit_quantity(text):
+    value = str(text or "")
+
+    patterns = [
+        r"[xX*]\s*(\d+)",
+        r"(\d+)\s*(?:pcs|pc|ခု|ကဒ်|စုံ)",
+        r"(?:qty|quantity)\s*[:=]?\s*(\d+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, value, flags=re.IGNORECASE)
+        if match:
+            return max(1, int(match.group(1)))
+
+    return None
+
+
+def is_pure_product_query(message, code, product):
+    """
+    A bare code/name request should always show the product, even if an old
+    incomplete order session exists. This prevents stale order state from
+    swallowing later product questions such as 0010 -> 0016.
+    """
+    value = str(message or "").strip()
+    if not value or not product:
+        return False
+
+    if is_order_message(value):
+        return False
+
+    if looks_like_order_details(value):
+        return False
+
+    if extract_explicit_quantity(value) is not None:
+        return False
+
+    normalized = normalize_code(value)
+    if normalized == code:
+        return True
+
+    # Product-name-only browsing also counts as a product question.
+    found_code, found_product = find_product_by_name(value)
+    return bool(found_product and found_code == code)
 
 
 def extract_order_fields_with_ai(message):
@@ -1208,27 +1265,58 @@ def extract_order_fields_locally(message):
     return result
 
 
+def is_quantity_only_message(text):
+    value = str(text or "").strip()
+
+    patterns = [
+        r"^[xX*]\s*\d+$",
+        r"^\d+\s*(?:pcs|pc|ခု|ကဒ်|စုံ)$",
+        r"^(?:qty|quantity)\s*[:=]?\s*\d+$",
+    ]
+
+    return any(
+        re.fullmatch(pattern, value, flags=re.IGNORECASE)
+        for pattern in patterns
+    )
+
+
 def merge_order_message(sender_id, message):
     session = get_order_session(sender_id)
 
-    # Fast local extraction first so ManyChat does not wait on OpenAI.
-    local = extract_order_fields_locally(message)
-    session = merge_extracted_order_data(session, local)
+    explicit_qty = extract_explicit_quantity(message)
 
-    # If key fields are still missing, AI may fill them, but only after local parsing.
-    still_missing_core = (
-        not session.get("name")
-        or not session.get("address")
-        or not session.get("phone")
-        or not session.get("delivery_area")
-    )
+    # A quantity-only follow-up (x2 / 2 ခု) must NEVER overwrite name/address.
+    if not is_quantity_only_message(message):
+        local = extract_order_fields_locally(message)
+        session = merge_extracted_order_data(session, local)
 
-    if still_missing_core and OPENAI_API_KEY:
-        try:
-            extracted = extract_order_fields_with_ai(message)
-            session = merge_extracted_order_data(session, extracted)
-        except Exception as e:
-            print("ORDER AI FALLBACK ERROR:", str(e), flush=True)
+        # If key identity/address fields are still missing, AI may fill them.
+        still_missing_core = (
+            not session.get("name")
+            or not session.get("address")
+            or not session.get("phone")
+            or not session.get("delivery_area")
+        )
+
+        if still_missing_core and OPENAI_API_KEY:
+            try:
+                extracted = extract_order_fields_with_ai(message)
+                session = merge_extracted_order_data(session, extracted)
+            except Exception as e:
+                print("ORDER AI FALLBACK ERROR:", str(e), flush=True)
+
+    if explicit_qty is not None:
+        target_code = session.get("last_product_code")
+        coded = find_codes_and_quantities(message)
+
+        if coded:
+            for code, qty in coded.items():
+                if code in PRODUCTS:
+                    session["items"][code] = qty
+        elif target_code in PRODUCTS:
+            session["items"][target_code] = explicit_qty
+
+        session["quantity_confirmed"] = True
 
     return session
 
@@ -1241,7 +1329,7 @@ def order_missing_fields(session):
         missing.append("အမည်")
 
     if not session.get("address"):
-        missing.append("လိပ်စာ")
+        missing.append("လိပ်စာအပြည့်အစုံ")
 
     if not session.get("phone"):
         missing.append("ဖုန်းနံပါတ်")
@@ -1255,6 +1343,7 @@ def order_missing_fields(session):
     return missing
 
 
+
 def order_prompt_for_missing(missing):
     if not missing:
         return ""
@@ -1262,11 +1351,15 @@ def order_prompt_for_missing(missing):
     if missing == ["ရန်ကုန်/နယ်"]:
         return "ပို့ရမယ့်နေရာက ရန်ကုန်လား၊ နယ်လားရှင်။"
 
+    if missing == ["အရေအတွက်"]:
+        return "မှာယူမယ့် အရေအတွက် ဘယ်နှခုလဲရှင်။ ဥပမာ 2 ခု / x2 လို့ ပို့ပေးပါရှင်။"
+
     return (
-        "အော်ဒါအတွက် "
+        "အော်ဒါတင်ပေးဖို့ "
         + " / ".join(missing)
-        + " လေးပို့ပေးပါရှင်။"
+        + " ကို အပြည့်အစုံပို့ပေးပါရှင်။"
     )
+
 
 
 def product_price(code):
@@ -1309,26 +1402,78 @@ def build_telegram_order(session):
 
         if qty == 1:
             item_parts.append(
-                f"Code {code} {item_name} {unit_price:,} Ks"
+                f"(Code {code}) {item_name} စျေးနှုန်း {unit_price} Ks"
             )
         else:
             item_parts.append(
-                f"Code {code} {item_name} {unit_price:,} Ks x {qty} = {item_total:,} Ks"
+                f"(Code {code}) {item_name} စျေးနှုန်း {unit_price} Ks * {qty}"
             )
 
     grand_total = subtotal + delivery_fee
     items_text = " + ".join(item_parts)
+
+    if delivery_area == "yangon":
+        delivery_text = f"ပို့ဆောင်ခ ရန်ကုန် {delivery_fee}Ks"
+    else:
+        delivery_text = f"ပို့ဆောင်ခ နယ် {delivery_fee}Ks"
 
     cod_text = "COD"
     if total_pcs > 1:
         cod_text = f"COD {total_pcs} PCS"
 
     return (
-        f"{name} / {address} / {phone} / "
-        f"{items_text} + ပို့ဆောင်ခ {delivery_fee:,} Ks = "
-        f"{grand_total:,} Ks / {cod_text}"
+        f"{name}/{address}/{phone}/"
+        f"{items_text} + {delivery_text} = {grand_total}Ks / {cod_text}"
     )
 
+
+
+# =========================
+# INTENT / HANDOFF
+# =========================
+ORDER_WORDS = (
+    "order",
+    "မှာယူ",
+    "မှာမယ်",
+    "ယူမယ်",
+    "အော်ဒါ",
+    "ယူပါမယ်",
+    "လိုချင်တယ်",
+    "လိုချင်ပါတယ်",
+    "ယူချင်တယ်",
+)
+
+GREETING_WORDS = (
+    "hi",
+    "hello",
+    "မင်္ဂလာပါ",
+    "ဟလို",
+)
+
+ADMIN_TRIGGER_WORDS = (
+    "admin",
+    "အက်မင်",
+    "အက်ဒမင်",
+    "လူနဲ့ပြော",
+    "လူနဲ့ပြောမယ်",
+    "လူနဲ့ပြောချင်",
+    "လူနဲ့ဆက်သွယ်",
+    "လူပြန်",
+    "လူကိုခေါ်",
+    "လူခေါ်",
+    "ဝန်ထမ်း",
+    "တာဝန်ရှိသူ",
+    "ပိုင်ရှင်",
+    "ဆိုင်ရှင်",
+    "staff",
+    "human",
+    "agent",
+    "customer service",
+    "ဖုန်းပြော",
+    "ဖုန်းဆက်",
+    "complaint",
+    "တိုင်မယ်",
+)
 
 
 def wants_admin(text):
@@ -1383,46 +1528,26 @@ def manychat_text(text):
 
 
 def manychat_product_response(code, product):
-    # Reply order:
-    # 1) product image
-    # 2) Google Sheet detail/description
-    # 3) price + delivery + COD
-    # 4) ask for complete order information
     messages = []
 
     image_url = product_public_image_url(code, product)
     if image_url:
         print("MANYCHAT PUBLIC IMAGE URL:", image_url, flush=True)
-        messages.append(
-            {
-                "type": "image",
-                "url": image_url,
-            }
-        )
+        messages.append({"type": "image", "url": image_url})
 
     detail = product_detail(product)
     if detail:
-        messages.append(
-            {
-                "type": "text",
-                "text": detail,
-            }
-        )
+        messages.append({"type": "text", "text": detail})
 
-    messages.append(
-        {
-            "type": "text",
-            "text": product_reply(code, product),
-        }
-    )
+    messages.append({"type": "text", "text": product_reply(code, product)})
 
     messages.append(
         {
             "type": "text",
             "text": (
-                "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် / "
-                "အရေအတွက် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။ "
-                "အချက်အလက်ပြည့်စုံမှ အော်ဒါတင်ပြီး ပို့ဆောင်ပေးလို့ရပါတယ်ရှင်။"
+                "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို "
+                "အပြည့်အစုံရေးပို့ပေးပါရှင်။ အရေအတွက် မရေးထားရင် 1 ခုအဖြစ် "
+                "အော်ဒါတင်ပေးပါမယ်ရှင်။ 2 ခုနှင့်အထက်ဆို x2 / 2 ခု လို့ရေးပေးပါရှင်။"
             ),
         }
     )
@@ -1482,15 +1607,14 @@ def delivery_time_reply(text):
 
 def handle_manychat_request(data):
     """
-    Supported ManyChat POST body:
-    {
-        "message": "<Last Text Input>",
-        "contact_id": "<Contact Id>",
-        "image_url": "<optional customer image/screenshot URL>"
-    }
+    ManyChat body:
+      message     = Last Text Input
+      contact_id  = Contact Id
+      image_url   = optional customer attachment URL
 
-    image_url is optional. If ManyChat can expose an attachment URL, send it
-    using this field and the bot can read order details from screenshots.
+    One incoming customer event produces one Dynamic Block response.
+    Product responses may contain image + detail + price + order prompt as
+    multiple message objects inside that single response.
     """
     load_products()
 
@@ -1506,22 +1630,23 @@ def handle_manychat_request(data):
         or ""
     ).strip()
 
-    if not contact_id:
-        return manychat_text(
-            "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
-        )
-
-    if admin_is_active(contact_id):
-        print("MANYCHAT ADMIN ACTIVE - BOT SILENT:", contact_id, flush=True)
-        return manychat_response([])
-
-    session = get_order_session(contact_id)
-
     print(
         "MANYCHAT INPUT:",
         {"message": message, "contact_id": contact_id, "image_url": incoming_image_url},
         flush=True,
     )
+
+    if not contact_id:
+        return manychat_text(
+            "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
+        )
+
+    # Pause is per customer id only. Other customers continue normally.
+    if admin_is_active(contact_id):
+        print("MANYCHAT ADMIN ACTIVE - BOT SILENT:", contact_id, flush=True)
+        return manychat_response([])
+
+    session = get_order_session(contact_id)
 
     if wants_admin(message):
         pause_for_admin(contact_id)
@@ -1547,6 +1672,12 @@ def handle_manychat_request(data):
     if not product and message:
         code, product = ai_find_product_from_text(message)
 
+    # A bare code/name is always browsing, never swallowed by stale order state.
+    if product and is_pure_product_query(message, code, product):
+        ORDER_SESSIONS[contact_id] = new_order_session()
+        ORDER_SESSIONS[contact_id]["last_product_code"] = code
+        return manychat_product_response(code, product)
+
     if product:
         session["last_product_code"] = code
 
@@ -1555,6 +1686,7 @@ def handle_manychat_request(data):
         or session.get("name")
         or session.get("address")
         or session.get("phone")
+        or session.get("quantity_confirmed")
     )
 
     last_product_ready = session.get("last_product_code") in PRODUCTS
@@ -1564,6 +1696,7 @@ def handle_manychat_request(data):
         or active_order
         or (last_product_ready and looks_like_order_details(message))
         or (last_product_ready and bool(incoming_image_url))
+        or (extract_explicit_quantity(message) is not None and last_product_ready)
     )
 
     # -------- Order collection --------
@@ -1571,10 +1704,10 @@ def handle_manychat_request(data):
         if product and is_order_message(message):
             session["items"].setdefault(code, 1)
 
-        # If buyer sends name/address/phone after viewing a product, assume
-        # that most recently viewed product unless another item is specified.
+        # After browsing a product, name/address/phone means ordering that product.
         if not session["items"] and last_product_ready:
             session["items"][session["last_product_code"]] = 1
+            session["quantity_confirmed"] = True
 
         if message:
             print("ORDER TEXT RECEIVED:", message, flush=True)
@@ -1591,16 +1724,19 @@ def handle_manychat_request(data):
                 extracted_from_image,
             )
 
-        # Support a later quantity-only message such as x5 / *5 / 5 pcs.
-        if session.get("last_product_code") in PRODUCTS:
-            qty_match = re.search(
-                r"(?:[xX*]\s*(\d+)|(\d+)\s*(?:pcs|pc|ခု|ကဒ်|စုံ))",
-                message,
-                flags=re.IGNORECASE,
-            )
-            if qty_match:
-                qty = int(qty_match.group(1) or qty_match.group(2))
-                session["items"][session["last_product_code"]] = max(1, qty)
+        explicit_qty = extract_explicit_quantity(message)
+        if explicit_qty is not None:
+            target_code = session.get("last_product_code")
+            coded = find_codes_and_quantities(message)
+
+            if coded:
+                for item_code, qty in coded.items():
+                    if item_code in PRODUCTS:
+                        session["items"][item_code] = qty
+            elif target_code in PRODUCTS:
+                session["items"][target_code] = explicit_qty
+
+            session["quantity_confirmed"] = True
 
         missing = order_missing_fields(session)
         print("ORDER MISSING:", missing, flush=True)
@@ -1621,7 +1757,7 @@ def handle_manychat_request(data):
             "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
         )
 
-    # -------- Product question --------
+    # Product recognized from a customer image/screenshot.
     if product:
         return manychat_product_response(code, product)
 
@@ -1629,14 +1765,13 @@ def handle_manychat_request(data):
     if greeting:
         return manychat_text(greeting)
 
-    # If ManyChat triggered on a non-text message but did not pass the actual
-    # attachment URL, we cannot inspect the image. Do not hallucinate a product.
+    # ManyChat must actually pass image_url for image recognition.
     if not message and not incoming_image_url:
         return manychat_text(
             "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"
         )
 
-    # Unknown / shopping-unrelated / unresolved image -> Admin.
+    # Shopping-unrelated / unknown / explicit unresolved request -> human.
     pause_for_admin(contact_id)
     return manychat_text(
         "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
@@ -1817,6 +1952,12 @@ def webhook():
             # Keep one customer-facing text reply per incoming message.
             # Product photo + its single text reply still count as one product response.
             # ---------------------------------
+            if product and is_pure_product_query(text, code, product):
+                ORDER_SESSIONS[sender_id] = new_order_session()
+                ORDER_SESSIONS[sender_id]["last_product_code"] = code
+                send_product_response(sender_id, code, product)
+                continue
+
             if product:
                 session["last_product_code"] = code
 
@@ -1842,6 +1983,7 @@ def webhook():
 
                 if not session["items"] and last_product_ready:
                     session["items"][session["last_product_code"]] = 1
+                    session["quantity_confirmed"] = True
 
                 if text:
                     session = merge_order_message(sender_id, text)
@@ -1855,6 +1997,20 @@ def webhook():
                         session,
                         extracted_from_image,
                     )
+
+                explicit_qty = extract_explicit_quantity(text)
+                if explicit_qty is not None:
+                    target_code = session.get("last_product_code")
+                    coded = find_codes_and_quantities(text)
+
+                    if coded:
+                        for item_code, qty in coded.items():
+                            if item_code in PRODUCTS:
+                                session["items"][item_code] = qty
+                    elif target_code in PRODUCTS:
+                        session["items"][target_code] = explicit_qty
+
+                    session["quantity_confirmed"] = True
 
                 missing = order_missing_fields(session)
 
