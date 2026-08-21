@@ -1163,7 +1163,7 @@ def webhook():
     print(data, flush=True)
 
     if not data or data.get("object") != "page":
-        return "EVENT_RECEIVED", 200
+        return {"status": "EVENT_RECEIVED"}, 200
 
     load_products()
 
