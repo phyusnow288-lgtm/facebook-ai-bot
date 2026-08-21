@@ -116,7 +116,7 @@ def load_products(force=False):
         return
 
     try:
-        response = requests.get(sheet_export_url(GOOGLE_SHEET_URL), timeout=20)
+        response = requests.get(sheet_export_url(GOOGLE_SHEET_URL), timeout=60)
         response.raise_for_status()
 
         reader = csv.DictReader(response.text.splitlines())
