@@ -6,7 +6,7 @@ import time
 import base64
 import mimetypes
 import requests
-from flask import Flask, request
+from flask import Flask, request, Response
 
 app = Flask(__name__)
 
@@ -174,13 +174,18 @@ def google_drive_direct_url(url):
 
 
 def google_drive_view_url(url):
+    """
+    Convert Google Drive share/view links to a direct image-serving URL.
+    ManyChat/Facebook often fails on drive.google.com/uc redirect URLs,
+    so use Googleusercontent directly when a Drive file id is available.
+    """
     url = str(url or "").strip()
     if not url:
         return ""
 
     file_id = google_drive_file_id(url)
     if file_id:
-        return f"https://drive.google.com/uc?export=view&id={file_id}"
+        return f"https://lh3.googleusercontent.com/d/{file_id}"
 
     return url
 
@@ -198,6 +203,141 @@ def product_image_url(product):
         or ""
     ).strip()
 
+
+
+def product_public_image_url(code, product):
+    """
+    Return a stable public HTTPS image URL served by this Render app.
+    This avoids ManyChat/Meta having to follow Google Drive redirects.
+    """
+    source = product_image_url(product)
+    if not source:
+        return ""
+
+    # Verify source image is actually downloadable before advertising it to ManyChat.
+    image_bytes, _content_type = download_image_bytes(source)
+    if not image_bytes:
+        return ""
+
+    base = request.host_url.rstrip("/")
+    return f"{base}/product-image/{normalize_code(code)}"
+
+
+def looks_like_order_details(message):
+    """
+    Detect a customer message that likely contains order details even if they
+    did not explicitly type 'order' / 'ယူမယ်'.
+    """
+    value = str(message or "").strip()
+    if not value:
+        return False
+
+    # Myanmar phone numbers / common local phone formatting.
+    digits = re.sub(r"\D", "", value)
+    if len(digits) >= 9:
+        return True
+
+    # Slash-separated copy-friendly order details.
+    if value.count("/") >= 2:
+        return True
+
+    address_words = (
+        "လမ်း", "ရပ်ကွက်", "မြို့နယ်", "မြို့", "ရွာ", "အမှတ်",
+        "တာမွေ", "သင်္ဃန်းကျွန်း", "ရန်ကုန်", "မန္တလေး",
+        "road", "street", "township", "yangon", "mandalay",
+    )
+    low = value.lower()
+    return any(word.lower() in low for word in address_words)
+
+
+def extract_order_fields_from_image(image_url, caption=""):
+    """
+    Read Name / Address / Phone / delivery area / optional item+qty from a
+    customer screenshot or photo. Returns only fields visible in the image.
+    """
+    if not OPENAI_API_KEY or not image_url:
+        return {}
+
+    customer_data_url = image_as_data_url(image_url)
+    if not customer_data_url:
+        return {}
+
+    load_products()
+
+    catalog_lines = []
+    for code, product in PRODUCTS.items():
+        catalog_lines.append(
+            f'{code}: {get_row_value(product, "Product Name", "Name")}'
+        )
+
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "Read this CUSTOMER ORDER SCREENSHOT/PHOTO. Extract only visible "
+                "customer order information. Do not invent anything. "
+                "Return ONLY one JSON object in this exact shape:\n"
+                '{'
+                '"name":"","address":"","phone":"","delivery_area":"",'
+                '"items":[{"code":"0001","quantity":1}]'
+                '}\n'
+                'delivery_area must be "yangon", "other", or "". '
+                "Use Yangon for Yangon addresses such as Tarmwe/Tamwe/Thingangyun. "
+                "Use other for clearly non-Yangon Myanmar addresses. "
+                "Never invent a product code. If no product is visible, items must be [].\n\n"
+                f"PRODUCTS:\n{chr(10).join(catalog_lines)}\n\n"
+                f"CAPTION/TEXT: {caption}"
+            ),
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": customer_data_url},
+        },
+    ]
+
+    answer = openai_chat(
+        [{"role": "user", "content": content}],
+        max_tokens=350,
+        temperature=0,
+    )
+
+    result = parse_json_answer(answer)
+    return result if isinstance(result, dict) else {}
+
+
+def merge_extracted_order_data(session, extracted):
+    if not isinstance(extracted, dict):
+        return session
+
+    for field in ("name", "address", "phone", "delivery_area"):
+        value = str(extracted.get(field, "") or "").strip()
+        if value:
+            session[field] = value
+
+    for item in extracted.get("items", []) or []:
+        code = normalize_code(item.get("code", ""))
+        if code not in PRODUCTS:
+            continue
+
+        try:
+            qty = max(1, int(item.get("quantity", 1)))
+        except Exception:
+            qty = 1
+
+        session["items"][code] = qty
+
+    return session
+
+
+def buyer_order_confirmation(session):
+    """
+    Buyer sees the same copy-ready slash-separated order summary that is sent
+    to Telegram, plus a short confirmation line.
+    """
+    return (
+        build_telegram_order(session)
+        + "\n\nအော်ဒါတင်ပြီးပါပြီရှင်။ ကျေးဇူးတင်ပါတယ်ရှင်။"
+    )
 
 def download_image_bytes(url):
     url = google_drive_direct_url(url)
@@ -558,6 +698,20 @@ def product_status(product):
     ).strip().lower()
 
 
+def product_detail(product):
+    return str(
+        get_row_value(
+            product,
+            "Description",
+            "Detail",
+            "Details",
+            "Product Detail",
+            "Product Details",
+        )
+        or ""
+    ).strip()
+
+
 def product_reply(code, product):
     name = str(get_row_value(product, "Product Name", "Name")).strip()
 
@@ -718,7 +872,7 @@ def send_facebook_image_url(recipient_id, image_url):
 
 
 def send_product_response(recipient_id, code, product):
-    # Download the Google Drive product photo server-side and upload it to Meta.
+    # Requested order: image -> Google Sheet detail -> separate price/delivery/COD.
     image_url = product_image_url(product)
 
     if image_url:
@@ -733,12 +887,19 @@ def send_product_response(recipient_id, code, product):
                 content_type,
             )
 
-        # Fallback if multipart upload fails.
         if not sent:
             send_facebook_image_url(recipient_id, image_url)
 
+    detail = product_detail(product)
+    if detail:
+        send_facebook_text(recipient_id, detail)
+
     send_facebook_text(recipient_id, product_reply(code, product))
 
+
+# =========================
+# TELEGRAM
+# =========================
 
 # =========================
 # TELEGRAM
@@ -936,27 +1097,8 @@ def merge_order_message(sender_id, message):
         session["items"][code] = qty
 
     extracted = extract_order_fields_with_ai(message)
+    return merge_extracted_order_data(session, extracted)
 
-    for field in ("name", "address", "phone", "delivery_area"):
-        value = str(extracted.get(field, "") or "").strip()
-
-        if value:
-            session[field] = value
-
-    for item in extracted.get("items", []) or []:
-        code = normalize_code(item.get("code", ""))
-
-        if code not in PRODUCTS:
-            continue
-
-        try:
-            qty = max(1, int(item.get("quantity", 1)))
-        except Exception:
-            qty = 1
-
-        session["items"][code] = qty
-
-    return session
 
 
 def order_missing_fields(session):
@@ -1154,69 +1296,94 @@ def manychat_text(text):
 
 
 def manychat_product_response(code, product):
-    # Send the text first. Add the product image only when a usable HTTPS URL exists.
-    # Google Drive links are converted to a direct-view URL.
-    messages = [
+    # Requested order:
+    # 1) product image
+    # 2) Google Sheet detail/description
+    # 3) separate price + delivery + COD message
+    messages = []
+
+    image_url = product_public_image_url(code, product)
+    if image_url:
+        print("MANYCHAT PUBLIC IMAGE URL:", image_url, flush=True)
+        messages.append(
+            {
+                "type": "image",
+                "url": image_url,
+            }
+        )
+
+    detail = product_detail(product)
+    if detail:
+        messages.append(
+            {
+                "type": "text",
+                "text": detail,
+            }
+        )
+
+    messages.append(
         {
             "type": "text",
             "text": product_reply(code, product),
         }
-    ]
-
-    image_url = product_image_url(product)
-    if image_url:
-        image_url = google_drive_view_url(image_url)
-        if isinstance(image_url, str) and image_url.startswith("https://"):
-            messages.append(
-                {
-                    "type": "image",
-                    "url": image_url,
-                }
-            )
+    )
 
     return manychat_response(messages)
 
 
+
 def handle_manychat_request(data):
     """
-    ManyChat POST body:
+    Supported ManyChat POST body:
     {
         "message": "<Last Text Input>",
-        "contact_id": "<Contact Id>"
+        "contact_id": "<Contact Id>",
+        "image_url": "<optional customer image/screenshot URL>"
     }
+
+    image_url is optional. If ManyChat can expose an attachment URL, send it
+    using this field and the bot can read order details from screenshots.
     """
     load_products()
 
     message = str(data.get("message", "") or "").strip()
     contact_id = str(data.get("contact_id", "") or "").strip()
+    incoming_image_url = str(
+        data.get("image_url", "")
+        or data.get("attachment_url", "")
+        or data.get("image", "")
+        or ""
+    ).strip()
 
     if not contact_id:
         return manychat_text(
             "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
         )
 
-    # After handoff, bot stays silent while Admin handles the contact.
     if admin_is_active(contact_id):
         print("MANYCHAT ADMIN ACTIVE - BOT SILENT:", contact_id, flush=True)
         return manychat_response([])
 
     session = get_order_session(contact_id)
 
-    # Explicit request for a human.
     if wants_admin(message):
         pause_for_admin(contact_id)
         return manychat_text(
             "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
         )
 
-    # 1) Code
+    # -------- Product recognition --------
     code, product = find_product_by_code(message)
 
-    # 2) Product name
     if not product:
         code, product = find_product_by_name(message)
 
-    # 3) Flexible Burmese / English / Chinese / description matching
+    if not product and incoming_image_url:
+        code, product = ai_find_product_from_image(
+            incoming_image_url,
+            message,
+        )
+
     if not product and message:
         code, product = ai_find_product_from_text(message)
 
@@ -1230,21 +1397,48 @@ def handle_manychat_request(data):
         or session.get("phone")
     )
 
-    order_intent = is_order_message(message) or active_order
+    last_product_ready = session.get("last_product_code") in PRODUCTS
 
-    # Order collection: return only ONE text reply for this incoming message.
+    order_intent = (
+        is_order_message(message)
+        or active_order
+        or (last_product_ready and looks_like_order_details(message))
+        or (last_product_ready and bool(incoming_image_url))
+    )
+
+    # -------- Order collection --------
     if order_intent:
         if product and is_order_message(message):
             session["items"].setdefault(code, 1)
 
-        session = merge_order_message(contact_id, message)
-
-        if (
-            is_order_message(message)
-            and not session["items"]
-            and session.get("last_product_code") in PRODUCTS
-        ):
+        # If buyer sends name/address/phone after viewing a product, assume
+        # that most recently viewed product unless another item is specified.
+        if not session["items"] and last_product_ready:
             session["items"][session["last_product_code"]] = 1
+
+        if message:
+            session = merge_order_message(contact_id, message)
+
+        if incoming_image_url:
+            extracted_from_image = extract_order_fields_from_image(
+                incoming_image_url,
+                message,
+            )
+            session = merge_extracted_order_data(
+                session,
+                extracted_from_image,
+            )
+
+        # Support a later quantity-only message such as x5 / *5 / 5 pcs.
+        if session.get("last_product_code") in PRODUCTS:
+            qty_match = re.search(
+                r"(?:[xX*]\s*(\d+)|(\d+)\s*(?:pcs|pc|ခု|ကဒ်|စုံ))",
+                message,
+                flags=re.IGNORECASE,
+            )
+            if qty_match:
+                qty = int(qty_match.group(1) or qty_match.group(2))
+                session["items"][session["last_product_code"]] = max(1, qty)
 
         missing = order_missing_fields(session)
 
@@ -1254,17 +1448,16 @@ def handle_manychat_request(data):
         telegram_text = build_telegram_order(session)
 
         if send_telegram_message(telegram_text):
+            buyer_text = buyer_order_confirmation(session)
             ORDER_SESSIONS[contact_id] = new_order_session()
-            return manychat_text(
-                "အော်ဒါတင်ပြီးပါပြီရှင်။ ကျေးဇူးတင်ပါတယ်ရှင်။"
-            )
+            return manychat_text(buyer_text)
 
         pause_for_admin(contact_id)
         return manychat_text(
             "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
         )
 
-    # Product question: image + one product text reply.
+    # -------- Product question --------
     if product:
         return manychat_product_response(code, product)
 
@@ -1272,11 +1465,12 @@ def handle_manychat_request(data):
     if greeting:
         return manychat_text(greeting)
 
-    # Anything unrelated to shopping or unclear goes to Admin.
+    # Unknown / shopping-unrelated / explicit unresolved image -> Admin.
     pause_for_admin(contact_id)
     return manychat_text(
         "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
     )
+
 
 
 # =========================
@@ -1319,6 +1513,28 @@ def verify_webhook():
         return challenge, 200
 
     return "Verification failed", 403
+
+
+
+@app.route("/product-image/<code>", methods=["GET"])
+def product_image_proxy(code):
+    load_products()
+
+    code = normalize_code(code)
+    product = PRODUCTS.get(code)
+
+    if not product:
+        return "Not found", 404
+
+    source_url = product_image_url(product)
+    image_bytes, content_type = download_image_bytes(source_url)
+
+    if not image_bytes:
+        return "Image unavailable", 404
+
+    response = Response(image_bytes, mimetype=content_type or "image/jpeg")
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
 
 
 @app.route("/webhook", methods=["POST"])
@@ -1433,21 +1649,34 @@ def webhook():
                 or session.get("phone")
             )
 
-            order_intent = is_order_message(text) or active_order
+            last_product_ready = session.get("last_product_code") in PRODUCTS
+
+            order_intent = (
+                is_order_message(text)
+                or active_order
+                or (last_product_ready and looks_like_order_details(text))
+                or (last_product_ready and bool(incoming_image_url))
+            )
 
             if order_intent:
                 if product and is_order_message(text):
                     session["items"].setdefault(code, 1)
 
-                session = merge_order_message(sender_id, text)
-
-                # Customer says "ယူမယ်" after previously viewing a product.
-                if (
-                    is_order_message(text)
-                    and not session["items"]
-                    and session.get("last_product_code") in PRODUCTS
-                ):
+                if not session["items"] and last_product_ready:
                     session["items"][session["last_product_code"]] = 1
+
+                if text:
+                    session = merge_order_message(sender_id, text)
+
+                if incoming_image_url:
+                    extracted_from_image = extract_order_fields_from_image(
+                        incoming_image_url,
+                        text,
+                    )
+                    session = merge_extracted_order_data(
+                        session,
+                        extracted_from_image,
+                    )
 
                 missing = order_missing_fields(session)
 
@@ -1462,9 +1691,11 @@ def webhook():
                     if send_telegram_message(telegram_text):
                         send_facebook_text(
                             sender_id,
-                            "အော်ဒါတင်ပြီးပါပြီရှင်။ ကျေးဇူးတင်ပါတယ်ရှင်။",
+                            buyer_order_confirmation(session),
                         )
                         ORDER_SESSIONS[sender_id] = new_order_session()
+                    else:
+                        handoff_to_admin(sender_id)
 
                 continue
 
@@ -1498,5 +1729,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
+
 
 
