@@ -1163,17 +1163,17 @@ def webhook():
     print(data, flush=True)
 
    if not data or data.get("object") != "page":
-    return {
-        "version": "v2",
-        "content": {
-            "messages": [
-                {
-                    "type": "text",
-                    "text": "EVENT_RECEIVED"
-                }
-            ]
-        }
-    }, 200
+        return {
+            "version": "v2",
+            "content": {
+                "messages": [
+                    {
+                        "type": "text",
+                        "text": "EVENT_RECEIVED"
+                    }
+                ]
+            }
+        }, 200
 
     load_products()
 
