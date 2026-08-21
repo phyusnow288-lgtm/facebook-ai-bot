@@ -1162,8 +1162,8 @@ def webhook():
     print("=== WEBHOOK POST RECEIVED ===", flush=True)
     print(data, flush=True)
 
-  if not data or data.get("object") != "page":
-        return {
+   if not data or data.get("object") != "page":
+         return {
             "version": "v2",
             "content": {
                 "messages": [
