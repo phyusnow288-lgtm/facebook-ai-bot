@@ -579,7 +579,7 @@ def parse_json_answer(answer):
         return {}
 
 
-def openai_chat(messages, max_tokens=200, temperature=0):
+def openai_chat(messages, max_tokens=200, temperature=0, timeout_seconds=7):
     if not OPENAI_API_KEY:
         return None
 
@@ -596,7 +596,7 @@ def openai_chat(messages, max_tokens=200, temperature=0):
                 "messages": messages,
                 "max_tokens": max_tokens,
             },
-            timeout=7,
+            timeout=timeout_seconds,
         )
 
         print("OPENAI STATUS:", response.status_code, flush=True)
@@ -661,16 +661,146 @@ Never invent a code.
 
 
 # =========================
+# CATALOG REFERENCE IMAGE GRID (V34)
+# =========================
+_REFERENCE_GRID_CACHE = {"key": "", "data_url": ""}
+_REFERENCE_GRID_LOCK = threading.Lock()
+
+
+def _catalog_image_cache_key():
+    """Stable key so a Google Sheet image change automatically rebuilds the grid."""
+    parts = []
+    for code, product in sorted(PRODUCTS.items()):
+        url = product_image_url(product)
+        if url:
+            parts.append(f"{code}|{url}")
+    return "\n".join(parts)
+
+
+def _download_reference_image(item):
+    """Download one catalog image with a short timeout; failures are non-fatal."""
+    code, url = item
+    try:
+        response = requests.get(
+            google_drive_direct_url(url),
+            timeout=1.8,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        ctype = (response.headers.get("Content-Type", "").split(";")[0].strip() or "")
+        if ctype and not ctype.startswith("image/"):
+            return code, b""
+        return code, response.content or b""
+    except Exception as e:
+        print("REFERENCE IMAGE DOWNLOAD SKIP:", code, str(e), flush=True)
+        return code, b""
+
+
+def catalog_reference_grid_data_url():
+    """Build one labelled contact sheet from Google Sheet product images.
+
+    The old image matcher saw only the customer's photo plus TEXT descriptions.
+    V34 also gives the vision model the shop's actual reference images in one
+    compact grid.  This is much more reliable for packaging/photos/screenshots
+    and still uses a single OpenAI vision request, which is important because
+    ManyChat Dynamic Block has a fixed 10-second timeout.
+
+    Pillow is optional.  If it is unavailable, the bot safely falls back to the
+    existing text-catalog vision path instead of failing deployment.
+    """
+    load_products()
+    key = _catalog_image_cache_key()
+    if not key:
+        return ""
+
+    if _REFERENCE_GRID_CACHE.get("key") == key and _REFERENCE_GRID_CACHE.get("data_url"):
+        return _REFERENCE_GRID_CACHE["data_url"]
+
+    with _REFERENCE_GRID_LOCK:
+        if _REFERENCE_GRID_CACHE.get("key") == key and _REFERENCE_GRID_CACHE.get("data_url"):
+            return _REFERENCE_GRID_CACHE["data_url"]
+
+        try:
+            from PIL import Image, ImageOps, ImageDraw
+            from io import BytesIO
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+        except Exception as e:
+            print("REFERENCE GRID PIL UNAVAILABLE:", str(e), flush=True)
+            return ""
+
+        refs = []
+        for code, product in sorted(PRODUCTS.items()):
+            url = product_image_url(product)
+            if url:
+                refs.append((code, url))
+
+        # Keep the request bounded even as the Sheet grows.  Current catalog is
+        # small; the most recent 40 coded products are enough for one grid.
+        refs = refs[:40]
+        if not refs:
+            return ""
+
+        downloaded = {}
+        try:
+            with ThreadPoolExecutor(max_workers=min(8, len(refs))) as pool:
+                futures = [pool.submit(_download_reference_image, item) for item in refs]
+                for future in as_completed(futures):
+                    code, raw = future.result()
+                    if raw:
+                        downloaded[code] = raw
+        except Exception as e:
+            print("REFERENCE GRID DOWNLOAD ERROR:", str(e), flush=True)
+
+        tiles = []
+        for code, _url in refs:
+            raw = downloaded.get(code)
+            if not raw:
+                continue
+            try:
+                im = Image.open(BytesIO(raw)).convert("RGB")
+                im.thumbnail((210, 180))
+                tile = Image.new("RGB", (220, 220), "white")
+                x = (220 - im.width) // 2
+                y = 28 + (180 - im.height) // 2
+                tile.paste(im, (x, y))
+                draw = ImageDraw.Draw(tile)
+                draw.text((8, 6), f"CODE {code}", fill="black")
+                tiles.append((code, tile))
+            except Exception as e:
+                print("REFERENCE GRID IMAGE SKIP:", code, str(e), flush=True)
+
+        if not tiles:
+            return ""
+
+        cols = 4
+        rows = (len(tiles) + cols - 1) // cols
+        sheet = Image.new("RGB", (cols * 220, rows * 220), "white")
+        for idx, (_code, tile) in enumerate(tiles):
+            sheet.paste(tile, ((idx % cols) * 220, (idx // cols) * 220))
+
+        out = BytesIO()
+        sheet.save(out, format="JPEG", quality=72, optimize=True)
+        data_url = "data:image/jpeg;base64," + base64.b64encode(out.getvalue()).decode("ascii")
+        _REFERENCE_GRID_CACHE["key"] = key
+        _REFERENCE_GRID_CACHE["data_url"] = data_url
+        print("REFERENCE GRID READY:", len(tiles), "products", len(out.getvalue()), "bytes", flush=True)
+        return data_url
+
+
+# =========================
 # IMAGE PRODUCT IDENTIFICATION
 # =========================
 def ai_find_product_from_image(image_url, caption=""):
-    """Identify a catalog product from a customer image in one vision call.
+    """Identify a catalog product from customer image using visual references.
 
-    ManyChat gives us short-lived Facebook CDN URLs.  Instead of asking the model
-    to fetch that URL itself, first make a *short* server-side download and send
-    the bytes as a data URL.  This is more reliable for scontent/fbcdn links while
-    still respecting ManyChat's fixed 10-second Dynamic Block timeout.  If the
-    short download fails, fall back to the original HTTPS URL.
+    Reliability order:
+    1) Download the short-lived Facebook CDN image into a data URL when possible.
+    2) Build/cache a labelled grid of the shop's actual Google Sheet product images.
+    3) Send customer image + reference grid + text catalog in ONE vision call.
+    4) If the grid cannot be built, fall back to customer image + text catalog.
+
+    This preserves one-call latency for ManyChat's fixed 10-second timeout.
     """
     if not OPENAI_API_KEY or not image_url:
         return None, None
@@ -681,7 +811,7 @@ def ai_find_product_from_image(image_url, caption=""):
     if not source_url.startswith(("http://", "https://", "data:")):
         return None, None
 
-    vision_url = source_url
+    customer_vision_url = source_url
     if source_url.startswith(("http://", "https://")):
         try:
             r = requests.get(
@@ -694,35 +824,61 @@ def ai_find_product_from_image(image_url, caption=""):
             ctype = (r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
                      or "image/jpeg")
             if ctype.startswith("image/") and r.content:
-                vision_url = (
-                    f"data:{ctype};base64,"
-                    + base64.b64encode(r.content).decode("ascii")
+                customer_vision_url = (
+                    f"data:{ctype};base64," + base64.b64encode(r.content).decode("ascii")
                 )
                 print("IMAGE INPUT: DOWNLOADED FB/CDN BYTES", len(r.content), flush=True)
         except Exception as e:
             print("IMAGE FAST DOWNLOAD FALLBACK TO URL:", str(e), flush=True)
+
+    reference_grid = ""
+    try:
+        reference_grid = catalog_reference_grid_data_url()
+    except Exception as e:
+        print("REFERENCE GRID FALLBACK:", str(e), flush=True)
 
     content = [
         {
             "type": "text",
             "text": (
                 "Identify exactly ONE matching product from this shop catalog. "
-                "The customer image can be the actual product, packaging, an ad screenshot, "
-                "or a photo of a phone screen. Compare visible text, brand/model markings, "
-                "shape, color/layout, and catalog descriptions. Text can be Burmese, English, "
-                "or Chinese. Return ONLY JSON: {\"code\":\"0001\"}. "
-                "If there is no confident catalog match, return {\"code\":null}. "
-                "Never invent a code.\n\n"
-                f"CATALOG:\n{catalog}\n\nCUSTOMER TEXT: {caption}"
+                "The FIRST image is the CUSTOMER image. It may be an actual product, "
+                "packaging, screenshot, or a photo of a phone screen. "
+                "If a labelled REFERENCE CATALOG GRID is provided after it, compare the "
+                "customer image directly with those reference photos and use the CODE label "
+                "of the best confident visual match. Also use visible Burmese/English/Chinese "
+                "text, brand/model markings, shape and catalog descriptions. "
+                "Return ONLY JSON: {\"code\":\"0001\"}. If no confident catalog match, "
+                "return {\"code\":null}. Never invent a code.\n\n"
+                f"TEXT CATALOG:\n{catalog}\n\nCUSTOMER TEXT: {caption}"
             ),
         },
-        {"type": "image_url", "image_url": {"url": vision_url}},
+        {
+            "type": "image_url",
+            "image_url": {"url": customer_vision_url, "detail": "auto"},
+        },
     ]
+
+    if reference_grid:
+        content.extend([
+            {
+                "type": "text",
+                "text": "REFERENCE CATALOG GRID: each tile is labelled CODE ####. Match the CUSTOMER image to one tile.",
+            },
+            {
+                "type": "image_url",
+                "image_url": {"url": reference_grid, "detail": "low"},
+            },
+        ])
+        print("IMAGE MATCH MODE: CUSTOMER + REFERENCE GRID", flush=True)
+    else:
+        print("IMAGE MATCH MODE: CUSTOMER + TEXT CATALOG FALLBACK", flush=True)
 
     answer = openai_chat(
         [{"role": "user", "content": content}],
         max_tokens=60,
         temperature=0,
+        timeout_seconds=5.8,
     )
     result = parse_json_answer(answer)
     code = normalize_code(result.get("code", ""))
@@ -2731,28 +2887,38 @@ def handle_manychat_request(data):
             session["items"] = {}
             return done(manychat_product_response(code, product))
 
-    # V33: If the buyer identifies a NEW product and orders a quantity in the
-    # same first message (e.g. "Mini vise 2 ခုယူမယ်"), show the product image,
-    # detail and price BEFORE asking for address/phone.  Do not do this for a
-    # product already shown in the immediately preceding turn, so "2 ခုယူမယ်"
-    # after viewing a product remains a short order-progress reply.
+    # V34 GLOBAL INFO-FIRST RULE
+    # Any current message that identifies a sellable product must show the product
+    # image + Google Sheet detail + price/delivery/COD BEFORE order collection.
+    # This is global for every catalog item and future Sheet items, not just Mini Vise.
+    # A follow-up such as "2 ခုယူမယ်" after a product was already shown contains no
+    # product identifier, so it correctly continues the order without re-sending info.
     explicit_qty_now = extract_explicit_quantity(message)
-    newly_identified_order = bool(
-        product
-        and product_is_sellable(product)
-        and explicit_qty_now is not None
-        and initial_last_product_code != code
-        and not image_has_order_details
-        and not looks_like_order_details(message)
-    )
-    if newly_identified_order:
+    current_message_identifies_product = bool(product and (
+        recognized_from_image
+        or recognized_from_ad
+        or find_product_by_code(message)[1]
+        or find_product_by_name(message)[1]
+        or (message and not generic_order)  # AI text identification/description
+    ))
+
+    if product and product_is_sellable(product) and current_message_identifies_product:
         session["last_product_code"] = code
-        session["items"] = {code: explicit_qty_now}
-        session["quantity_confirmed"] = True
-        lock_facebook_account_name(session, account_name)
-        missing_now = order_missing_fields(session)
-        print("V33 FIRST PRODUCT+QTY SHOW INFO FIRST:", code, explicit_qty_now, missing_now, flush=True)
-        return done(manychat_product_order_response(code, product, missing_now))
+
+        # If this same message also expresses purchase intent, remember quantity/order
+        # state first, then append only the missing-fields prompt after product info.
+        purchase_now = bool(generic_order or explicit_qty_now is not None)
+        if purchase_now:
+            qty_now = explicit_qty_now if explicit_qty_now is not None else 1
+            session["items"] = {code: qty_now}
+            session["quantity_confirmed"] = True
+            lock_facebook_account_name(session, account_name)
+            missing_now = order_missing_fields(session)
+            print("V34 GLOBAL INFO FIRST + ORDER:", code, qty_now, missing_now, flush=True)
+            return done(manychat_product_order_response(code, product, missing_now))
+
+        print("V34 GLOBAL INFO FIRST - PRODUCT QUERY:", code, flush=True)
+        return done(manychat_product_response(code, product))
 
     last_product_ready = session.get("last_product_code") in PRODUCTS
 
@@ -3186,4 +3352,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
-
