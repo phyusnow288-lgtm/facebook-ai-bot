@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V30-AUDITED-4-FIXES"
+BOT_VERSION = "V32-GLOBAL-QTY-NO-CODE-CONFUSION"
 
 app = Flask(__name__)
 
@@ -446,22 +446,42 @@ def image_as_data_url(url):
 # PRODUCT SEARCH
 # =========================
 def find_product_by_code(message):
-    load_products()
+    """Find only an EXPLICIT catalog code; never reinterpret quantity as a code.
 
+    Global rule:
+    - ``2 ခု``, ``5 ထုပ်``, ``10 pcs``, ``x3`` and similar numbers are quantities.
+    - A short numeric code (1..999) is accepted only when explicitly labelled
+      ``Code`` / ``Product Code`` / ``ကုဒ်``.
+    - A four-digit catalog code such as ``0017`` is explicit enough by itself.
+
+    This intentionally means a bare message like ``2`` is NOT treated as Code 0002.
+    Customers can identify products by name/photo, or use ``0002`` / ``Code 2``.
+    """
+    load_products()
     if not message:
         return None, None
 
-    text = str(message).strip()
+    text = _western_digits(str(message)).strip()
+    if not text:
+        return None, None
 
-    # Finds 1, 01, 001, 0001, 12, 0012 etc.
-    for number in re.findall(r"\d+", text):
-        code = normalize_code(number)
+    # Explicitly-labelled short or long code.
+    label_patterns = (
+        r"(?i)(?:code|product\s*code)\s*[:#-]?\s*(\d{1,4})(?!\d)",
+        r"ကုဒ်\s*[:#-]?\s*(\d{1,4})(?!\d)",
+    )
+    for pattern in label_patterns:
+        for match in re.finditer(pattern, text):
+            code = normalize_code(match.group(1))
+            if code in PRODUCTS:
+                return code, PRODUCTS[code]
+
+    # Four digits are the shop's canonical code format and are safe even when
+    # embedded in normal text. Quantity parsing elsewhere is limited to 1-3 digits.
+    for match in re.finditer(r"(?<!\d)(\d{4})(?!\d)", text):
+        code = normalize_code(match.group(1))
         if code in PRODUCTS:
             return code, PRODUCTS[code]
-
-    for code, product in PRODUCTS.items():
-        if code in text:
-            return code, product
 
     return None, None
 
@@ -1239,33 +1259,85 @@ def get_order_session(sender_id):
     )
 
 
+QUANTITY_UNITS_RE = (
+    r"(?:pcs?|pieces?|pc|ခု|ထုပ်|ဘူး|ချောင်း|လုံး|စုံ|ကဒ်|ကတ်|စက်|ပုံး|အိတ်|"
+    r"set|sets|pack|packs|pair|pairs)"
+)
+
+BURMESE_QUANTITY_WORDS = {
+    "တစ်": 1, "တ": 1, "နှစ်": 2, "သုံး": 3, "လေး": 4, "ငါး": 5,
+    "ခြောက်": 6, "ခုနစ်": 7, "ရှစ်": 8, "ကိုး": 9, "ဆယ်": 10,
+}
+
+def _bounded_quantity(number):
+    try:
+        qty = int(number)
+    except Exception:
+        return None
+    if qty < 1 or qty > 999:
+        return None
+    return qty
+
+def _quantity_after_position(text, end_pos):
+    tail = text[end_pos:end_pos + 40]
+    patterns = (
+        rf"^\s*[xX*]\s*(\d{{1,3}})",
+        rf"^\s*(\d{{1,3}})\s*{QUANTITY_UNITS_RE}",
+        r"^\s*[-:]\s*(\d{1,3})(?!\d)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, tail, flags=re.IGNORECASE)
+        if match:
+            qty = _bounded_quantity(match.group(1))
+            if qty is not None:
+                return qty
+
+    compact_tail = re.sub(r"\s+", "", tail)
+    for word, qty in BURMESE_QUANTITY_WORDS.items():
+        if re.match(rf"^{re.escape(word)}{QUANTITY_UNITS_RE}", compact_tail, flags=re.IGNORECASE):
+            return qty
+    return 1
+
+def _explicit_code_mentions(text):
+    value = _western_digits(str(text or ""))
+    mentions = []
+    occupied = []
+
+    label_patterns = (
+        r"(?i)(?:code|product\s*code)\s*[:#-]?\s*(\d{1,4})(?!\d)",
+        r"ကုဒ်\s*[:#-]?\s*(\d{1,4})(?!\d)",
+    )
+    for pattern in label_patterns:
+        for match in re.finditer(pattern, value):
+            code = normalize_code(match.group(1))
+            if code in PRODUCTS:
+                mentions.append((code, match.start(), match.end()))
+                occupied.append((match.start(), match.end()))
+
+    for match in re.finditer(r"(?<!\d)(\d{4})(?!\d)", value):
+        if any(a <= match.start() < b for a, b in occupied):
+            continue
+        code = normalize_code(match.group(1))
+        if code in PRODUCTS:
+            mentions.append((code, match.start(), match.end()))
+
+    # Do NOT infer a short catalog code from a bare number. Bare 1..999 can be
+    # a follow-up quantity and must never silently become 0001..0999. A bare
+    # four-digit code is already collected by the canonical-code loop above.
+
+    mentions.sort(key=lambda x: x[1])
+    return mentions
+
 def find_codes_and_quantities(text):
     load_products()
-
-    text = str(text or "")
+    value = _western_digits(str(text or ""))
     found = {}
+    mentions = _explicit_code_mentions(value)
 
-    for code in PRODUCTS.keys():
-        if code not in text:
-            continue
-
-        qty = 1
-        escaped = re.escape(code)
-
-        patterns = [
-            rf"{escaped}\s*[xX*]\s*(\d+)",
-            rf"{escaped}\s+(\d+)\s*(?:pcs|pc|ခု|စုံ)",
-            rf"{escaped}\s*[-:]\s*(\d+)",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-
-            if match:
-                qty = max(1, int(match.group(1)))
-                break
-
-        found[code] = qty
+    for index, (code, _start, end) in enumerate(mentions):
+        segment_end = mentions[index + 1][1] if index + 1 < len(mentions) else len(value)
+        local_value = value[:segment_end]
+        found[code] = _quantity_after_position(local_value, end)
 
     return found
 
@@ -1276,29 +1348,33 @@ def _western_digits(value):
 
 
 def extract_explicit_quantity(text):
+    """Extract explicit quantity safely; 1..10 are fully covered."""
     raw = str(text or "").strip()
     value = _western_digits(raw)
-    low = re.sub(r"\s+", "", value.lower())
 
-    # Common Burmese quantity wording buyers actually use.
-    burmese_one = (
-        "တခု", "တစ်ခု", "တခုယူ", "တစ်ခုယူ", "တခုယူမယ်", "တစ်ခုယူမယ်",
-        "တခုလိုချင်", "တစ်ခုလိုချင်",
+    patterns = (
+        r"[xX*]\s*(\d{1,3})(?!\d)",
+        rf"(?<!\d)(\d{{1,3}})\s*{QUANTITY_UNITS_RE}",
+        r"(?:qty|quantity)\s*[:=]?\s*(\d{1,3})(?!\d)",
     )
-    if any(token in low for token in burmese_one):
-        return 1
-
-    patterns = [
-        r"[xX*]\s*(\d+)",
-        r"(\d+)\s*(?:pcs|pc|ခု|ကဒ်|စုံ)",
-        r"(?:qty|quantity)\s*[:=]?\s*(\d+)",
-    ]
-
     for pattern in patterns:
         match = re.search(pattern, value, flags=re.IGNORECASE)
         if match:
-            return max(1, int(match.group(1)))
+            qty = _bounded_quantity(match.group(1))
+            if qty is not None:
+                return qty
 
+    compact = re.sub(r"\s+", "", value.lower())
+    for word, qty in BURMESE_QUANTITY_WORDS.items():
+        if re.search(rf"{re.escape(word)}{QUANTITY_UNITS_RE}", compact, flags=re.IGNORECASE):
+            return qty
+
+    burmese_one_phrases = (
+        "တခုယူ", "တစ်ခုယူ", "တခုယူမယ်", "တစ်ခုယူမယ်",
+        "တခုလိုချင်", "တစ်ခုလိုချင်",
+    )
+    if any(token in compact for token in burmese_one_phrases):
+        return 1
     return None
 
 
@@ -1562,7 +1638,23 @@ def is_likely_delivery_address(value):
         "avenue", "ave", "building", "apartment", "floor", "room", "no.",
     )
     has_address_structure = any(tok in low for tok in address_tokens)
-    has_house_number = bool(re.search(r"\b\d{1,4}[/-]?[a-zA-Z]?\b", low))
+
+    # Quantity numbers are not house/building numbers. Strip explicit quantity
+    # expressions before the numeric-address heuristic.
+    numeric_address_probe = _western_digits(low)
+    numeric_address_probe = re.sub(
+        rf"(?<!\d)\d{{1,3}}\s*{QUANTITY_UNITS_RE}",
+        " ",
+        numeric_address_probe,
+        flags=re.IGNORECASE,
+    )
+    numeric_address_probe = re.sub(
+        r"[xX*]\s*\d{1,3}(?!\d)",
+        " ",
+        numeric_address_probe,
+        flags=re.IGNORECASE,
+    )
+    has_house_number = bool(re.search(r"\b\d{1,4}[/-]?[a-zA-Z]?\b", numeric_address_probe))
     has_phone = 9 <= len(digits) <= 13
 
     # Sales questions/chat must not become addresses, even when they mention a
@@ -1762,18 +1854,21 @@ def extract_order_fields_locally(message, session=None):
     return result
 
 def is_quantity_only_message(text):
-    value = str(text or "").strip()
+    value = _western_digits(str(text or "").strip())
+    compact = re.sub(r"\s+", "", value.lower())
 
-    patterns = [
-        r"^[xX*]\s*\d+$",
-        r"^\d+\s*(?:pcs|pc|ခု|ကဒ်|စုံ)$",
-        r"^(?:qty|quantity)\s*[:=]?\s*\d+$",
-    ]
-
-    return any(
-        re.fullmatch(pattern, value, flags=re.IGNORECASE)
-        for pattern in patterns
+    patterns = (
+        r"^[xX*]\s*\d{1,3}$",
+        rf"^\d{{1,3}}\s*{QUANTITY_UNITS_RE}$",
+        r"^(?:qty|quantity)\s*[:=]?\s*\d{1,3}$",
     )
+    if any(re.fullmatch(pattern, value, flags=re.IGNORECASE) for pattern in patterns):
+        return True
+
+    for word in BURMESE_QUANTITY_WORDS:
+        if re.fullmatch(rf"{re.escape(word)}{QUANTITY_UNITS_RE}", compact, flags=re.IGNORECASE):
+            return True
+    return False
 
 
 def merge_order_message(sender_id, message):
@@ -1796,6 +1891,27 @@ def merge_order_message(sender_id, message):
         if still_missing_core and OPENAI_API_KEY:
             try:
                 extracted = extract_order_fields_with_ai(message)
+                if isinstance(extracted, dict):
+                    ai_address = str(extracted.get("address", "") or "").strip()
+                    if ai_address and not is_likely_delivery_address(ai_address):
+                        print("AI ADDRESS REJECTED AS NON-ADDRESS:", ai_address, flush=True)
+                        extracted["address"] = ""
+                        extracted["delivery_area"] = ""
+
+                    explicit_codes = find_codes_and_quantities(message)
+                    target_code = session.get("last_product_code")
+                    if (
+                        extract_explicit_quantity(message) is not None
+                        and not explicit_codes
+                        and target_code in PRODUCTS
+                    ):
+                        safe_items = []
+                        for item in extracted.get("items", []) or []:
+                            item_code = normalize_code(item.get("code", ""))
+                            if item_code == target_code:
+                                safe_items.append(item)
+                        extracted["items"] = safe_items
+
                 session = merge_extracted_order_data(session, extracted)
             except Exception as e:
                 print("ORDER AI FALLBACK ERROR:", str(e), flush=True)
