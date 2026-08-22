@@ -1504,18 +1504,16 @@ def infer_delivery_area_for_complete_order(session):
 def is_likely_delivery_address(value):
     """True only when text looks like a real delivery address, not a buyer question.
 
-    Supports Burmese, English, and mixed Myanmar addresses. Ambiguous text is left
-    for the AI order extractor instead of being blindly saved as an address.
+    Supports Burmese, English, and mixed Myanmar addresses.  Question/chat text
+    is rejected BEFORE township matching so messages such as "Tamwe ပို့ခဘယ်လောက်လဲ"
+    are never stored as an address just because they contain a location name.
     """
     text = str(value or "").strip()
     if not text:
         return False
 
     low = text.lower()
-
-    # Strong location evidence always wins.
-    if detect_delivery_area_from_text(text):
-        return True
+    digits = re.sub(r"\D", "", _western_digits(text))
 
     address_tokens = (
         "လမ်း", "လမ်းမ", "ရပ်ကွက်", "မြို့နယ်", "မြို့", "ရွာ", "ကျေးရွာ",
@@ -1524,24 +1522,35 @@ def is_likely_delivery_address(value):
         "village", "city", "state", "region", "district", "block", "lane",
         "avenue", "ave", "building", "apartment", "floor", "room", "no.",
     )
-    if any(tok in low for tok in address_tokens):
-        return True
+    has_address_structure = any(tok in low for tok in address_tokens)
+    has_house_number = bool(re.search(r"\b\d{1,4}[/-]?[a-zA-Z]?\b", low))
+    has_phone = 9 <= len(digits) <= 13
 
-    # Do not turn ordinary sales questions/chat into an address merely because
-    # an account name is already present in the order session.
+    # Sales questions/chat must not become addresses, even when they mention a
+    # township/city.  A genuinely structured address or address+phone can pass.
     question_tokens = (
         "လား", "လဲ", "ဘယ်", "ဘယ်လောက်", "ရမလား", "ရှိလား", "ရှိသေးလား",
         "ပို့ခ", "စျေး", "ဈေး", "အသုံးပြု", "ဘယ်လို", "အော်ဒါတင်ပေးမှာလား",
-        "အော်ဒါတင်ပေးမလား", "how much", "price", "delivery fee", "deli",
+        "အော်ဒါတင်ပေးမလား", "how much", "price", "delivery fee",
         "can i", "can you", "do you", "is it", "how to", "what", "where",
         "available", "in stock", "order?", "?",
     )
-    if any(tok in low for tok in question_tokens):
+    if any(tok in low for tok in question_tokens) and not (has_phone or (has_address_structure and has_house_number)):
         return False
+
+    if is_order_noise_segment(text):
+        return False
+
+    # Explicit place/township/state clue.
+    if detect_delivery_area_from_text(text):
+        return True
+
+    if has_address_structure:
+        return True
 
     # Postal-looking text: a house/building number plus several words is often
     # an address even when the township/city is omitted.
-    if re.search(r"\b\d{1,4}[/-]?[a-zA-Z]?\b", low) and len(text.split()) >= 3:
+    if has_house_number and len(text.split()) >= 3:
         return True
 
     return False
@@ -2369,7 +2378,16 @@ def handle_manychat_request(data):
     # treated as an order immediately. This avoids unrelated recognition logic
     # swallowing Name / Address / Phone / quantity messages.
     remembered_code = str(session.get("last_product_code", "") or "").strip()
-    if remembered_code in PRODUCTS and (looks_like_order_details(message) or generic_purchase_intent(message)):
+    # Order progress may arrive as Burmese/English/mixed address text, a phone-only
+    # follow-up, a one-shot address+phone message, or an address screenshot/photo.
+    # Use the stricter order-progress classifier so ordinary product questions are
+    # not swallowed as addresses.
+    order_progress_now = looks_like_order_progress(message, session=session)
+    if remembered_code in PRODUCTS and (
+        order_progress_now
+        or generic_purchase_intent(message)
+        or image_has_order_details
+    ):
         remembered_product = PRODUCTS.get(remembered_code, {})
         if product_is_sellable(remembered_product):
             # Default quantity is 1 when omitted.
