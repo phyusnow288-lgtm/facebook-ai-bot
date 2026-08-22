@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V22-ORDER-ONLY-FIX"
+BOT_VERSION = "V23-FINAL-COMPLETE"
 
 app = Flask(__name__)
 
@@ -47,6 +47,12 @@ MANYCHAT_ECHO_IGNORE_UNTIL = {}
 RECENT_TELEGRAM_ORDERS = {}
 RECENT_TELEGRAM_LOCK = threading.Lock()
 TELEGRAM_ORDER_DEDUP_SECONDS = 300
+
+# Suppress the same ManyChat input being answered twice when ManyChat retries a
+# Dynamic Block request. Keyed per contact + exact input/context.
+RECENT_MANYCHAT_INPUTS = {}
+RECENT_MANYCHAT_LOCK = threading.Lock()
+MANYCHAT_INPUT_DEDUP_SECONDS = int(os.environ.get("MANYCHAT_INPUT_DEDUP_SECONDS", "8"))
 MANYCHAT_ECHO_GRACE_SECONDS = int(os.environ.get("MANYCHAT_ECHO_GRACE_SECONDS", "20"))
 PRODUCT_REFRESH_LOCK = threading.Lock()
 PRODUCT_REFRESH_RUNNING = False
@@ -1050,6 +1056,49 @@ def queue_telegram_order(contact_id, message):
 
 
 # =========================
+# MANYCHAT INPUT DEDUP
+# =========================
+def manychat_input_key(data, message, contact_id, image_url):
+    context_bits = []
+    if isinstance(data, dict):
+        for key in (
+            "product_code", "code", "ad_code", "source_code", "ref_code",
+            "ad_context", "ad_id", "ad_ref", "referral", "referral_payload",
+            "ad_name", "ad_title", "ad_headline", "campaign_name",
+            "manychat_ad_product", "last_ad_product",
+        ):
+            value = data.get(key)
+            if value not in (None, "", {}):
+                try:
+                    context_bits.append(f"{key}={json.dumps(value, ensure_ascii=False, sort_keys=True)}")
+                except Exception:
+                    context_bits.append(f"{key}={value}")
+    return "|".join([
+        str(contact_id or "").strip(),
+        str(message or "").strip(),
+        str(image_url or "").strip(),
+        *context_bits,
+    ])
+
+
+def is_duplicate_manychat_input(data, message, contact_id, image_url):
+    if not contact_id:
+        return False
+    key = manychat_input_key(data, message, contact_id, image_url)
+    now = now_ts()
+    with RECENT_MANYCHAT_LOCK:
+        for old_key, old_ts in list(RECENT_MANYCHAT_INPUTS.items()):
+            if now - old_ts > MANYCHAT_INPUT_DEDUP_SECONDS:
+                RECENT_MANYCHAT_INPUTS.pop(old_key, None)
+        old = RECENT_MANYCHAT_INPUTS.get(key)
+        if old and now - old <= MANYCHAT_INPUT_DEDUP_SECONDS:
+            print("MANYCHAT DUPLICATE INPUT SUPPRESSED:", contact_id, flush=True)
+            return True
+        RECENT_MANYCHAT_INPUTS[key] = now
+    return False
+
+
+# =========================
 # ADMIN TAKEOVER
 # =========================
 def pause_for_admin(customer_id):
@@ -2049,7 +2098,9 @@ def handle_manychat_request(data):
     - Product => image, detail, price, then exact order-info prompt.
     - No quantity supplied => defaults to 1 item.
     - Name/address/phone completion => buyer confirmation + Telegram.
-    - Explicit Admin request only => Admin handoff/pause for that customer.
+    - Unknown/non-shopping/unresolved => Admin handoff/pause for that customer.
+    - Exact duplicate ManyChat input => no second customer reply.
+    - Completed order => Telegram is queued once with retry + duplicate suppression.
     """
     load_products()
 
@@ -2090,6 +2141,11 @@ def handle_manychat_request(data):
     ) if data.get(k) not in (None, "", {})}
     if ad_debug:
         print("MANYCHAT AD CONTEXT:", ad_debug, flush=True)
+
+    # ManyChat can retry a Dynamic Block request. Never send the exact same
+    # reply twice to the same contact inside the short dedup window.
+    if is_duplicate_manychat_input(data, message, contact_id, incoming_image_url):
+        return manychat_response([])
 
     def done(response):
         return finalize_manychat(contact_id, response)
@@ -2149,12 +2205,12 @@ def handle_manychat_request(data):
 
                 telegram_text = build_telegram_order(session)
                 print("V22 TELEGRAM ORDER TEXT:", telegram_text, flush=True)
-                if send_telegram_order_now(telegram_text):
+                if queue_telegram_order(contact_id, telegram_text):
                     buyer_text = buyer_order_confirmation(session)
                     ORDER_SESSIONS[contact_id] = new_order_session()
                     return done(manychat_text(buyer_text))
 
-                # Do not erase the session on Telegram failure.
+                # Do not erase the session when Telegram configuration is missing.
                 return done(manychat_text(
                     "အော်ဒါအချက်အလက် ရရှိပါပြီရှင်။ Admin က ဆက်လက်စစ်ဆေးပေးပါမယ်ရှင်။"
                 ))
@@ -2308,13 +2364,14 @@ def handle_manychat_request(data):
         telegram_text = build_telegram_order(session)
         print("TELEGRAM ORDER TEXT:", telegram_text, flush=True)
 
-        # V22: complete orders are sent directly with a short timeout.
-        if send_telegram_order_now(telegram_text):
+        # Queue in background so ManyChat gets a fast valid response. The queue
+        # has its own 5-minute duplicate-order protection and Telegram retries.
+        if queue_telegram_order(contact_id, telegram_text):
             buyer_text = buyer_order_confirmation(session)
             ORDER_SESSIONS[contact_id] = new_order_session()
             return done(manychat_text(buyer_text))
 
-        # Keep the session on Telegram failure so the order is not lost.
+        # Keep the session when Telegram configuration is missing.
         return done(manychat_text(
             "အော်ဒါအချက်အလက် ရရှိပါပြီရှင်။ Admin က ဆက်လက်စစ်ဆေးပေးပါမယ်ရှင်။"
         ))
@@ -2327,8 +2384,14 @@ def handle_manychat_request(data):
     if greeting:
         return done(manychat_text(greeting))
 
-    # User's required unclear-product fallback. Never auto-pause Admin here.
-    return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
+    # An unresolved image, an unknown/non-shopping question, or anything the
+    # bot cannot confidently classify goes to a human Admin. Generic purchase
+    # intent without a product was already handled above with the exact
+    # "which product" sentence, so it never reaches this fallback.
+    pause_for_admin(contact_id)
+    return done(manychat_text(
+        "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
+    ))
 
 
 # =========================
