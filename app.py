@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V33-IMAGE-FIRST-ORDER-REPLY-FIX"
+BOT_VERSION = "V35-ALL-PRODUCT-CODE-TEXT-IMAGE"
 
 app = Flask(__name__)
 
@@ -517,28 +517,47 @@ def find_product_by_name(message):
 
 
 def product_catalog_text():
-    load_products()
+    """Build a rich text catalog directly from Google Sheet rows.
 
+    V35 uses every useful name/alias/detail field that may exist in the Sheet.
+    This keeps text recognition global: newly added products are automatically
+    available without adding Python product-specific rules.
+    """
+    load_products()
     rows = []
 
-    for code, product in PRODUCTS.items():
-        name = str(get_row_value(product, "Product Name", "Name")).strip()
-        details = str(
-            get_row_value(
-                product,
-                "Description",
-                "Details",
-                "Detail",
-                "အသေးစိတ်",
-            )
-        ).strip()
+    name_keys = (
+        "Product Name", "Name", "product_name",
+        "Myanmar Name", "MyanmarName", "Burmese Name", "MM Name",
+        "English Name", "EnglishName", "EN Name",
+        "Chinese Name", "ChineseName", "CN Name",
+        "Alias", "Aliases", "Keywords", "Keyword",
+        "Model", "Model No", "Model Number", "SKU",
+    )
+    detail_keys = (
+        "Description", "Details", "Detail", "Product Detail", "Product Details",
+        "Description Myanmar", "Myanmar Description", "အသေးစိတ်",
+    )
+
+    for code, product in sorted(PRODUCTS.items()):
+        names = []
+        for key in name_keys:
+            value = str(get_row_value(product, key) or "").strip()
+            if value and value not in names:
+                names.append(value)
+
+        details = []
+        for key in detail_keys:
+            value = str(get_row_value(product, key) or "").strip()
+            if value and value not in details:
+                details.append(value)
 
         rows.append(
-            f"Code {code} | Product: {name} | Details: {details}"
+            f"Code {code} | Names/Aliases: {' ; '.join(names)} | "
+            f"Details: {' ; '.join(details)}"
         )
 
     return "\n".join(rows)
-
 
 def reference_image_items():
     load_products()
@@ -616,30 +635,35 @@ def openai_chat(messages, max_tokens=200, temperature=0, timeout_seconds=7):
 # TEXT PRODUCT IDENTIFICATION
 # =========================
 def ai_find_product_from_text(message):
+    """Global catalog text matcher for Burmese/English/Chinese/mixed buyer text."""
     if not OPENAI_API_KEY or not message:
         return None, None
 
     catalog = product_catalog_text()
 
     system_prompt = f"""
-You identify which product a customer means in an online shop.
+You are a strict product matcher for one online-shop catalog.
 
 The customer may:
 - write Burmese, English, Chinese, or mixed languages
 - misspell a product name
-- describe the product instead of giving its code
-- paste text from a screenshot or advertisement
+- describe appearance, purpose, model number, package text, or use case
+- paste text copied from an advertisement or screenshot
+- include an order quantity such as 2 ခု, 5 ထုပ်, 10 pcs, x3
+
+IMPORTANT RULES:
+- Match ONLY a product that exists in CATALOG. Never invent a code.
+- Quantity numbers are NOT product codes. For example, "2 ခု" must never mean Code 0002.
+- Use names, aliases, model markings, and details together.
+- If the text does not confidently identify one catalog item, return null.
 
 CATALOG:
 {catalog}
 
-Return ONLY one JSON object:
+Return ONLY one JSON object, with no explanation:
 {{"code":"0001"}}
-
-If no catalog product is a confident match:
+Or if not confident:
 {{"code":null}}
-
-Never invent a code.
 """
 
     answer = openai_chat(
@@ -649,158 +673,163 @@ Never invent a code.
         ],
         max_tokens=80,
         temperature=0,
+        timeout_seconds=5.8,
     )
 
     result = parse_json_answer(answer)
     code = normalize_code(result.get("code", ""))
-
     if code in PRODUCTS:
+        print("TEXT AI MATCH:", code, flush=True)
         return code, PRODUCTS[code]
 
+    print("TEXT AI MATCH: NONE", flush=True)
     return None, None
 
 
 # =========================
-# CATALOG REFERENCE IMAGE GRID (V34)
+# CATALOG REFERENCE IMAGES (V35 - NO PILLOW REQUIRED)
 # =========================
-_REFERENCE_GRID_CACHE = {"key": "", "data_url": ""}
-_REFERENCE_GRID_LOCK = threading.Lock()
+_REFERENCE_IMAGES_CACHE = {"key": "", "parts": []}
+_REFERENCE_IMAGES_LOCK = threading.Lock()
 
 
 def _catalog_image_cache_key():
-    """Stable key so a Google Sheet image change automatically rebuilds the grid."""
-    parts = []
-    for code, product in sorted(PRODUCTS.items()):
-        url = product_image_url(product)
-        if url:
-            parts.append(f"{code}|{url}")
-    return "\n".join(parts)
+    """Change automatically whenever a Sheet product code or image URL changes."""
+    return "|".join(
+        f"{code}={product_image_url(product)}"
+        for code, product in sorted(PRODUCTS.items())
+        if product_image_url(product)
+    )
 
 
-def _download_reference_image(item):
-    """Download one catalog image with a short timeout; failures are non-fatal."""
-    code, url = item
+def _image_mime_from_bytes(raw, header=""):
+    """Detect common vision-compatible image MIME types without Pillow."""
+    header = str(header or "").split(";")[0].strip().lower()
+    if header in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+        return header
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(raw) >= 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+def _download_one_reference(item):
+    """Return (code, name, data_url) with a short bounded network timeout."""
+    code, name, url = item
     try:
         response = requests.get(
             google_drive_direct_url(url),
-            timeout=1.8,
+            timeout=2.0,
             allow_redirects=True,
             headers={"User-Agent": "Mozilla/5.0"},
         )
         response.raise_for_status()
-        ctype = (response.headers.get("Content-Type", "").split(";")[0].strip() or "")
-        if ctype and not ctype.startswith("image/"):
-            return code, b""
-        return code, response.content or b""
+        raw = response.content or b""
+        # Protect the 10-second ManyChat request and OpenAI payload from accidental
+        # giant files. Normal shop product images are far below this threshold.
+        if not raw or len(raw) > 2_500_000:
+            print("REFERENCE IMAGE SKIP SIZE:", code, len(raw), flush=True)
+            return code, name, ""
+        mime = _image_mime_from_bytes(raw, response.headers.get("Content-Type", ""))
+        if not mime:
+            print("REFERENCE IMAGE SKIP TYPE:", code, response.headers.get("Content-Type", ""), flush=True)
+            return code, name, ""
+        data_url = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+        return code, name, data_url
     except Exception as e:
         print("REFERENCE IMAGE DOWNLOAD SKIP:", code, str(e), flush=True)
-        return code, b""
+        return code, name, ""
 
 
-def catalog_reference_grid_data_url():
-    """Build one labelled contact sheet from Google Sheet product images.
+def catalog_reference_content_parts():
+    """Cache ALL available Google Sheet reference images as labelled vision parts.
 
-    The old image matcher saw only the customer's photo plus TEXT descriptions.
-    V34 also gives the vision model the shop's actual reference images in one
-    compact grid.  This is much more reliable for packaging/photos/screenshots
-    and still uses a single OpenAI vision request, which is important because
-    ManyChat Dynamic Block has a fixed 10-second timeout.
-
-    Pillow is optional.  If it is unavailable, the bot safely falls back to the
-    existing text-catalog vision path instead of failing deployment.
+    Unlike V34, this does not need Pillow and does not build a contact sheet.
+    Each real product image stays paired with its exact Code label, and all
+    references are sent in ONE OpenAI vision request. This mirrors the common
+    visual-search pattern of comparing a query image against a cached reference
+    catalog, while keeping the current small catalog compatible with ManyChat's
+    fixed 10-second Dynamic Block timeout.
     """
     load_products()
     key = _catalog_image_cache_key()
     if not key:
-        return ""
+        return []
 
-    if _REFERENCE_GRID_CACHE.get("key") == key and _REFERENCE_GRID_CACHE.get("data_url"):
-        return _REFERENCE_GRID_CACHE["data_url"]
+    if _REFERENCE_IMAGES_CACHE.get("key") == key and _REFERENCE_IMAGES_CACHE.get("parts"):
+        return list(_REFERENCE_IMAGES_CACHE["parts"])
 
-    with _REFERENCE_GRID_LOCK:
-        if _REFERENCE_GRID_CACHE.get("key") == key and _REFERENCE_GRID_CACHE.get("data_url"):
-            return _REFERENCE_GRID_CACHE["data_url"]
-
-        try:
-            from PIL import Image, ImageOps, ImageDraw
-            from io import BytesIO
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-        except Exception as e:
-            print("REFERENCE GRID PIL UNAVAILABLE:", str(e), flush=True)
-            return ""
+    with _REFERENCE_IMAGES_LOCK:
+        if _REFERENCE_IMAGES_CACHE.get("key") == key and _REFERENCE_IMAGES_CACHE.get("parts"):
+            return list(_REFERENCE_IMAGES_CACHE["parts"])
 
         refs = []
         for code, product in sorted(PRODUCTS.items()):
             url = product_image_url(product)
-            if url:
-                refs.append((code, url))
+            if not url:
+                continue
+            name = str(get_row_value(product, "Product Name", "Name") or "").strip()
+            refs.append((code, name, url))
 
-        # Keep the request bounded even as the Sheet grows.  Current catalog is
-        # small; the most recent 40 coded products are enough for one grid.
-        refs = refs[:40]
         if not refs:
-            return ""
+            return []
 
         downloaded = {}
         try:
-            with ThreadPoolExecutor(max_workers=min(8, len(refs))) as pool:
-                futures = [pool.submit(_download_reference_image, item) for item in refs]
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=min(10, len(refs))) as pool:
+                futures = [pool.submit(_download_one_reference, item) for item in refs]
                 for future in as_completed(futures):
-                    code, raw = future.result()
-                    if raw:
-                        downloaded[code] = raw
+                    code, name, data_url = future.result()
+                    if data_url:
+                        downloaded[code] = (name, data_url)
         except Exception as e:
-            print("REFERENCE GRID DOWNLOAD ERROR:", str(e), flush=True)
+            print("REFERENCE IMAGE CACHE ERROR:", str(e), flush=True)
 
-        tiles = []
-        for code, _url in refs:
-            raw = downloaded.get(code)
-            if not raw:
+        parts = []
+        for code, name, _url in refs:
+            cached = downloaded.get(code)
+            if not cached:
                 continue
-            try:
-                im = Image.open(BytesIO(raw)).convert("RGB")
-                im.thumbnail((210, 180))
-                tile = Image.new("RGB", (220, 220), "white")
-                x = (220 - im.width) // 2
-                y = 28 + (180 - im.height) // 2
-                tile.paste(im, (x, y))
-                draw = ImageDraw.Draw(tile)
-                draw.text((8, 6), f"CODE {code}", fill="black")
-                tiles.append((code, tile))
-            except Exception as e:
-                print("REFERENCE GRID IMAGE SKIP:", code, str(e), flush=True)
+            ref_name, data_url = cached
+            parts.append({
+                "type": "text",
+                "text": f"REFERENCE PRODUCT — CODE {code} — {ref_name}",
+            })
+            parts.append({
+                "type": "image_url",
+                "image_url": {"url": data_url, "detail": "low"},
+            })
 
-        if not tiles:
-            return ""
-
-        cols = 4
-        rows = (len(tiles) + cols - 1) // cols
-        sheet = Image.new("RGB", (cols * 220, rows * 220), "white")
-        for idx, (_code, tile) in enumerate(tiles):
-            sheet.paste(tile, ((idx % cols) * 220, (idx // cols) * 220))
-
-        out = BytesIO()
-        sheet.save(out, format="JPEG", quality=72, optimize=True)
-        data_url = "data:image/jpeg;base64," + base64.b64encode(out.getvalue()).decode("ascii")
-        _REFERENCE_GRID_CACHE["key"] = key
-        _REFERENCE_GRID_CACHE["data_url"] = data_url
-        print("REFERENCE GRID READY:", len(tiles), "products", len(out.getvalue()), "bytes", flush=True)
-        return data_url
+        _REFERENCE_IMAGES_CACHE["key"] = key
+        _REFERENCE_IMAGES_CACHE["parts"] = list(parts)
+        print(
+            "REFERENCE IMAGES READY:",
+            len(parts) // 2,
+            "/",
+            len(refs),
+            "products",
+            flush=True,
+        )
+        return parts
 
 
 # =========================
 # IMAGE PRODUCT IDENTIFICATION
 # =========================
 def ai_find_product_from_image(image_url, caption=""):
-    """Identify a catalog product from customer image using visual references.
+    """Match a customer image against ALL available Sheet product images.
 
-    Reliability order:
-    1) Download the short-lived Facebook CDN image into a data URL when possible.
-    2) Build/cache a labelled grid of the shop's actual Google Sheet product images.
-    3) Send customer image + reference grid + text catalog in ONE vision call.
-    4) If the grid cannot be built, fall back to customer image + text catalog.
-
-    This preserves one-call latency for ManyChat's fixed 10-second timeout.
+    One request contains:
+      customer image + rich text catalog + labelled product reference images.
+    If references cannot be downloaded, the rich text catalog still remains as
+    a fallback. No product-specific code is hard-coded, so new Sheet products
+    join recognition automatically after the normal catalog refresh.
     """
     if not OPENAI_API_KEY or not image_url:
         return None, None
@@ -811,6 +840,8 @@ def ai_find_product_from_image(image_url, caption=""):
     if not source_url.startswith(("http://", "https://", "data:")):
         return None, None
 
+    # Short-lived Facebook CDN URLs are safest when copied into the request as
+    # bytes immediately. If that fails, OpenAI can still try the public URL.
     customer_vision_url = source_url
     if source_url.startswith(("http://", "https://")):
         try:
@@ -821,37 +852,33 @@ def ai_find_product_from_image(image_url, caption=""):
                 headers={"User-Agent": "Mozilla/5.0"},
             )
             r.raise_for_status()
-            ctype = (r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
-                     or "image/jpeg")
-            if ctype.startswith("image/") and r.content:
-                customer_vision_url = (
-                    f"data:{ctype};base64," + base64.b64encode(r.content).decode("ascii")
-                )
-                print("IMAGE INPUT: DOWNLOADED FB/CDN BYTES", len(r.content), flush=True)
+            raw = r.content or b""
+            mime = _image_mime_from_bytes(raw, r.headers.get("Content-Type", ""))
+            if raw and mime:
+                customer_vision_url = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+                print("IMAGE INPUT: DOWNLOADED FB/CDN BYTES", len(raw), flush=True)
         except Exception as e:
             print("IMAGE FAST DOWNLOAD FALLBACK TO URL:", str(e), flush=True)
-
-    reference_grid = ""
-    try:
-        reference_grid = catalog_reference_grid_data_url()
-    except Exception as e:
-        print("REFERENCE GRID FALLBACK:", str(e), flush=True)
 
     content = [
         {
             "type": "text",
             "text": (
-                "Identify exactly ONE matching product from this shop catalog. "
-                "The FIRST image is the CUSTOMER image. It may be an actual product, "
-                "packaging, screenshot, or a photo of a phone screen. "
-                "If a labelled REFERENCE CATALOG GRID is provided after it, compare the "
-                "customer image directly with those reference photos and use the CODE label "
-                "of the best confident visual match. Also use visible Burmese/English/Chinese "
-                "text, brand/model markings, shape and catalog descriptions. "
-                "Return ONLY JSON: {\"code\":\"0001\"}. If no confident catalog match, "
-                "return {\"code\":null}. Never invent a code.\n\n"
-                f"TEXT CATALOG:\n{catalog}\n\nCUSTOMER TEXT: {caption}"
+                "Identify exactly ONE shop product shown in the CUSTOMER IMAGE. "
+                "The image can be the physical item, packaging, screenshot, ad image, "
+                "or a photo of another phone screen. Compare it against every labelled "
+                "REFERENCE PRODUCT image below. Use visual shape, packaging layout, "
+                "logos, colors, model numbers, and visible Burmese/English/Chinese text. "
+                "The rich text catalog is supporting evidence. A quantity visible in text "
+                "is never a product code. Return ONLY JSON {\"code\":\"0001\"}. "
+                "If no single catalog product is a confident match, return "
+                "{\"code\":null}. Never invent a code.\n\n"
+                f"TEXT CATALOG:\n{catalog}\n\nCUSTOMER CAPTION: {caption}"
             ),
+        },
+        {
+            "type": "text",
+            "text": "CUSTOMER IMAGE:",
         },
         {
             "type": "image_url",
@@ -859,20 +886,21 @@ def ai_find_product_from_image(image_url, caption=""):
         },
     ]
 
-    if reference_grid:
-        content.extend([
-            {
-                "type": "text",
-                "text": "REFERENCE CATALOG GRID: each tile is labelled CODE ####. Match the CUSTOMER image to one tile.",
-            },
-            {
-                "type": "image_url",
-                "image_url": {"url": reference_grid, "detail": "low"},
-            },
-        ])
-        print("IMAGE MATCH MODE: CUSTOMER + REFERENCE GRID", flush=True)
+    refs = []
+    try:
+        refs = catalog_reference_content_parts()
+    except Exception as e:
+        print("REFERENCE IMAGES FALLBACK:", str(e), flush=True)
+
+    if refs:
+        content.append({
+            "type": "text",
+            "text": "REFERENCE CATALOG IMAGES. Each image belongs to the CODE label immediately before it:",
+        })
+        content.extend(refs)
+        print("IMAGE MATCH MODE: CUSTOMER + ALL REFERENCE IMAGES", len(refs) // 2, flush=True)
     else:
-        print("IMAGE MATCH MODE: CUSTOMER + TEXT CATALOG FALLBACK", flush=True)
+        print("IMAGE MATCH MODE: CUSTOMER + RICH TEXT CATALOG FALLBACK", flush=True)
 
     answer = openai_chat(
         [{"role": "user", "content": content}],
@@ -888,7 +916,6 @@ def ai_find_product_from_image(image_url, caption=""):
 
     print("IMAGE MATCH: NONE", flush=True)
     return None, None
-
 
 # =========================
 # PRODUCT REPLY
@@ -2887,7 +2914,7 @@ def handle_manychat_request(data):
             session["items"] = {}
             return done(manychat_product_response(code, product))
 
-    # V34 GLOBAL INFO-FIRST RULE
+    # V35 GLOBAL INFO-FIRST RULE
     # Any current message that identifies a sellable product must show the product
     # image + Google Sheet detail + price/delivery/COD BEFORE order collection.
     # This is global for every catalog item and future Sheet items, not just Mini Vise.
@@ -2914,10 +2941,10 @@ def handle_manychat_request(data):
             session["quantity_confirmed"] = True
             lock_facebook_account_name(session, account_name)
             missing_now = order_missing_fields(session)
-            print("V34 GLOBAL INFO FIRST + ORDER:", code, qty_now, missing_now, flush=True)
+            print("V35 GLOBAL INFO FIRST + ORDER:", code, qty_now, missing_now, flush=True)
             return done(manychat_product_order_response(code, product, missing_now))
 
-        print("V34 GLOBAL INFO FIRST - PRODUCT QUERY:", code, flush=True)
+        print("V35 GLOBAL INFO FIRST - PRODUCT QUERY:", code, flush=True)
         return done(manychat_product_response(code, product))
 
     last_product_ready = session.get("last_product_code") in PRODUCTS
@@ -3046,10 +3073,21 @@ def handle_manychat_request(data):
     if greeting:
         return done(manychat_text(greeting))
 
-    # An unresolved non-image unknown/non-shopping question or anything the
-    # bot cannot confidently classify goes to a human Admin. Generic purchase
-    # intent without a product was already handled above with the exact
-    # "which product" sentence, so it never reaches this fallback.
+    # Preserve the long-standing shop rule: if the buyer is clearly talking
+    # about a product but Code/Text/Image recognition still cannot identify which
+    # catalog item, do NOT guess and do NOT pause the bot. Ask exactly which item.
+    low_unknown = str(message or "").lower()
+    productish_words = (
+        "ပစ္စည်း", "ဘယ်ဟာ", "ဒီဟာ", "ဒီပစ္စည်း", "စျေး", "ဈေး", "price",
+        "stock", "ရှိလား", "ပို့ခ", "delivery", "အသုံး", "ဘယ်လိုသုံး",
+        "ယူ", "မှာ", "order", "buy", "want", "item", "product",
+    )
+    if any(word in low_unknown for word in productish_words):
+        print("UNRESOLVED PRODUCT TEXT - ASK WHICH PRODUCT", flush=True)
+        return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
+
+    # Explicit Admin requests were handled earlier. Truly unrelated/unknown
+    # non-product questions can still go to a human.
     pause_for_admin(contact_id)
     return done(manychat_text(
         "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
