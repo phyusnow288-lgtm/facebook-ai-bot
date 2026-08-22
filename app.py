@@ -39,6 +39,8 @@ ORDER_SESSIONS = {}
 PROCESSED_MESSAGE_IDS = set()
 BOT_SENT_MESSAGE_IDS = set()
 ADMIN_PAUSE_UNTIL = {}
+MANYCHAT_ECHO_IGNORE_UNTIL = {}
+MANYCHAT_ECHO_GRACE_SECONDS = int(os.environ.get("MANYCHAT_ECHO_GRACE_SECONDS", "20"))
 
 
 # =========================
@@ -907,9 +909,7 @@ def send_product_response(recipient_id, code, product):
     send_facebook_text(
         recipient_id,
         (
-            "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို "
-            "အပြည့်အစုံရေးပို့ပေးပါရှင်။ အရေအတွက် မရေးထားရင် 1 ခုအဖြစ် "
-            "အော်ဒါတင်ပေးပါမယ်ရှင်။ 2 ခုနှင့်အထက်ဆို x2 / 2 ခု လို့ရေးပေးပါရှင်။"
+            'မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။'
         ),
     )
 
@@ -990,10 +990,10 @@ def handle_echo_message(event, message_data):
     """
     Page/Admin outgoing message handling.
 
-    Messages sent directly by this Python bot are tracked by message id and
-    ignored here. Any other Page-sent echo is treated as a human Admin reply.
-    The bot pauses for that customer for ADMIN_PAUSE_MINUTES. Every new manual
-    Admin reply refreshes the pause window.
+    - Python-bot messages are ignored by message id.
+    - ManyChat-generated replies are ignored for a short grace period so they
+      are not mistaken for a human Admin reply.
+    - A real manual Page/Admin reply pauses ONLY that one customer.
     """
     mid = str(message_data.get("mid", "") or "").strip()
 
@@ -1002,14 +1002,21 @@ def handle_echo_message(event, message_data):
         print("BOT ECHO IGNORED:", mid, flush=True)
         return
 
-    customer_id = (
+    customer_id = str(
         event.get("recipient", {}).get("id")
         or event.get("sender", {}).get("id")
-    )
+        or ""
+    ).strip()
 
     if not customer_id:
         return
 
+    ignore_until = MANYCHAT_ECHO_IGNORE_UNTIL.get(customer_id, 0)
+    if ignore_until > now_ts():
+        print("MANYCHAT ECHO IGNORED:", customer_id, flush=True)
+        return
+
+    MANYCHAT_ECHO_IGNORE_UNTIL.pop(customer_id, None)
     pause_for_admin(customer_id)
 
     print(
@@ -1018,7 +1025,6 @@ def handle_echo_message(event, message_data):
         f"{ADMIN_PAUSE_MINUTES} minutes",
         flush=True,
     )
-
 
 
 def new_order_session():
@@ -1433,6 +1439,14 @@ def build_telegram_order(session):
 # =========================
 ORDER_WORDS = (
     "order",
+    "place an order",
+    "make a purchase",
+    "can i make a purchase",
+    "purchase",
+    "buy",
+    "i want it",
+    "i want this",
+    "want this",
     "မှာယူ",
     "မှာမယ်",
     "ယူမယ်",
@@ -1441,7 +1455,11 @@ ORDER_WORDS = (
     "လိုချင်တယ်",
     "လိုချင်ပါတယ်",
     "ယူချင်တယ်",
+    "တစ်ခုယူမယ်",
+    "၁ခုယူမယ်",
+    "၁ ခုယူမယ်",
 )
+
 
 GREETING_WORDS = (
     "hi",
@@ -1507,6 +1525,72 @@ def handoff_to_admin(sender_id):
 
 
 
+
+def generic_purchase_intent(text):
+    """Order/purchase wording that does not identify a product by itself."""
+    low = str(text or "").strip().lower()
+    return bool(low and is_order_message(low))
+
+
+def extract_product_context_from_manychat(data):
+    """
+    Optional forward-compatible Ad/Product context.
+
+    If ManyChat later sends any product/ad field containing a 4-digit code
+    (e.g. product_code=0016, ad_name='0016 Chain Breaker'), use it.
+    The current flow can keep sending only message + contact_id; this helper
+    does not break that setup.
+    """
+    if not isinstance(data, dict):
+        return "", None
+
+    preferred_keys = (
+        "product_code", "code", "ad_code", "source_code", "ref_code",
+        "ad_name", "ad_title", "campaign_name", "source", "ref",
+    )
+
+    for key in preferred_keys:
+        value = str(data.get(key, "") or "").strip()
+        if not value:
+            continue
+        code, product = find_product_by_code(value)
+        if product:
+            return code, product
+
+    # Last-resort scan of simple scalar fields only.
+    for key, value in data.items():
+        if key in ("message", "contact_id"):
+            continue
+        if isinstance(value, (str, int, float)):
+            code, product = find_product_by_code(str(value))
+            if product:
+                return code, product
+
+    return "", None
+
+
+def finalize_manychat(contact_id, response):
+    """
+    Remember that ManyChat is about to send a reply for this customer.
+    This prevents the Page echo of that automated reply from being mistaken
+    for a manual Admin takeover.
+    """
+    try:
+        messages = (
+            response.get("content", {}).get("messages", [])
+            if isinstance(response, dict)
+            else []
+        )
+        if contact_id and messages:
+            MANYCHAT_ECHO_IGNORE_UNTIL[str(contact_id)] = (
+                now_ts() + MANYCHAT_ECHO_GRACE_SECONDS
+            )
+    except Exception as e:
+        print("MANYCHAT FINALIZE WARNING:", str(e), flush=True)
+
+    return response
+
+
 # =========================
 # MANYCHAT DYNAMIC BLOCK
 # =========================
@@ -1545,9 +1629,7 @@ def manychat_product_response(code, product):
         {
             "type": "text",
             "text": (
-                "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို "
-                "အပြည့်အစုံရေးပို့ပေးပါရှင်။ အရေအတွက် မရေးထားရင် 1 ခုအဖြစ် "
-                "အော်ဒါတင်ပေးပါမယ်ရှင်။ 2 ခုနှင့်အထက်ဆို x2 / 2 ခု လို့ရေးပေးပါရှင်။"
+                'မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။'
             ),
         }
     )
@@ -1608,13 +1690,17 @@ def delivery_time_reply(text):
 def handle_manychat_request(data):
     """
     ManyChat body:
-      message     = Last Text Input
-      contact_id  = Contact Id
-      image_url   = optional customer attachment URL
+      message      = Last Text Input
+      contact_id   = Contact Id
+      image_url    = optional customer attachment URL
+      product_code/ad_code/ad_name = optional future Ad context
 
-    One incoming customer event produces one Dynamic Block response.
-    Product responses may contain image + detail + price + order prompt as
-    multiple message objects inside that single response.
+    Rules:
+    - Unclear product => exactly "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"
+    - Product => image, detail, price, then exact order-info prompt.
+    - No quantity supplied => defaults to 1 item.
+    - Name/address/phone completion => buyer confirmation + Telegram.
+    - Explicit Admin request only => Admin handoff/pause for that customer.
     """
     load_products()
 
@@ -1636,50 +1722,67 @@ def handle_manychat_request(data):
         flush=True,
     )
 
-    if not contact_id:
-        return manychat_text(
-            "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
-        )
+    def done(response):
+        return finalize_manychat(contact_id, response)
 
-    # Pause is per customer id only. Other customers continue normally.
+    if not contact_id:
+        return manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။")
+
+    # Pause is per customer only. Other customers continue normally.
     if admin_is_active(contact_id):
         print("MANYCHAT ADMIN ACTIVE - BOT SILENT:", contact_id, flush=True)
         return manychat_response([])
 
     session = get_order_session(contact_id)
 
+    # Explicit human/Admin request only.
     if wants_admin(message):
         pause_for_admin(contact_id)
-        return manychat_text(
+        return done(manychat_text(
             "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
-        )
+        ))
 
     if asks_delivery_time(message):
-        return manychat_text(delivery_time_reply(message))
+        return done(manychat_text(delivery_time_reply(message)))
 
     # -------- Product recognition --------
-    code, product = find_product_by_code(message)
+    # 0) Optional ad/product context.
+    context_code, context_product = extract_product_context_from_manychat(data)
 
+    # 1) Direct code/name from current message.
+    code, product = find_product_by_code(message)
     if not product:
         code, product = find_product_by_name(message)
 
+    # 2) Customer image/screenshot.
     if not product and incoming_image_url:
         code, product = ai_find_product_from_image(
             incoming_image_url,
             message,
         )
 
-    if not product and message:
+    # If this is only a generic purchase phrase and there is no remembered/ad
+    # product context, DO NOT ask OpenAI to guess a product.
+    generic_order = generic_purchase_intent(message)
+
+    # 3) Description / Burmese / English / Chinese text.
+    if not product and message and not generic_order:
         code, product = ai_find_product_from_text(message)
 
-    # A bare code/name is always browsing, never swallowed by stale order state.
+    # Use optional Ad context if current message did not identify a product.
+    if not product and context_product:
+        code, product = context_code, context_product
+
+    # A bare product code/name is browsing and refreshes the current product.
     if product and is_pure_product_query(message, code, product):
         ORDER_SESSIONS[contact_id] = new_order_session()
         ORDER_SESSIONS[contact_id]["last_product_code"] = code
-        return manychat_product_response(code, product)
+        return done(manychat_product_response(code, product))
 
     if product:
         session["last_product_code"] = code
+
+    last_product_ready = session.get("last_product_code") in PRODUCTS
 
     active_order = bool(
         session.get("items")
@@ -1689,10 +1792,13 @@ def handle_manychat_request(data):
         or session.get("quantity_confirmed")
     )
 
-    last_product_ready = session.get("last_product_code") in PRODUCTS
+    # Generic "လိုချင်ပါတယ်" / "Can I make a purchase?" with no product known:
+    # never hand off to Admin and never guess a product.
+    if generic_order and not product and not last_product_ready and not active_order:
+        return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
 
     order_intent = (
-        is_order_message(message)
+        generic_order
         or active_order
         or (last_product_ready and looks_like_order_details(message))
         or (last_product_ready and bool(incoming_image_url))
@@ -1701,15 +1807,23 @@ def handle_manychat_request(data):
 
     # -------- Order collection --------
     if order_intent:
-        if product and is_order_message(message):
+        if product and generic_order:
             session["items"].setdefault(code, 1)
 
-        # After browsing a product, name/address/phone means ordering that product.
+        # If one product was browsed/identified, quantity omitted means 1 piece.
         if not session["items"] and last_product_ready:
             session["items"][session["last_product_code"]] = 1
             session["quantity_confirmed"] = True
 
-        if message:
+        # If no product is known yet, ask only which product.
+        if not session["items"] and not last_product_ready:
+            return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
+
+        if message and not (
+            generic_order
+            and not looks_like_order_details(message)
+            and extract_explicit_quantity(message) is None
+        ):
             print("ORDER TEXT RECEIVED:", message, flush=True)
             session = merge_order_message(contact_id, message)
             print("ORDER SESSION AFTER TEXT:", session, flush=True)
@@ -1742,7 +1856,7 @@ def handle_manychat_request(data):
         print("ORDER MISSING:", missing, flush=True)
 
         if missing:
-            return manychat_text(order_prompt_for_missing(missing))
+            return done(manychat_text(order_prompt_for_missing(missing)))
 
         telegram_text = build_telegram_order(session)
         print("TELEGRAM ORDER TEXT:", telegram_text, flush=True)
@@ -1750,33 +1864,24 @@ def handle_manychat_request(data):
         if send_telegram_message(telegram_text):
             buyer_text = buyer_order_confirmation(session)
             ORDER_SESSIONS[contact_id] = new_order_session()
-            return manychat_text(buyer_text)
+            return done(manychat_text(buyer_text))
 
-        pause_for_admin(contact_id)
-        return manychat_text(
-            "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
-        )
+        # Telegram failure should not permanently silence the bot.
+        # Keep the order data and tell the buyer Admin will handle it.
+        return done(manychat_text(
+            "အော်ဒါအချက်အလက် ရရှိပါပြီရှင်။ Admin က ဆက်လက်စစ်ဆေးပေးပါမယ်ရှင်။"
+        ))
 
-    # Product recognized from a customer image/screenshot.
+    # Product recognized from non-pure text/image.
     if product:
-        return manychat_product_response(code, product)
+        return done(manychat_product_response(code, product))
 
     greeting = simple_greeting(message)
     if greeting:
-        return manychat_text(greeting)
+        return done(manychat_text(greeting))
 
-    # ManyChat must actually pass image_url for image recognition.
-    if not message and not incoming_image_url:
-        return manychat_text(
-            "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"
-        )
-
-    # Shopping-unrelated / unknown / explicit unresolved request -> human.
-    pause_for_admin(contact_id)
-    return manychat_text(
-        "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
-    )
-
+    # User's required unclear-product fallback. Never auto-pause Admin here.
+    return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
 
 
 # =========================
@@ -1970,11 +2075,21 @@ def webhook():
 
             last_product_ready = session.get("last_product_code") in PRODUCTS
 
+            generic_order = generic_purchase_intent(text)
+
+            if generic_order and not product and not last_product_ready and not active_order:
+                send_facebook_text(
+                    sender_id,
+                    "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။",
+                )
+                continue
+
             order_intent = (
-                is_order_message(text)
+                generic_order
                 or active_order
                 or (last_product_ready and looks_like_order_details(text))
                 or (last_product_ready and bool(incoming_image_url))
+                or (extract_explicit_quantity(text) is not None and last_product_ready)
             )
 
             if order_intent:
@@ -2048,10 +2163,13 @@ def webhook():
                 continue
 
             # ---------------------------------
-            # SHOPPING-UNRELATED / UNKNOWN -> ADMIN
-            # Bot does not improvise unrelated answers.
+            # UNCLEAR PRODUCT
+            # User requirement: do not guess and do not auto-handoff.
             # ---------------------------------
-            handoff_to_admin(sender_id)
+            send_facebook_text(
+                sender_id,
+                "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။",
+            )
 
     return "EVENT_RECEIVED", 200
 
