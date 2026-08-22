@@ -52,7 +52,7 @@ TELEGRAM_ORDER_DEDUP_SECONDS = 300
 # Dynamic Block request. Keyed per contact + exact input/context.
 RECENT_MANYCHAT_INPUTS = {}
 RECENT_MANYCHAT_LOCK = threading.Lock()
-MANYCHAT_INPUT_DEDUP_SECONDS = int(os.environ.get("MANYCHAT_INPUT_DEDUP_SECONDS", "8"))
+MANYCHAT_INPUT_DEDUP_SECONDS = int(os.environ.get("MANYCHAT_INPUT_DEDUP_SECONDS", "30"))
 MANYCHAT_ECHO_GRACE_SECONDS = int(os.environ.get("MANYCHAT_ECHO_GRACE_SECONDS", "20"))
 PRODUCT_REFRESH_LOCK = threading.Lock()
 PRODUCT_REFRESH_RUNNING = False
@@ -1415,7 +1415,14 @@ def detect_delivery_area_from_text(value):
         "လွိုင်ကော်", "loikaw", "ဟားခါး", "hakha", "ဖားကန့်", "hpakant",
         "မြစ်ကြီးနား", "myitkyina", "ဗန်းမော်", "bhamo", "စစ်တွေ", "sittwe",
         "သံတွဲ", "thandwe", "ကျောက်ဖြူ", "kyaukphyu", "မောင်တော", "maungdaw",
-        "မော်လမြိုင်ကျွန်း", "mawlamyinegyun", "ဟင်္သာတ", "h is not used",
+        "မော်လမြိုင်ကျွန်း", "mawlamyinegyun", "ဟင်္သာတ", "hinthada",
+        "ဧရာဝတီ", "ayeyarwady", "irrawaddy",
+        "အိမ်မဲ", "einme", "einme township",
+        "မြောင်းမြ", "myaungmya", "ဝါးခယ်မ", "wakema", "လပွတ္တာ", "labutta",
+        "မအူပင်", "maubin", "ဖျာပုံ", "pyapon", "ဘိုကလေး", "bogale",
+        "ကျောင်းကုန်း", "kyaunggon", "ကျုံပျော်", "kyonpyaw", "ငပုတော", "ngapudaw",
+        "ဇလွန်", "zalun", "လေးမျက်နှာ", "laymyethna", "မြန်အောင်", "myanaung",
+        "ကြံခင်း", "kyangin", "h is not used",
     )
     # Remove a deliberately impossible sentinel without complicating matching.
     other_words = tuple(w for w in other_words if w != "h is not used")
@@ -1748,6 +1755,7 @@ def unavailable_order_reply(code, availability):
 
 
 def build_telegram_order(session):
+    """Build the exact compact order format used by the shop/admin."""
     delivery_area = str(session.get("delivery_area", "")).strip().lower()
     delivery_fee = delivery_fee_for_area(delivery_area)
 
@@ -1761,10 +1769,7 @@ def build_telegram_order(session):
 
     for code, qty in session.get("items", {}).items():
         product = PRODUCTS.get(code, {})
-        item_name = str(
-            get_row_value(product, "Product Name", "Name")
-        ).strip()
-
+        item_name = str(get_row_value(product, "Product Name", "Name")).strip()
         unit_price = product_price(code)
         item_total = unit_price * qty
         subtotal += item_total
@@ -1772,28 +1777,27 @@ def build_telegram_order(session):
 
         if qty == 1:
             item_parts.append(
-                f"(Code {code}) {item_name} စျေးနှုန်း {unit_price} Ks"
+                f"Code {code} {item_name} စျေးနှုန်း - {unit_price:,} Ks"
             )
         else:
             item_parts.append(
-                f"(Code {code}) {item_name} စျေးနှုန်း {unit_price} Ks * {qty}"
+                f"Code {code} {item_name} စျေးနှုန်း - {unit_price:,} Ks x {qty} = {item_total:,} Ks"
             )
 
     grand_total = subtotal + delivery_fee
     items_text = " + ".join(item_parts)
 
     if delivery_area == "yangon":
-        delivery_text = f"ပို့ဆောင်ခ ရန်ကုန် {delivery_fee}Ks"
+        delivery_text = f"ရန်ကုန်ပို့ခ - {delivery_fee:,} Ks"
     else:
-        delivery_text = f"ပို့ဆောင်ခ နယ် {delivery_fee}Ks"
+        delivery_text = f"နယ်ပို့ခ - {delivery_fee:,} Ks"
 
-    cod_text = "COD"
-    if total_pcs > 1:
-        cod_text = f"COD {total_pcs} PCS"
+    cod_text = "COD" if total_pcs <= 1 else f"COD {total_pcs} PCS"
 
     return (
-        f"{name}/{address}/{phone}/"
-        f"{items_text} + {delivery_text} = {grand_total}Ks / {cod_text}"
+        f"{name} / {address} / {phone} / "
+        f"{items_text} + {delivery_text} / "
+        f"စုစုပေါင်း - {grand_total:,} Ks / {cod_text}"
     )
 
 
@@ -2170,6 +2174,31 @@ def handle_manychat_request(data):
     if asks_delivery_time(message):
         return done(manychat_text(delivery_time_reply(message)))
 
+    # If the current message explicitly contains product code(s), those codes
+    # are authoritative for THIS order. Do not carry an older browsed product
+    # into the new order. This fixes stale-session orders such as old 0001 + new
+    # explicit 0013 becoming an unintended two-item order.
+    explicit_message_items = find_codes_and_quantities(message)
+    if explicit_message_items:
+        sellable_explicit = {
+            c: q for c, q in explicit_message_items.items()
+            if c in PRODUCTS
+        }
+        if sellable_explicit:
+            old_items = dict(session.get("items", {}))
+            if old_items != sellable_explicit:
+                print(
+                    "EXPLICIT PRODUCT OVERRIDES STALE SESSION ITEMS:",
+                    old_items,
+                    "->",
+                    sellable_explicit,
+                    flush=True,
+                )
+            session["items"] = dict(sellable_explicit)
+            session["quantity_confirmed"] = True
+            if len(sellable_explicit) == 1:
+                session["last_product_code"] = next(iter(sellable_explicit))
+
     # -------- FAST ORDER PATH (V22) --------
     # Keep this before product/AI/image recognition. Once a customer has just
     # viewed a sellable product, a message containing order details must be
@@ -2189,7 +2218,7 @@ def handle_manychat_request(data):
                 print("V22 FAST ORDER SESSION:", session, flush=True)
 
             explicit_qty = extract_explicit_quantity(message)
-            if explicit_qty is not None:
+            if explicit_qty is not None and not explicit_message_items:
                 session["items"][remembered_code] = explicit_qty
                 session["quantity_confirmed"] = True
 
@@ -2341,9 +2370,15 @@ def handle_manychat_request(data):
             coded = find_codes_and_quantities(message)
 
             if coded:
-                for item_code, qty in coded.items():
-                    if item_code in PRODUCTS:
-                        session["items"][item_code] = qty
+                # Product codes explicitly written in the current customer
+                # message define the current order and replace stale items.
+                session["items"] = {
+                    item_code: qty
+                    for item_code, qty in coded.items()
+                    if item_code in PRODUCTS
+                }
+                if len(session["items"]) == 1:
+                    session["last_product_code"] = next(iter(session["items"]))
             elif target_code in PRODUCTS:
                 session["items"][target_code] = explicit_qty
 
@@ -2690,9 +2725,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
-
-
-
-
-
-
