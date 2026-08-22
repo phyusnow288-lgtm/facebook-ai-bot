@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V21-FINAL-IMAGE-ORDER-FIX"
+BOT_VERSION = "V22-ORDER-ONLY-FIX"
 
 app = Flask(__name__)
 
@@ -983,6 +983,32 @@ def send_telegram_message(message):
 
     except Exception as e:
         print("TELEGRAM ERROR:", str(e), flush=True)
+        return False
+
+
+
+
+def send_telegram_order_now(message):
+    """Send one order to Telegram synchronously with a short timeout.
+
+    This path is intentionally simple and is used only after all order fields
+    are already complete, so the customer order is not lost in a daemon thread.
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("TELEGRAM ENV IS MISSING", flush=True)
+        return False
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=5,
+        )
+        print("TELEGRAM ORDER STATUS:", response.status_code, flush=True)
+        print("TELEGRAM ORDER RESPONSE:", response.text, flush=True)
+        return response.status_code == 200
+    except Exception as e:
+        print("TELEGRAM ORDER ERROR:", str(e), flush=True)
         return False
 
 
@@ -2088,6 +2114,54 @@ def handle_manychat_request(data):
     if asks_delivery_time(message):
         return done(manychat_text(delivery_time_reply(message)))
 
+    # -------- FAST ORDER PATH (V22) --------
+    # Keep this before product/AI/image recognition. Once a customer has just
+    # viewed a sellable product, a message containing order details must be
+    # treated as an order immediately. This avoids unrelated recognition logic
+    # swallowing Name / Address / Phone / quantity messages.
+    remembered_code = str(session.get("last_product_code", "") or "").strip()
+    if remembered_code in PRODUCTS and (looks_like_order_details(message) or generic_purchase_intent(message)):
+        remembered_product = PRODUCTS.get(remembered_code, {})
+        if product_is_sellable(remembered_product):
+            # Default quantity is 1 when omitted.
+            session["items"].setdefault(remembered_code, 1)
+            session["quantity_confirmed"] = True
+
+            if message:
+                print("V22 FAST ORDER TEXT:", message, flush=True)
+                session = merge_order_message(contact_id, message)
+                print("V22 FAST ORDER SESSION:", session, flush=True)
+
+            explicit_qty = extract_explicit_quantity(message)
+            if explicit_qty is not None:
+                session["items"][remembered_code] = explicit_qty
+                session["quantity_confirmed"] = True
+
+            session = infer_delivery_area_for_complete_order(session)
+            fast_missing = order_missing_fields(session)
+            print("V22 FAST ORDER MISSING:", fast_missing, flush=True)
+
+            if not fast_missing:
+                bad_code, bad_status = first_unavailable_session_item(session)
+                if bad_code:
+                    ORDER_SESSIONS[contact_id] = new_order_session()
+                    return done(manychat_text(unavailable_order_reply(bad_code, bad_status)))
+
+                telegram_text = build_telegram_order(session)
+                print("V22 TELEGRAM ORDER TEXT:", telegram_text, flush=True)
+                if send_telegram_order_now(telegram_text):
+                    buyer_text = buyer_order_confirmation(session)
+                    ORDER_SESSIONS[contact_id] = new_order_session()
+                    return done(manychat_text(buyer_text))
+
+                # Do not erase the session on Telegram failure.
+                return done(manychat_text(
+                    "အော်ဒါအချက်အလက် ရရှိပါပြီရှင်။ Admin က ဆက်လက်စစ်ဆေးပေးပါမယ်ရှင်။"
+                ))
+
+            # If the customer sent only part of the order, ask only for what is missing.
+            return done(manychat_text(order_prompt_for_missing(fast_missing)))
+
     # -------- Product recognition --------
     recognized_from_image = False
     recognized_from_ad = False
@@ -2234,15 +2308,13 @@ def handle_manychat_request(data):
         telegram_text = build_telegram_order(session)
         print("TELEGRAM ORDER TEXT:", telegram_text, flush=True)
 
-        # IMPORTANT: ManyChat Dynamic Block has a hard 10-second timeout.
-        # Never wait for Telegram here; queue it in a background worker and
-        # return the buyer response immediately.
-        if queue_telegram_order(contact_id, telegram_text):
+        # V22: complete orders are sent directly with a short timeout.
+        if send_telegram_order_now(telegram_text):
             buyer_text = buyer_order_confirmation(session)
             ORDER_SESSIONS[contact_id] = new_order_session()
             return done(manychat_text(buyer_text))
 
-        # Missing Telegram configuration: keep the session so the order is not lost.
+        # Keep the session on Telegram failure so the order is not lost.
         return done(manychat_text(
             "အော်ဒါအချက်အလက် ရရှိပါပြီရှင်။ Admin က ဆက်လက်စစ်ဆေးပေးပါမယ်ရှင်။"
         ))
@@ -2555,6 +2627,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
+
 
 
 
