@@ -8,6 +8,8 @@ import mimetypes
 import requests
 from flask import Flask, request, Response
 
+BOT_VERSION = "V17-YANGON-ORDER-FIX"
+
 app = Flask(__name__)
 
 # =========================
@@ -210,15 +212,14 @@ def product_image_url(product):
 def product_public_image_url(code, product):
     """
     Return a stable public HTTPS image URL served by this Render app.
-    This avoids ManyChat/Meta having to follow Google Drive redirects.
+
+    IMPORTANT: never download/verify the Google Drive image inside the ManyChat
+    Dynamic Block request. That extra network call can make ManyChat time out even
+    when Render eventually logs HTTP 200. The /product-image/<code> endpoint will
+    fetch the image only when ManyChat/Meta requests the image itself.
     """
     source = product_image_url(product)
     if not source:
-        return ""
-
-    # Verify source image is actually downloadable before advertising it to ManyChat.
-    image_bytes, _content_type = download_image_bytes(source)
-    if not image_bytes:
         return ""
 
     base = request.host_url.rstrip("/")
@@ -1178,38 +1179,165 @@ Rules:
 
 
 def detect_delivery_area_from_text(value):
-    low = str(value or "").lower()
+    """
+    Detect delivery area only when the text gives a useful location clue.
+
+    Yangon customers often write only township/ward/road and omit the word
+    "ရန်ကုန်".  Therefore Yangon township names count as Yangon.  For non-Yangon
+    orders we prefer explicit city/state/town names.  If no area can be detected,
+    a later finalization step may safely default a COMPLETE order to Yangon.
+    """
+    low = str(value or "").lower().strip()
+    if not low:
+        return ""
 
     yangon_words = (
-        "ရန်ကုန်", "တာမွေ", "တောင်ဥက္ကလာ", "မြောက်ဥက္ကလာ",
-        "သင်္ဃန်းကျွန်း", "သဃ်ကျွန်း", "သင်္ဃန်း", "လှိုင်", "ကမာရွတ်",
-        "မရမ်းကုန်း", "အင်းစိန်", "သာကေတ", "ဒဂုံ", "လမ်းမတော်",
-        "ပန်းဘဲတန်း", "ကျောက်တံတား", "ဗဟန်း", "စမ်းချောင်း",
-        "မင်္ဂလာတောင်ညွန့်", "ကြည့်မြင်တိုင်", "အလုံ", "လှိုင်သာယာ",
-        "ရွှေပြည်သာ", "ဒလ", "မှော်ဘီ", "ထောက်ကြန့်",
-        "yangon", "tarmwe", "tamwe", "thingangyun",
+        # City / common spellings
+        "ရန်ကုန်", "yangon", "rangoon",
+        # Yangon townships / common customer spellings
+        "တာမွေ", "tamwe", "tarmwe",
+        "ဗဟန်း", "bahan",
+        "စမ်းချောင်း", "sanchaung",
+        "ကမာရွတ်", "kamayut", "kamaryut",
+        "လှိုင်", "hlaing",
+        "မရမ်းကုန်း", "mayangone", "mayangon",
+        "အင်းစိန်", "inseIn".lower(),
+        "မင်္ဂလာဒုံ", "mingaladon",
+        "ရွှေပြည်သာ", "shwepyithar", "shwe pyi thar",
+        "လှိုင်သာယာ", "hlaingthaya", "hlaing tharyar", "hlaing thar yar",
+        "သင်္ဃန်းကျွန်း", "သဃ်ကျွန်း", "သင်္ဃန်း", "thingangyun", "thingangyun",
+        "တောင်ဥက္ကလာ", "တောင်ဥက္ကလာပ", "south okkalapa", "south okkala",
+        "မြောက်ဥက္ကလာ", "မြောက်ဥက္ကလာပ", "north okkalapa", "north okkala",
+        "သာကေတ", "thaketa",
+        "ဒေါပုံ", "dawbon",
+        "ပုဇွန်တောင်", "pazundaung",
+        "မင်္ဂလာတောင်ညွန့်", "mingala taungnyunt", "mingalar taung nyunt",
+        "ဗိုလ်တထောင်", "botahtaung", "botataung",
+        "ကျောက်တံတား", "kyauktada",
+        "ပန်းဘဲတန်း", "pabedan",
+        "လမ်းမတော်", "lanmadaw",
+        "လသာ", "latha",
+        "အလုံ", "ahlone", "alon",
+        "ကြည့်မြင်တိုင်", "kyimyindaing", "kyimyindine",
+        "ဒဂုံ", "dagon",
+        "ဒဂုံမြို့သစ်မြောက်ပိုင်း", "မြောက်ဒဂုံ", "north dagon",
+        "ဒဂုံမြို့သစ်တောင်ပိုင်း", "တောင်ဒဂုံ", "south dagon",
+        "ဒဂုံမြို့သစ်အရှေ့ပိုင်း", "အရှေ့ဒဂုံ", "east dagon",
+        "ဒဂုံဆိပ်ကမ်း", "dagon seikkan", "dagon seikkan",
+        "ဒလ", "dala",
+        "ဆိပ်ကြီးခနောင်တို", "seikgyikanaungto", "seikgyi kanaungto",
+        "ကိုကိုးကျွန်း", "cocokyun", "coco island",
+        "ထန်းတပင်", "htantabin",
+        "မှော်ဘီ", "hmawbi",
+        "လှည်းကူး", "hleGu".lower(), "hlegu",
+        "တိုက်ကြီး", "taikkyi",
+        "ကော့မှူး", "kawhmu",
+        "ကွမ်းခြံကုန်း", "kungyangon",
+        "သန်လျင်", "thanlyin",
+        "ကျောက်တန်း", "kyauktan",
+        "သုံးခွ", "thongwa",
+        "ခရမ်း", "khayan",
+        "တွံတေး", "twantay",
+        "ကျောက်မြောင်း", "kyaukmyaung",
     )
     if any(word in low for word in yangon_words):
         return "yangon"
 
+    # Explicit non-Yangon places. This list intentionally contains common
+    # destination cities; AI can still recognize less-common ones.
     other_words = (
-        "မန္တလေး", "နေပြည်တော်", "ပဲခူး", "မော်လမြိုင်", "တောင်ကြီး",
-        "မကွေး", "စစ်ကိုင်း", "ပုသိမ်", "ပြည်", "မုံရွာ", "မိတ္ထီလာ",
-        "မြိတ်", "ထားဝယ်", "ဘားအံ", "လားရှိုး", "ကျိုင်းတုံ",
-        "mandalay", "naypyidaw", "bago", "mawlamyine",
+        "နယ်", "မန္တလေး", "mandalay", "နေပြည်တော်", "naypyidaw", "nay pyi taw",
+        "ပဲခူး", "bago", "မော်လမြိုင်", "mawlamyine", "မော်လမြိုင်မြို့",
+        "တောင်ကြီး", "taunggyi", "မကွေး", "magway", "စစ်ကိုင်း", "sagaing",
+        "ပုသိမ်", "pathein", "ပြည်", "pyay", "မုံရွာ", "monywa",
+        "မိတ္ထီလာ", "meiktila", "မြင်းခြံ", "myingyan", "ကျောက်ဆည်", "kyaukse",
+        "မြိတ်", "myeik", "ထားဝယ်", "dawei", "ကော့သောင်း", "kawthaung",
+        "ဘားအံ", "hpa-an", "hpaan", "မြဝတီ", "myawaddy", "tachileik", "တာချီလိတ်",
+        "လားရှိုး", "lashio", "ကျိုင်းတုံ", "kengtung", "မူဆယ်", "muse",
+        "လွိုင်ကော်", "loikaw", "ဟားခါး", "hakha", "ဖားကန့်", "hpakant",
+        "မြစ်ကြီးနား", "myitkyina", "ဗန်းမော်", "bhamo", "စစ်တွေ", "sittwe",
+        "သံတွဲ", "thandwe", "ကျောက်ဖြူ", "kyaukphyu", "မောင်တော", "maungdaw",
+        "မော်လမြိုင်ကျွန်း", "mawlamyinegyun", "ဟင်္သာတ", "h is not used",
     )
+    # Remove a deliberately impossible sentinel without complicating matching.
+    other_words = tuple(w for w in other_words if w != "h is not used")
     if any(word in low for word in other_words):
         return "other"
 
     return ""
 
 
-def extract_order_fields_locally(message):
+def infer_delivery_area_for_complete_order(session):
     """
-    Fast deterministic parser for normal text orders.
-    Avoids an OpenAI call in the live ManyChat request path.
+    Final delivery-area rule requested for the shop:
+
+    * explicit Yangon clue -> Yangon
+    * explicit non-Yangon clue -> Other
+    * if Name + Address + Phone are complete but the address gives no city clue,
+      default to Yangon because Yangon customers commonly omit the word Yangon,
+      while customers from other cities usually include their city/town.
+
+    The default is applied ONLY to a complete order so a partial address is not
+    prematurely classified.
     """
+    address = str(session.get("address", "") or "").strip()
+    if not address:
+        return session
+
+    detected = detect_delivery_area_from_text(address)
+    if detected:
+        session["delivery_area"] = detected
+        return session
+
+    if (
+        session.get("name")
+        and session.get("address")
+        and session.get("phone")
+        and session.get("items")
+    ):
+        session["delivery_area"] = "yangon"
+        print("DELIVERY AREA DEFAULTED TO YANGON:", address, flush=True)
+
+    return session
+
+
+def looks_like_order_progress(message, session=None):
+    """Recognize incremental order details after a product has been selected."""
     value = str(message or "").strip()
+    if not value:
+        return False
+
+    # Product questions / greetings should not be swallowed as order fields.
+    if simple_greeting(value) or wants_admin(value) or asks_delivery_time(value):
+        return False
+
+    if looks_like_order_details(value):
+        return True
+
+    # Phone-only follow-up.
+    digits = re.sub(r"\D", "", value)
+    if 9 <= len(digits) <= 13:
+        return True
+
+    # Slash/newline separated customer details.
+    if "/" in value or "\n" in value or "|" in value:
+        return True
+
+    session = session or {}
+    # After a product has been selected, a short plain-text first message is
+    # commonly the buyer's name; the next plain-text message is commonly address.
+    if session.get("last_product_code") in PRODUCTS:
+        if not session.get("name") and 1 < len(value) <= 80:
+            return True
+        if session.get("name") and not session.get("address") and len(value) >= 4:
+            return True
+
+    return False
+
+def extract_order_fields_locally(message, session=None):
+    """Fast deterministic parser for one-shot and multi-message orders."""
+    value = str(message or "").strip()
+    current = session or {}
     result = {
         "name": "",
         "address": "",
@@ -1220,56 +1348,69 @@ def extract_order_fields_locally(message):
     if not value:
         return result
 
-    # Normalize common separators but preserve Burmese text.
     parts = [p.strip() for p in re.split(r"[/\n|]+", value) if p.strip()]
 
-    # Phone: Myanmar-style 09... or any 9-12 digit phone-like number.
+    # Phone: Myanmar 09... or a reasonable 9-13 digit phone-like number.
     phone_match = re.search(r"(?<!\d)(09[\d\s-]{7,12}\d)(?!\d)", value)
     if not phone_match:
-        phone_match = re.search(r"(?<!\d)(\d[\d\s-]{8,13}\d)(?!\d)", value)
+        phone_match = re.search(r"(?<!\d)(\d[\d\s-]{7,12}\d)(?!\d)", value)
     if phone_match:
         result["phone"] = re.sub(r"[^\d+]", "", phone_match.group(1))
 
-    # Find any explicit product code/quantity in the message.
     for code, qty in find_codes_and_quantities(value).items():
         if code in PRODUCTS:
             result["items"].append({"code": code, "quantity": qty})
 
-    # Remove phone-only and obvious item-only segments before assigning name/address.
     clean_parts = []
     for part in parts:
-        if result["phone"] and result["phone"] in re.sub(r"[^\d+]", "", part):
+        normalized_part_digits = re.sub(r"[^\d+]", "", part)
+        if result["phone"] and result["phone"] == normalized_part_digits:
             continue
         if find_codes_and_quantities(part):
             continue
         clean_parts.append(part)
 
-    # First short segment is usually the customer name.
+    # Multi-part: first non-address-looking segment is usually name.
     if clean_parts:
-        first = clean_parts[0].strip()
-        if len(first) <= 80 and not looks_like_order_details(first):
+        first = clean_parts[0]
+        if not current.get("name") and len(first) <= 80 and not looks_like_order_details(first):
             result["name"] = first
             clean_parts = clean_parts[1:]
 
-    # Everything else becomes address.
+    # If the name was already collected in a previous message, all remaining
+    # non-phone text is address. This fixes customers sending Name / Address /
+    # Phone as three separate messages.
     if clean_parts:
-        result["address"] = " / ".join(clean_parts).strip()
+        if current.get("name") or result.get("name"):
+            result["address"] = " / ".join(clean_parts).strip()
+        elif len(clean_parts) >= 2:
+            result["name"] = clean_parts[0]
+            result["address"] = " / ".join(clean_parts[1:]).strip()
+        elif looks_like_order_details(clean_parts[0]):
+            result["address"] = clean_parts[0]
+        elif not current.get("name"):
+            result["name"] = clean_parts[0]
 
-    # If line 1 looked address-like but line 0 is still likely a name, recover.
-    if not result["name"] and parts:
-        candidate = parts[0].strip()
-        digit_count = len(re.sub(r"\D", "", candidate))
-        if digit_count < 5 and len(candidate) <= 80:
-            result["name"] = candidate
-            remaining = [p for p in parts[1:] if result["phone"] not in re.sub(r"[^\d+]", "", p)]
-            if remaining:
-                result["address"] = " / ".join(remaining).strip()
+    # A single address-like line after name should be accepted even if it omits
+    # Yangon and does not contain the exact word "လိပ်စာ".
+    if current.get("name") and not current.get("address") and not result["address"]:
+        leftovers = []
+        for part in parts:
+            pd = re.sub(r"[^\d+]", "", part)
+            if result["phone"] and pd == result["phone"]:
+                continue
+            if find_codes_and_quantities(part):
+                continue
+            leftovers.append(part)
+        if leftovers:
+            candidate = " / ".join(leftovers).strip()
+            if candidate and candidate != current.get("name"):
+                result["address"] = candidate
 
     result["delivery_area"] = detect_delivery_area_from_text(
         result["address"] or value
     )
     return result
-
 
 def is_quantity_only_message(text):
     value = str(text or "").strip()
@@ -1288,20 +1429,19 @@ def is_quantity_only_message(text):
 
 def merge_order_message(sender_id, message):
     session = get_order_session(sender_id)
-
     explicit_qty = extract_explicit_quantity(message)
 
-    # A quantity-only follow-up (x2 / 2 ခု) must NEVER overwrite name/address.
     if not is_quantity_only_message(message):
-        local = extract_order_fields_locally(message)
+        local = extract_order_fields_locally(message, session=session)
         session = merge_extracted_order_data(session, local)
 
-        # If key identity/address fields are still missing, AI may fill them.
+        # AI only fills genuinely missing core fields. Do not force AI just
+        # because delivery_area is blank; complete unknown-city orders are
+        # defaulted to Yangon by the shop rule below.
         still_missing_core = (
             not session.get("name")
             or not session.get("address")
             or not session.get("phone")
-            or not session.get("delivery_area")
         )
 
         if still_missing_core and OPENAI_API_KEY:
@@ -1324,11 +1464,11 @@ def merge_order_message(sender_id, message):
 
         session["quantity_confirmed"] = True
 
+    session = infer_delivery_area_for_complete_order(session)
     return session
 
-
-
 def order_missing_fields(session):
+    infer_delivery_area_for_complete_order(session)
     missing = []
 
     if not session.get("name"):
@@ -1716,6 +1856,18 @@ def handle_manychat_request(data):
         or ""
     ).strip()
 
+    # ManyChat can sometimes put a Facebook CDN image URL into Last Text Input.
+    # Treat that as an image instead of customer text.
+    low_message = message.lower()
+    if (
+        not incoming_image_url
+        and low_message.startswith(("http://", "https://"))
+        and any(token in low_message for token in ("scontent", ".jpg", ".jpeg", ".png", ".webp", "fbcdn"))
+    ):
+        incoming_image_url = message
+        message = ""
+        print("MANYCHAT MESSAGE PROMOTED TO IMAGE URL", flush=True)
+
     print(
         "MANYCHAT INPUT:",
         {"message": message, "contact_id": contact_id, "image_url": incoming_image_url},
@@ -1801,6 +1953,7 @@ def handle_manychat_request(data):
         generic_order
         or active_order
         or (last_product_ready and looks_like_order_details(message))
+        or (last_product_ready and looks_like_order_progress(message, session))
         or (last_product_ready and bool(incoming_image_url))
         or (extract_explicit_quantity(message) is not None and last_product_ready)
     )
@@ -1837,6 +1990,7 @@ def handle_manychat_request(data):
                 session,
                 extracted_from_image,
             )
+            session = infer_delivery_area_for_complete_order(session)
 
         explicit_qty = extract_explicit_quantity(message)
         if explicit_qty is not None:
@@ -2181,6 +2335,7 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
+
 
 
 
