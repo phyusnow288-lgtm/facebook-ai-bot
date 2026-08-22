@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V19-FULL-AUDIT"
+BOT_VERSION = "V21-FINAL-IMAGE-ORDER-FIX"
 
 app = Flask(__name__)
 
@@ -44,6 +44,9 @@ PROCESSED_MESSAGE_IDS = set()
 BOT_SENT_MESSAGE_IDS = set()
 ADMIN_PAUSE_UNTIL = {}
 MANYCHAT_ECHO_IGNORE_UNTIL = {}
+RECENT_TELEGRAM_ORDERS = {}
+RECENT_TELEGRAM_LOCK = threading.Lock()
+TELEGRAM_ORDER_DEDUP_SECONDS = 300
 MANYCHAT_ECHO_GRACE_SECONDS = int(os.environ.get("MANYCHAT_ECHO_GRACE_SECONDS", "20"))
 PRODUCT_REFRESH_LOCK = threading.Lock()
 PRODUCT_REFRESH_RUNNING = False
@@ -556,7 +559,7 @@ def openai_chat(messages, max_tokens=200, temperature=0):
                 "messages": messages,
                 "max_tokens": max_tokens,
             },
-            timeout=8,
+            timeout=7,
         )
 
         print("OPENAI STATUS:", response.status_code, flush=True)
@@ -624,112 +627,46 @@ Never invent a code.
 # IMAGE PRODUCT IDENTIFICATION
 # =========================
 def ai_find_product_from_image(image_url, caption=""):
+    """Fast one-call image identification designed for ManyChat's 10s timeout."""
     if not OPENAI_API_KEY or not image_url:
         return None, None
 
     load_products()
-
-    customer_data_url = image_as_data_url(image_url)
-    if not customer_data_url:
-        return None, None
-
     catalog = product_catalog_text()
 
-    # Stage 1: identify from the customer's image + catalog text.
+    # Prefer the original public FB/HTTP URL so Render does not spend up to 30s
+    # downloading and base64-encoding it before calling OpenAI.
+    source_url = str(image_url or "").strip()
+    if not source_url.startswith(("http://", "https://", "data:")):
+        return None, None
+
     content = [
         {
             "type": "text",
             "text": (
-                "Identify which product from this shop catalog is shown in the CUSTOMER IMAGE. "
-                "The image may be a direct product photo, screenshot, Facebook post screenshot, "
-                "photo of another screen, or image containing Burmese/English/Chinese text. "
-                "Use the visual appearance, visible text, labels, shape, and catalog descriptions. "
-                "Return ONLY one JSON object with a code field. "
-                "If one catalog item is the best clear match, return its code. "
-                "If truly uncertain, return null. Never invent a code.\n\n"
-                f"CATALOG:\n{catalog}\n\n"
-                f"CUSTOMER TEXT: {caption}"
+                "Identify the ONE product from this shop catalog shown in the customer image. "
+                "The image may be a product photo, screenshot, or photo of a phone screen. "
+                "Use visible Burmese/English/Chinese text, packaging, shape and catalog descriptions. "
+                "Return ONLY JSON: {\"code\":\"0001\"}. "
+                "If no confident catalog match, return {\"code\":null}. Never invent a code.\n\n"
+                f"CATALOG:\n{catalog}\n\nCUSTOMER TEXT: {caption}"
             ),
         },
-        {
-            "type": "image_url",
-            "image_url": {"url": customer_data_url},
-        },
+        {"type": "image_url", "image_url": {"url": source_url}},
     ]
 
     answer = openai_chat(
         [{"role": "user", "content": content}],
-        max_tokens=80,
+        max_tokens=60,
         temperature=0,
     )
-
     result = parse_json_answer(answer)
     code = normalize_code(result.get("code", ""))
-
     if code in PRODUCTS:
-        print("IMAGE MATCH STAGE 1:", code, flush=True)
+        print("IMAGE MATCH:", code, flush=True)
         return code, PRODUCTS[code]
 
-    # Stage 2: compare against Google Sheet reference images in small batches.
-    references = reference_image_items()
-
-    batch_size = 5
-
-    for offset in range(0, len(references), batch_size):
-        batch = references[offset:offset + batch_size]
-
-        compare_content = [
-            {
-                "type": "text",
-                "text": (
-                    "Match the CUSTOMER IMAGE to one of the REFERENCE PRODUCTS below. "
-                    "The customer image can have a different angle, crop, background, lighting, "
-                    "screenshot frame, or text overlay. Look for the same underlying product. "
-                    "Return ONLY one JSON object with a code field. "
-                    "If none of this batch matches, return null."
-                ),
-            },
-            {
-                "type": "text",
-                "text": "CUSTOMER IMAGE",
-            },
-            {
-                "type": "image_url",
-                "image_url": {"url": customer_data_url},
-            },
-        ]
-
-        for item in batch:
-            ref_data = image_as_data_url(item["url"])
-            if not ref_data:
-                continue
-
-            compare_content.append(
-                {
-                    "type": "text",
-                    "text": f'REFERENCE Code {item["code"]}: {item["name"]}',
-                }
-            )
-            compare_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": ref_data},
-                }
-            )
-
-        answer = openai_chat(
-            [{"role": "user", "content": compare_content}],
-            max_tokens=80,
-            temperature=0,
-        )
-
-        result = parse_json_answer(answer)
-        code = normalize_code(result.get("code", ""))
-
-        if code in PRODUCTS:
-            print("IMAGE MATCH STAGE 2:", code, flush=True)
-            return code, PRODUCTS[code]
-
+    print("IMAGE MATCH: NONE", flush=True)
     return None, None
 
 
@@ -1049,6 +986,43 @@ def send_telegram_message(message):
         return False
 
 
+def _telegram_order_worker(order_key, message):
+    ok = False
+    for attempt in range(1, 4):
+        print(f"TELEGRAM ORDER ATTEMPT {attempt}:", order_key, flush=True)
+        if send_telegram_message(message):
+            ok = True
+            break
+        time.sleep(1.5 * attempt)
+    print("TELEGRAM ORDER FINAL:", order_key, "OK" if ok else "FAILED", flush=True)
+
+
+def queue_telegram_order(contact_id, message):
+    """Queue Telegram in background so ManyChat always gets its reply inside 10 seconds."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("TELEGRAM ENV IS MISSING - ORDER NOT QUEUED", flush=True)
+        return False
+
+    key = f"{contact_id}|{message}"
+    now = now_ts()
+    with RECENT_TELEGRAM_LOCK:
+        # prune old entries
+        for old_key, old_ts in list(RECENT_TELEGRAM_ORDERS.items()):
+            if now - old_ts > TELEGRAM_ORDER_DEDUP_SECONDS:
+                RECENT_TELEGRAM_ORDERS.pop(old_key, None)
+        if key in RECENT_TELEGRAM_ORDERS:
+            print("TELEGRAM DUPLICATE ORDER SUPPRESSED:", contact_id, flush=True)
+            return True
+        RECENT_TELEGRAM_ORDERS[key] = now
+
+    threading.Thread(
+        target=_telegram_order_worker,
+        args=(key, message),
+        daemon=True,
+    ).start()
+    return True
+
+
 # =========================
 # ADMIN TAKEOVER
 # =========================
@@ -1173,8 +1147,23 @@ def find_codes_and_quantities(text):
     return found
 
 
+def _western_digits(value):
+    table = str.maketrans("၀၁၂၃၄၅၆၇၈၉", "0123456789")
+    return str(value or "").translate(table)
+
+
 def extract_explicit_quantity(text):
-    value = str(text or "")
+    raw = str(text or "").strip()
+    value = _western_digits(raw)
+    low = re.sub(r"\s+", "", value.lower())
+
+    # Common Burmese quantity wording buyers actually use.
+    burmese_one = (
+        "တခု", "တစ်ခု", "တခုယူ", "တစ်ခုယူ", "တခုယူမယ်", "တစ်ခုယူမယ်",
+        "တခုလိုချင်", "တစ်ခုလိုချင်",
+    )
+    if any(token in low for token in burmese_one):
+        return 1
 
     patterns = [
         r"[xX*]\s*(\d+)",
@@ -1483,10 +1472,11 @@ def extract_order_fields_locally(message, session=None):
 
     parts = [p.strip() for p in re.split(r"[/\n|]+", value) if p.strip()]
 
-    # Phone: Myanmar 09... or a reasonable 9-13 digit phone-like number.
-    phone_match = re.search(r"(?<![0-9])(09[0-9 \t-]{7,12}[0-9])(?![0-9])", value)
+    # Phone: support both Western and Myanmar digits, without swallowing quantity text.
+    phone_source = _western_digits(value)
+    phone_match = re.search(r"(?<![0-9])(09[0-9 \t-]{7,12}[0-9])(?![0-9])", phone_source)
     if not phone_match:
-        phone_match = re.search(r"(?<![0-9])([0-9][0-9 \t-]{7,12}[0-9])(?![0-9])", value)
+        phone_match = re.search(r"(?<![0-9])([0-9][0-9 \t-]{7,12}[0-9])(?![0-9])", phone_source)
     if phone_match:
         result["phone"] = re.sub(r"[^\d+]", "", phone_match.group(1))
 
@@ -2099,6 +2089,9 @@ def handle_manychat_request(data):
         return done(manychat_text(delivery_time_reply(message)))
 
     # -------- Product recognition --------
+    recognized_from_image = False
+    recognized_from_ad = False
+
     # 0) Optional ad/product context.
     context_code, context_product = extract_product_context_from_manychat(data)
 
@@ -2113,6 +2106,7 @@ def handle_manychat_request(data):
             incoming_image_url,
             message,
         )
+        recognized_from_image = bool(product)
 
     # If this is only a generic purchase phrase and there is no remembered/ad
     # product context, DO NOT ask OpenAI to guess a product.
@@ -2125,6 +2119,16 @@ def handle_manychat_request(data):
     # Use optional Ad context if current message did not identify a product.
     if not product and context_product:
         code, product = context_code, context_product
+        recognized_from_ad = True
+
+    # A customer image that identifies a catalog product is a PRODUCT QUERY, not
+    # an order screenshot. V20 treated every incoming image as order intent and
+    # therefore asked for Name/Address/Phone instead of showing the matched item.
+    if product and recognized_from_image and not looks_like_order_details(message):
+        ORDER_SESSIONS[contact_id] = new_order_session()
+        if product_is_sellable(product):
+            ORDER_SESSIONS[contact_id]["last_product_code"] = code
+        return done(manychat_product_response(code, product))
 
     # A bare product code/name is browsing and refreshes the current product.
     if product and is_pure_product_query(message, code, product):
@@ -2164,7 +2168,6 @@ def handle_manychat_request(data):
         or active_order
         or (last_product_ready and looks_like_order_details(message))
         or (last_product_ready and looks_like_order_progress(message, session))
-        or (last_product_ready and bool(incoming_image_url))
         or (extract_explicit_quantity(message) is not None and last_product_ready)
     )
 
@@ -2231,13 +2234,15 @@ def handle_manychat_request(data):
         telegram_text = build_telegram_order(session)
         print("TELEGRAM ORDER TEXT:", telegram_text, flush=True)
 
-        if send_telegram_message(telegram_text):
+        # IMPORTANT: ManyChat Dynamic Block has a hard 10-second timeout.
+        # Never wait for Telegram here; queue it in a background worker and
+        # return the buyer response immediately.
+        if queue_telegram_order(contact_id, telegram_text):
             buyer_text = buyer_order_confirmation(session)
             ORDER_SESSIONS[contact_id] = new_order_session()
             return done(manychat_text(buyer_text))
 
-        # Telegram failure should not permanently silence the bot.
-        # Keep the order data and tell the buyer Admin will handle it.
+        # Missing Telegram configuration: keep the session so the order is not lost.
         return done(manychat_text(
             "အော်ဒါအချက်အလက် ရရှိပါပြီရှင်။ Admin က ဆက်လက်စစ်ဆေးပေးပါမယ်ရှင်။"
         ))
@@ -2458,8 +2463,7 @@ def webhook():
                 generic_order
                 or active_order
                 or (last_product_ready and looks_like_order_details(text))
-                or (last_product_ready and bool(incoming_image_url))
-                or (extract_explicit_quantity(text) is not None and last_product_ready)
+                        or (extract_explicit_quantity(text) is not None and last_product_ready)
             )
 
             if order_intent:
