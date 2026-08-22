@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V36-ADMIN-ON-OFF-SAFE"
+BOT_VERSION = "V38-SAFE-9-FIXES-MULTI-IMAGE-ORDER"
 
 app = Flask(__name__)
 
@@ -48,6 +48,14 @@ RECENT_MANYCHAT_REPLY_TEXTS = {}
 RECENT_MANYCHAT_REPLY_LOCK = threading.Lock()
 MANYCHAT_REPLY_TEXT_TTL_SECONDS = int(os.environ.get("MANYCHAT_REPLY_TEXT_TTL_SECONDS", "120"))
 RECENT_TELEGRAM_ORDERS = {}
+
+# V38: ManyChat Contact Id and Meta PSID are not always the same identifier.
+# Keep a short-lived correlation map so Admin ON/OFF from a Meta echo controls
+# the exact same customer when the next buyer message arrives through ManyChat.
+CUSTOMER_ID_ALIASES = {}
+RECENT_MANYCHAT_INBOUND = []
+RECENT_MANYCHAT_INBOUND_LOCK = threading.Lock()
+RECENT_MANYCHAT_INBOUND_TTL_SECONDS = 90
 RECENT_TELEGRAM_LOCK = threading.Lock()
 TELEGRAM_ORDER_DEDUP_SECONDS = 300
 
@@ -542,6 +550,59 @@ def find_product_by_name(message):
     return best_code, best_product
 
 
+def find_named_products_and_quantities(message):
+    """Return every distinct catalog product explicitly named in one message."""
+    load_products()
+    text = str(message or "")
+    if not text:
+        return {}
+    low = text.casefold()
+    compact_text = _compact_product_match_text(low)
+    matches = []
+    for code, product in PRODUCTS.items():
+        candidates = [
+            get_row_value(product, "Product Name", "Name", "product_name"),
+            get_row_value(product, "Myanmar Name", "MyanmarName", "Burmese Name", "MM Name"),
+            get_row_value(product, "English Name", "EnglishName", "EN Name"),
+            get_row_value(product, "Chinese Name", "ChineseName", "CN Name"),
+            get_row_value(product, "Model", "Model No", "Model Number", "SKU"),
+        ]
+        alias_blob = str(get_row_value(product, "Alias", "Aliases", "Keywords", "Keyword") or "")
+        if alias_blob:
+            candidates.extend(x.strip() for x in re.split(r"[,;|\n]+", alias_blob) if x.strip())
+        best = None
+        for candidate in candidates:
+            cand = str(candidate or "").casefold().strip()
+            if len(cand) < 2:
+                continue
+            pos = low.find(cand)
+            if pos >= 0:
+                score = len(cand)
+                if not best or score > best[0]:
+                    best = (score, pos, pos + len(cand))
+                continue
+            cc = _compact_product_match_text(cand)
+            if len(cc) >= 3 and cc in compact_text:
+                # Compact matches have no exact original offset; still include product.
+                if not best:
+                    best = (len(cc), 10**6, 10**6)
+        if best:
+            matches.append((best[1], -best[0], code, best[2]))
+
+    matches.sort()
+    found = {}
+    for pos, _negscore, code, endpos in matches:
+        qty = 1
+        if pos < 10**6:
+            tail = text[endpos:endpos + 30]
+            q = extract_explicit_quantity(tail)
+            if q is not None:
+                qty = q
+        found[code] = qty
+    return found
+
+
+
 def product_catalog_text():
     """Build a rich text catalog directly from Google Sheet rows.
 
@@ -942,6 +1003,70 @@ def ai_find_product_from_image(image_url, caption=""):
 
     print("IMAGE MATCH: NONE", flush=True)
     return None, None
+
+
+def ai_find_products_from_image(image_url, caption=""):
+    """Identify ALL distinct catalog products visible in one customer image/screenshot."""
+    if not OPENAI_API_KEY or not image_url:
+        return []
+    load_products()
+    catalog = product_catalog_text()
+    source_url = str(image_url or "").strip()
+    if not source_url.startswith(("http://", "https://", "data:")):
+        return []
+
+    customer_vision_url = source_url
+    if source_url.startswith(("http://", "https://")):
+        try:
+            r = requests.get(source_url, timeout=2.0, allow_redirects=True,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            raw = r.content or b""
+            mime = _image_mime_from_bytes(raw, r.headers.get("Content-Type", ""))
+            if raw and mime:
+                customer_vision_url = f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+        except Exception as e:
+            print("MULTI IMAGE DOWNLOAD FALLBACK:", str(e), flush=True)
+
+    content = [
+        {"type": "text", "text": (
+            "Identify ALL distinct shop products visible in the CUSTOMER IMAGE. "
+            "This may be a Messenger/Facebook screenshot containing 1, 2, 3, 4, 5 or more products. "
+            "Compare every visible product with the labelled reference catalog. "
+            "Return each catalog code at most once. Do not treat quantities, prices, phone numbers or dates as codes. "
+            "Return ONLY JSON like {\"codes\":[\"0001\",\"0014\"]}. "
+            "If none is confident return {\"codes\":[]}. Never invent a code.\n\n"
+            f"TEXT CATALOG:\n{catalog}\n\nCUSTOMER CAPTION: {caption}"
+        )},
+        {"type": "text", "text": "CUSTOMER IMAGE:"},
+        {"type": "image_url", "image_url": {"url": customer_vision_url, "detail": "auto"}},
+    ]
+    try:
+        refs = catalog_reference_content_parts()
+    except Exception as e:
+        refs = []
+        print("MULTI IMAGE REFERENCES FALLBACK:", str(e), flush=True)
+    if refs:
+        content.append({"type": "text", "text": "REFERENCE CATALOG IMAGES; each image belongs to the code label before it:"})
+        content.extend(refs)
+
+    answer = openai_chat(
+        [{"role": "user", "content": content}],
+        max_tokens=120, temperature=0, timeout_seconds=7.5,
+    )
+    result = parse_json_answer(answer)
+    raw_codes = result.get("codes", []) if isinstance(result, dict) else []
+    if isinstance(raw_codes, str):
+        raw_codes = re.findall(r"\d{1,4}", raw_codes)
+    out = []
+    for raw_code in raw_codes or []:
+        code = normalize_code(raw_code)
+        if code in PRODUCTS and code not in out:
+            out.append(code)
+    print("MULTI IMAGE MATCH CODES:", out, flush=True)
+    return out
+
+
 
 # =========================
 # PRODUCT REPLY
@@ -1409,49 +1534,144 @@ def is_recent_manychat_reply_text(value):
         return True
 
 
+def _identity_aliases(customer_id):
+    cid = str(customer_id or "").strip()
+    if not cid:
+        return set()
+    aliases = {cid}
+    pending = [cid]
+    while pending:
+        cur = pending.pop()
+        for other in CUSTOMER_ID_ALIASES.get(cur, set()):
+            other = str(other or "").strip()
+            if other and other not in aliases:
+                aliases.add(other)
+                pending.append(other)
+    return aliases
+
+
+def bind_customer_identities(*ids):
+    clean = [str(x or "").strip() for x in ids if str(x or "").strip()]
+    if len(clean) < 2:
+        return
+    merged = set()
+    for cid in clean:
+        merged.update(_identity_aliases(cid) or {cid})
+    for cid in merged:
+        CUSTOMER_ID_ALIASES[cid] = set(merged - {cid})
+    print("CUSTOMER IDS BOUND:", sorted(merged), flush=True)
+
+
+def _manychat_identity_from_payload(data, contact_id):
+    ids = [contact_id]
+    if isinstance(data, dict):
+        for key in (
+            "psid", "facebook_psid", "fb_psid", "page_scoped_id", "page_scoped_user_id",
+            "messenger_id", "facebook_id", "sender_id", "user_psid"
+        ):
+            value = str(data.get(key, "") or "").strip()
+            if value:
+                ids.append(value)
+        for obj_key in ("contact", "subscriber", "user"):
+            obj = data.get(obj_key)
+            if isinstance(obj, dict):
+                for key in ("psid", "facebook_psid", "page_scoped_id", "messenger_id"):
+                    value = str(obj.get(key, "") or "").strip()
+                    if value:
+                        ids.append(value)
+    bind_customer_identities(*ids)
+    return ids
+
+
+def remember_manychat_inbound(contact_id, message="", image_url=""):
+    cid = str(contact_id or "").strip()
+    if not cid:
+        return
+    text_fp = _normalize_reply_fingerprint(message)
+    image_fp = str(image_url or "").strip().split("?")[0][-180:]
+    now = now_ts()
+    with RECENT_MANYCHAT_INBOUND_LOCK:
+        RECENT_MANYCHAT_INBOUND[:] = [
+            row for row in RECENT_MANYCHAT_INBOUND
+            if now - row.get("ts", 0) <= RECENT_MANYCHAT_INBOUND_TTL_SECONDS
+        ]
+        RECENT_MANYCHAT_INBOUND.append({
+            "ts": now, "contact_id": cid, "text": text_fp, "image": image_fp
+        })
+
+
+def correlate_meta_sender_to_manychat(sender_id, message="", image_url=""):
+    sender_id = str(sender_id or "").strip()
+    if not sender_id:
+        return
+    text_fp = _normalize_reply_fingerprint(message)
+    image_fp = str(image_url or "").strip().split("?")[0][-180:]
+    now = now_ts()
+    best = None
+    with RECENT_MANYCHAT_INBOUND_LOCK:
+        RECENT_MANYCHAT_INBOUND[:] = [
+            row for row in RECENT_MANYCHAT_INBOUND
+            if now - row.get("ts", 0) <= RECENT_MANYCHAT_INBOUND_TTL_SECONDS
+        ]
+        for row in reversed(RECENT_MANYCHAT_INBOUND):
+            text_match = bool(text_fp and row.get("text") == text_fp)
+            image_match = bool(image_fp and row.get("image") == image_fp)
+            if text_match or image_match:
+                best = row.get("contact_id")
+                break
+    if best:
+        bind_customer_identities(sender_id, best)
+
+
 # =========================
 # ADMIN TAKEOVER
 # =========================
 def pause_for_admin(customer_id):
     if not customer_id:
         return
-
-    ADMIN_PAUSE_UNTIL[str(customer_id)] = (
-        now_ts() + ADMIN_PAUSE_MINUTES * 60
-    )
-
-    print(
-        "ADMIN PAUSE:",
-        customer_id,
-        "UNTIL",
-        ADMIN_PAUSE_UNTIL[str(customer_id)],
-        flush=True,
-    )
+    until = now_ts() + ADMIN_PAUSE_MINUTES * 60
+    aliases = _identity_aliases(customer_id) or {str(customer_id)}
+    for cid in aliases:
+        ADMIN_PAUSE_UNTIL[cid] = until
+    print("ADMIN PAUSE:", sorted(aliases), "UNTIL", until, flush=True)
 
 
 def admin_is_active(customer_id):
-    customer_id = str(customer_id or "")
+    aliases = _identity_aliases(customer_id) or {str(customer_id or "")}
+    now = now_ts()
+    active_until = 0
+    for cid in list(aliases):
+        until = ADMIN_PAUSE_UNTIL.get(cid, 0)
+        if until == float("inf"):
+            return True
+        if until > now:
+            active_until = max(active_until, until)
+        elif cid in ADMIN_PAUSE_UNTIL:
+            ADMIN_PAUSE_UNTIL.pop(cid, None)
+    if active_until > now:
+        for cid in aliases:
+            ADMIN_PAUSE_UNTIL[cid] = active_until
+        return True
+    return False
 
-    until = ADMIN_PAUSE_UNTIL.get(customer_id, 0)
 
-    if until <= now_ts():
-        ADMIN_PAUSE_UNTIL.pop(customer_id, None)
-        return False
-
-    return True
+def _set_admin_command_state(customer_id, command):
+    aliases = _identity_aliases(customer_id) or {str(customer_id or "")}
+    if command == "on":
+        for cid in aliases:
+            ADMIN_PAUSE_UNTIL.pop(cid, None)
+        print("ADMIN COMMAND ON - BOT ENABLED:", sorted(aliases), flush=True)
+        return True
+    if command == "off":
+        for cid in aliases:
+            ADMIN_PAUSE_UNTIL[cid] = float("inf")
+        print("ADMIN COMMAND OFF - BOT HARD LOCKED:", sorted(aliases), flush=True)
+        return True
+    return False
 
 
 def handle_echo_message(event, message_data):
-    """
-    Ignore Python-bot and ManyChat-generated echoes.
-    Only an unmatched Page echo is treated as a real manual Admin reply.
-
-    Manual Admin commands (case-insensitive):
-    - ON  -> immediately re-enable the bot for this customer.
-    - OFF -> keep the bot disabled for this customer until Admin sends ON.
-
-    Any other real manual Admin reply keeps the existing timed Admin-pause logic.
-    """
+    """Ignore bot/ManyChat echoes; real Admin ON/OFF is a hard per-customer switch."""
     mid = str(message_data.get("mid", "") or "").strip()
     if mid and mid in BOT_SENT_MESSAGE_IDS:
         BOT_SENT_MESSAGE_IDS.discard(mid)
@@ -1471,28 +1691,22 @@ def handle_echo_message(event, message_data):
     if not customer_id:
         return
 
+    # ON/OFF must be checked BEFORE the short ManyChat echo-ignore window.
+    # This avoids a manual command being swallowed by an unrelated recent bot reply.
+    admin_command = echo_text.casefold()
+    if admin_command in ("on", "off"):
+        _set_admin_command_state(customer_id, admin_command)
+        return
+
     ignore_until = MANYCHAT_ECHO_IGNORE_UNTIL.get(customer_id, 0)
     if ignore_until > now_ts():
         print("MANYCHAT ID ECHO IGNORED:", customer_id, flush=True)
         return
-
     MANYCHAT_ECHO_IGNORE_UNTIL.pop(customer_id, None)
-
-    # Admin ON/OFF controls are exact commands only, so normal sentences that
-    # merely contain the words "on" or "off" cannot accidentally change state.
-    admin_command = echo_text.casefold()
-    if admin_command == "on":
-        ADMIN_PAUSE_UNTIL.pop(customer_id, None)
-        print("ADMIN COMMAND ON - BOT ENABLED:", customer_id, flush=True)
-        return
-
-    if admin_command == "off":
-        ADMIN_PAUSE_UNTIL[customer_id] = float("inf")
-        print("ADMIN COMMAND OFF - BOT DISABLED UNTIL ON:", customer_id, flush=True)
-        return
 
     pause_for_admin(customer_id)
     print("MANUAL ADMIN MESSAGE DETECTED - BOT PAUSED:", customer_id, flush=True)
+
 
 def new_order_session():
     return {
@@ -1588,6 +1802,17 @@ def find_codes_and_quantities(text):
     load_products()
     value = _western_digits(str(text or ""))
     found = {}
+
+    # V38: a list such as 12/13/14 or 12,13,14 is explicit multi-code context.
+    # It is safe to normalize short codes here because at least two tokens are
+    # deliberately separated as a product list; a bare "2" is still a quantity.
+    compact_list = value.strip()
+    if re.fullmatch(r"\s*\d{1,4}(?:\s*[/,+]\s*\d{1,4})+\s*", compact_list):
+        for raw_code in re.findall(r"\d{1,4}", compact_list):
+            c = normalize_code(raw_code)
+            if c in PRODUCTS:
+                found[c] = 1
+
     mentions = _explicit_code_mentions(value)
 
     for index, (code, _start, end) in enumerate(mentions):
@@ -2578,6 +2803,29 @@ def manychat_product_response(code, product):
 
 
 
+def manychat_products_response(codes, include_order_prompt=True):
+    """Send image + Sheet detail + price for every matched item, then one order prompt."""
+    messages = []
+    seen = set()
+    for raw_code in codes or []:
+        code = normalize_code(raw_code)
+        if code in seen or code not in PRODUCTS:
+            continue
+        seen.add(code)
+        product = PRODUCTS[code]
+        image_url = product_public_image_url(code, product)
+        if image_url:
+            messages.append({"type": "image", "url": image_url})
+        detail = product_detail(product)
+        if detail:
+            messages.append({"type": "text", "text": detail})
+        messages.append({"type": "text", "text": product_reply(code, product)})
+    if include_order_prompt and any(product_is_sellable(PRODUCTS[c]) for c in seen):
+        messages.append({"type": "text", "text": "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။"})
+    return manychat_response(messages)
+
+
+
 def manychat_product_order_response(code, product, missing):
     """Show product info first, then ask only for still-missing order fields.
 
@@ -2760,6 +3008,11 @@ def handle_manychat_request(data):
     if ad_debug:
         print("MANYCHAT AD CONTEXT:", ad_debug, flush=True)
 
+    # V38 identity bridge: bind any PSID-like field ManyChat provides and also
+    # remember this inbound so the matching Meta webhook event can correlate IDs.
+    _manychat_identity_from_payload(data, contact_id)
+    remember_manychat_inbound(contact_id, message, incoming_image_url)
+
     # ManyChat can retry a Dynamic Block request. Never send the exact same
     # reply twice to the same contact inside the short dedup window.
     if is_duplicate_manychat_input(data, message, contact_id, incoming_image_url):
@@ -2843,6 +3096,26 @@ def handle_manychat_request(data):
             session["quantity_confirmed"] = True
             if len(sellable_explicit) == 1:
                 session["last_product_code"] = next(iter(sellable_explicit))
+
+    # V38 global multi-name/multi-code order selection.
+    # A current message explicitly naming/listing multiple products is authoritative
+    # for this order and cannot be mixed with stale items from an older browse.
+    named_message_items = find_named_products_and_quantities(message)
+    combined_explicit_items = dict(explicit_message_items)
+    for c, q in named_message_items.items():
+        if c in PRODUCTS:
+            combined_explicit_items[c] = q
+    if combined_explicit_items:
+        sellable_now = {
+            c: max(1, int(q)) for c, q in combined_explicit_items.items()
+            if c in PRODUCTS and product_is_sellable(PRODUCTS[c])
+        }
+        if sellable_now:
+            session["items"] = dict(sellable_now)
+            session["quantity_confirmed"] = True
+            if len(sellable_now) == 1:
+                session["last_product_code"] = next(iter(sellable_now))
+            print("V38 EXPLICIT CURRENT ITEMS:", sellable_now, flush=True)
 
     # V30: parse address + phone before deciding whether the message is order progress.
     pre_local_order = {}
@@ -2937,13 +3210,19 @@ def handle_manychat_request(data):
     if not product:
         code, product = find_product_by_name(message)
 
-    # 2) Customer image/screenshot.
+    # 2) Customer image/screenshot. V38 recognizes EVERY visible catalog item.
+    image_codes = []
     if not product and incoming_image_url:
-        code, product = ai_find_product_from_image(
-            incoming_image_url,
-            message,
-        )
-        recognized_from_image = bool(product)
+        image_codes = ai_find_products_from_image(incoming_image_url, message)
+        if image_codes:
+            code = image_codes[0]
+            product = PRODUCTS.get(code)
+            recognized_from_image = True
+        else:
+            code, product = ai_find_product_from_image(incoming_image_url, message)
+            recognized_from_image = bool(product)
+            if product and code:
+                image_codes = [code]
 
     # If this is only a generic purchase phrase and there is no remembered/ad
     # product context, DO NOT ask OpenAI to guess a product.
@@ -2964,14 +3243,23 @@ def handle_manychat_request(data):
     # an order screenshot. V20 treated every incoming image as order intent and
     # therefore asked for Name/Address/Phone instead of showing the matched item.
     if product and recognized_from_image and not image_has_order_details and not looks_like_order_details(message):
-        ORDER_SESSIONS[contact_id] = new_order_session()
-        lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
-        if product_is_sellable(product):
-            ORDER_SESSIONS[contact_id]["last_product_code"] = code
-        return done(manychat_product_response(code, product))
+        # Do NOT reset the session: five separate product photos must accumulate
+        # into one eventual order. One screenshot may also contribute many items.
+        sellable_image_codes = []
+        for image_code in (image_codes or [code]):
+            image_product = PRODUCTS.get(image_code, {})
+            if product_is_sellable(image_product):
+                session["items"].setdefault(image_code, 1)
+                sellable_image_codes.append(image_code)
+        if sellable_image_codes:
+            session["last_product_code"] = sellable_image_codes[-1]
+            session["quantity_confirmed"] = True
+        lock_facebook_account_name(session, account_name)
+        print("V38 IMAGE BASKET ITEMS:", session.get("items"), flush=True)
+        return done(manychat_products_response(image_codes or [code], include_order_prompt=True))
 
     # A bare product code/name is browsing and refreshes the current product.
-    if product and is_pure_product_query(message, code, product):
+    if product and is_pure_product_query(message, code, product) and len(combined_explicit_items) <= 1:
         ORDER_SESSIONS[contact_id] = new_order_session()
         lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
         if product_is_sellable(product):
@@ -2988,6 +3276,18 @@ def handle_manychat_request(data):
             session["last_product_code"] = ""
             session["items"] = {}
             return done(manychat_product_response(code, product))
+
+    # V38: if the current message explicitly identifies multiple items, show every
+    # item's image/detail/price once and keep all of them in the same order session.
+    if len(combined_explicit_items) > 1:
+        multi_codes = [c for c in combined_explicit_items if c in PRODUCTS]
+        sellable_multi = [c for c in multi_codes if product_is_sellable(PRODUCTS[c])]
+        if sellable_multi:
+            session["items"] = {c: max(1, int(combined_explicit_items[c])) for c in sellable_multi}
+            session["last_product_code"] = sellable_multi[-1]
+            session["quantity_confirmed"] = True
+            lock_facebook_account_name(session, account_name)
+        return done(manychat_products_response(multi_codes, include_order_prompt=True))
 
     # V35 GLOBAL INFO-FIRST RULE
     # Any current message that identifies a sellable product must show the product
@@ -3012,7 +3312,9 @@ def handle_manychat_request(data):
         purchase_now = bool(generic_order or explicit_qty_now is not None)
         if purchase_now:
             qty_now = explicit_qty_now if explicit_qty_now is not None else 1
-            session["items"] = {code: qty_now}
+            # Merge into the current basket instead of erasing items gathered
+            # from earlier separate product photos/messages in the same order.
+            session["items"][code] = qty_now
             session["quantity_confirmed"] = True
             lock_facebook_account_name(session, account_name)
             missing_now = order_missing_fields(session)
@@ -3272,11 +3574,6 @@ def webhook():
             if not sender_id:
                 continue
 
-            # If Admin is handling this customer, bot stays completely silent.
-            if admin_is_active(sender_id):
-                print("ADMIN ACTIVE - BOT SILENT:", sender_id, flush=True)
-                continue
-
             text = str(message_data.get("text", "") or "").strip()
             attachments = message_data.get("attachments", []) or []
 
@@ -3290,6 +3587,15 @@ def webhook():
 
                     if incoming_image_url:
                         break
+
+            # Correlate Meta PSID with the recent ManyChat contact for the same inbound.
+            correlate_meta_sender_to_manychat(sender_id, text, incoming_image_url)
+
+            # Hard OFF / Admin pause is checked only after identity correlation so
+            # both Meta and ManyChat routes honor the same per-customer switch.
+            if admin_is_active(sender_id):
+                print("ADMIN ACTIVE - BOT SILENT:", sender_id, flush=True)
+                continue
 
             print("CUSTOMER:", sender_id, flush=True)
             print("TEXT:", text, flush=True)
