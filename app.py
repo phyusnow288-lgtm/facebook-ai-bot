@@ -321,8 +321,11 @@ def extract_order_fields_from_image(image_url, caption=""):
         {
             "type": "text",
             "text": (
-                "Read this CUSTOMER ORDER SCREENSHOT/PHOTO. Extract only visible "
-                "customer order information. Do not invent anything. "
+                "Read this CUSTOMER ORDER SCREENSHOT/PHOTO. It may be a screenshot/photo "
+                "of a Burmese, English, or mixed-language delivery address, phone number, "
+                "or full order details. Extract only visible customer order information. "
+                "Do not invent anything. The buyer name is supplied separately from the "
+                "Facebook account, so do not guess a name from conversational text. "
                 "Return ONLY one JSON object in this exact shape:\n"
                 '{'
                 '"name":"","address":"","phone":"","delivery_area":"",'
@@ -358,8 +361,13 @@ def merge_extracted_order_data(session, extracted):
 
     for field in ("name", "address", "phone", "delivery_area"):
         value = str(extracted.get(field, "") or "").strip()
-        if value:
-            session[field] = value
+        if not value:
+            continue
+        # ManyChat orders always use the Facebook/ManyChat account name.
+        # Never let typed text, OCR, or AI overwrite that locked name.
+        if field == "name" and session.get("_account_name_locked"):
+            continue
+        session[field] = value
 
     extracted_items = extracted.get("items", []) or []
 
@@ -1180,6 +1188,7 @@ def new_order_session():
         "items": {},
         "last_product_code": "",
         "quantity_confirmed": False,
+        "_account_name_locked": False,
     }
 
 
@@ -1319,6 +1328,13 @@ Rules:
 - quantity must be integer >= 1.
 - Do not invent missing information.
 - Never invent product codes.
+- A delivery address may be written in Burmese, English, or mixed language.
+- Extract address ONLY when the text is actually a delivery/location address.
+- Questions or chat such as price, delivery fee, availability, how to use,
+  "အော်ဒါတင်ပေးမှာလား", "ဘယ်လောက်လဲ", "ပို့ခဘယ်လောက်လဲ",
+  "can I order?", "how much?", "where are you?" are NOT addresses.
+- If a line mixes a phone number with an address, remove only the phone and keep the address.
+- The buyer name is supplied separately from the Facebook account; do not guess a name from chat text.
 """
 
     answer = openai_chat(
@@ -1485,6 +1501,52 @@ def infer_delivery_area_for_complete_order(session):
     return session
 
 
+def is_likely_delivery_address(value):
+    """True only when text looks like a real delivery address, not a buyer question.
+
+    Supports Burmese, English, and mixed Myanmar addresses. Ambiguous text is left
+    for the AI order extractor instead of being blindly saved as an address.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+
+    low = text.lower()
+
+    # Strong location evidence always wins.
+    if detect_delivery_area_from_text(text):
+        return True
+
+    address_tokens = (
+        "လမ်း", "လမ်းမ", "ရပ်ကွက်", "မြို့နယ်", "မြို့", "ရွာ", "ကျေးရွာ",
+        "အမှတ်", "တိုက်", "အခန်း", "ထပ်", "အိမ်", "ဈေး", "စက်မှုဇုန်",
+        "road", " rd", "street", " st", "township", "ward", "quarter",
+        "village", "city", "state", "region", "district", "block", "lane",
+        "avenue", "ave", "building", "apartment", "floor", "room", "no.",
+    )
+    if any(tok in low for tok in address_tokens):
+        return True
+
+    # Do not turn ordinary sales questions/chat into an address merely because
+    # an account name is already present in the order session.
+    question_tokens = (
+        "လား", "လဲ", "ဘယ်", "ဘယ်လောက်", "ရမလား", "ရှိလား", "ရှိသေးလား",
+        "ပို့ခ", "စျေး", "ဈေး", "အသုံးပြု", "ဘယ်လို", "အော်ဒါတင်ပေးမှာလား",
+        "အော်ဒါတင်ပေးမလား", "how much", "price", "delivery fee", "deli",
+        "can i", "can you", "do you", "is it", "how to", "what", "where",
+        "available", "in stock", "order?", "?",
+    )
+    if any(tok in low for tok in question_tokens):
+        return False
+
+    # Postal-looking text: a house/building number plus several words is often
+    # an address even when the township/city is omitted.
+    if re.search(r"\b\d{1,4}[/-]?[a-zA-Z]?\b", low) and len(text.split()) >= 3:
+        return True
+
+    return False
+
+
 def looks_like_order_progress(message, session=None):
     """Recognize incremental order details after a product has been selected."""
     value = str(message or "").strip()
@@ -1508,12 +1570,11 @@ def looks_like_order_progress(message, session=None):
         return True
 
     session = session or {}
-    # After a product has been selected, a short plain-text first message is
-    # commonly the buyer's name; the next plain-text message is commonly address.
+    # With ManyChat the buyer name comes from the Facebook account, so do not
+    # treat arbitrary chat as a name/address. Only location-looking text advances
+    # the order; ambiguous text can still be classified by the AI order parser.
     if session.get("last_product_code") in PRODUCTS:
-        if not session.get("name") and 1 < len(value) <= 80:
-            return True
-        if session.get("name") and not session.get("address") and len(value) >= 4:
+        if session.get("name") and not session.get("address") and is_likely_delivery_address(value):
             return True
 
     return False
@@ -1528,7 +1589,9 @@ def is_order_noise_segment(text):
         "ယူမယ်", "ယူပါမယ်", "ယူချင်တယ်", "ယူချင်ပါတယ်", "လိုချင်တယ်",
         "လိုချင်ပါတယ်", "မှာမယ်", "မှာယူမယ်", "မှာယူပါမယ်", "အော်ဒါတင်မယ်",
         "တခုယူ", "တစ်ခုယူ", "၁ခုယူ", "၁ ခုယူ", "တခုယူမယ်",
-        "တစ်ခုယူမယ်", "one", "1pc", "1pcs", "x1", "order", "buy",
+        "တစ်ခုယူမယ်", "အော်ဒါတင်ပေးမှာလား", "အော်ဒါတင်ပေးမလား",
+        "အော်ဒါတင်မှာလား", "မှာပေးမှာလား", "လိုချင်ပါတယ်", "လိုချင်ပါသည်",
+        "one", "1pc", "1pcs", "x1", "order", "buy",
     )
     phrase_compact = tuple(re.sub(r"\s+", "", p.lower()) for p in phrases)
     if compact in phrase_compact:
@@ -1552,15 +1615,27 @@ def extract_order_fields_locally(message, session=None):
     if not value:
         return result
 
-    parts = [p.strip() for p in re.split(r"[/\n|]+", value) if p.strip()]
-
     # Phone: support both Western and Myanmar digits, without swallowing quantity text.
+    # IMPORTANT: remove ONLY the phone substring before parsing Name/Address.
+    # Older versions discarded the entire segment whenever that segment also
+    # contained the phone number, so a one-shot message like
+    # "Hpone Myint 16 Kyaik Kasan Rd Tamwe 09777888899" lost the address and
+    # forced the buyer to send the phone again separately.
     phone_source = _western_digits(value)
     phone_match = re.search(r"(?<![0-9])(09[0-9 \t-]{7,12}[0-9])(?![0-9])", phone_source)
     if not phone_match:
         phone_match = re.search(r"(?<![0-9])([0-9][0-9 \t-]{7,12}[0-9])(?![0-9])", phone_source)
+
+    value_without_phone = value
     if phone_match:
         result["phone"] = re.sub(r"[^\d+]", "", phone_match.group(1))
+        # Remove the matched phone from a western-digit copy, then use that copy
+        # for deterministic field parsing. This is safe for Burmese text because
+        # _western_digits() changes only digit glyphs.
+        start, end = phone_match.span(1)
+        value_without_phone = (phone_source[:start] + " " + phone_source[end:]).strip()
+
+    parts = [p.strip() for p in re.split(r"[/\n|]+", value_without_phone) if p.strip()]
 
     for code, qty in find_codes_and_quantities(value).items():
         if code in PRODUCTS:
@@ -1568,14 +1643,12 @@ def extract_order_fields_locally(message, session=None):
 
     clean_parts = []
     for part in parts:
-        normalized_part_digits = re.sub(r"[^\d+]", "", part)
-        if result["phone"] and result["phone"] == normalized_part_digits:
-            continue
         if find_codes_and_quantities(part):
             continue
         if is_order_noise_segment(part):
             continue
-        clean_parts.append(part)
+        clean_parts.append(part.strip(" ,.-"))
+    clean_parts = [p for p in clean_parts if p]
 
     # Multi-part: first non-address-looking segment is usually name.
     if clean_parts:
@@ -1584,12 +1657,23 @@ def extract_order_fields_locally(message, session=None):
             result["name"] = first
             clean_parts = clean_parts[1:]
 
+    # If ManyChat/FB account name already supplied the customer name, NEVER
+    # try to reinterpret the remaining one-shot text as another name. Everything
+    # left after removing phone/code/order-noise is the delivery address.
+    if current.get("name") and clean_parts and not current.get("address"):
+        candidate = " / ".join(clean_parts).strip()
+        if is_likely_delivery_address(candidate):
+            result["address"] = candidate
+            clean_parts = []
+
     # If the name was already collected in a previous message, all remaining
     # non-phone text is address. This fixes customers sending Name / Address /
     # Phone as three separate messages.
     if clean_parts:
         if current.get("name") or result.get("name"):
-            result["address"] = " / ".join(clean_parts).strip()
+            candidate = " / ".join(clean_parts).strip()
+            if is_likely_delivery_address(candidate):
+                result["address"] = candidate
         elif len(clean_parts) >= 2:
             result["name"] = clean_parts[0]
             result["address"] = " / ".join(clean_parts[1:]).strip()
@@ -1613,7 +1697,7 @@ def extract_order_fields_locally(message, session=None):
             leftovers.append(part)
         if leftovers:
             candidate = " / ".join(leftovers).strip()
-            if candidate and candidate != current.get("name"):
+            if candidate and candidate != current.get("name") and is_likely_delivery_address(candidate):
                 result["address"] = candidate
 
     result["delivery_area"] = detect_delivery_area_from_text(
@@ -2089,11 +2173,59 @@ def delivery_time_reply(text):
     )
 
 
+def extract_manychat_account_name(data):
+    """Best-effort Facebook/ManyChat account name supplied by ManyChat.
+
+    Preferred Body field is full_name = Full Name. Also accepts common aliases
+    and first_name + last_name so the bot never has to guess a buyer name from
+    conversational text.
+    """
+    if not isinstance(data, dict):
+        return ""
+
+    for key in ("full_name", "facebook_name", "fb_name", "contact_name", "name"):
+        value = str(data.get(key, "") or "").strip()
+        if value:
+            return value
+
+    first = str(data.get("first_name", "") or "").strip()
+    last = str(data.get("last_name", "") or "").strip()
+    combined = " ".join(x for x in (first, last) if x).strip()
+    if combined:
+        return combined
+
+    # Some ManyChat payloads may include nested contact/subscriber data.
+    for obj_key in ("contact", "subscriber", "user"):
+        obj = data.get(obj_key)
+        if isinstance(obj, dict):
+            for key in ("full_name", "name"):
+                value = str(obj.get(key, "") or "").strip()
+                if value:
+                    return value
+            first = str(obj.get("first_name", "") or "").strip()
+            last = str(obj.get("last_name", "") or "").strip()
+            combined = " ".join(x for x in (first, last) if x).strip()
+            if combined:
+                return combined
+
+    return ""
+
+
+def lock_facebook_account_name(session, account_name):
+    """Use Facebook/ManyChat account name as the only buyer name for ManyChat orders."""
+    account_name = str(account_name or "").strip()
+    if account_name:
+        session["name"] = account_name
+        session["_account_name_locked"] = True
+    return session
+
+
 def handle_manychat_request(data):
     """
     ManyChat body:
       message      = Last Text Input
       contact_id   = Contact Id
+      full_name    = Full Name (recommended; Facebook/ManyChat account name)
       image_url    = optional customer attachment URL
       product_code/ad_code/ad_context/ad_name = optional Ad context from ManyChat
 
@@ -2101,7 +2233,8 @@ def handle_manychat_request(data):
     - Unclear product => exactly "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"
     - Product => image, detail, price, then exact order-info prompt.
     - No quantity supplied => defaults to 1 item.
-    - Name/address/phone completion => buyer confirmation + Telegram.
+    - Buyer name always comes from Facebook/ManyChat Full Name.
+    - Burmese/English/mixed text or image address + phone completion => buyer confirmation + Telegram.
     - Unknown/non-shopping/unresolved => Admin handoff/pause for that customer.
     - Exact duplicate ManyChat input => no second customer reply.
     - Completed order => Telegram is queued once with retry + duplicate suppression.
@@ -2110,6 +2243,7 @@ def handle_manychat_request(data):
 
     message = str(data.get("message", "") or "").strip()
     contact_id = str(data.get("contact_id", "") or "").strip()
+    account_name = extract_manychat_account_name(data)
     incoming_image_url = str(
         data.get("image_url", "")
         or data.get("attachment_url", "")
@@ -2134,7 +2268,7 @@ def handle_manychat_request(data):
 
     print(
         "MANYCHAT INPUT:",
-        {"message": message, "contact_id": contact_id, "image_url": incoming_image_url},
+        {"message": message, "contact_id": contact_id, "account_name": account_name, "image_url": incoming_image_url},
         flush=True,
     )
 
@@ -2164,6 +2298,12 @@ def handle_manychat_request(data):
 
     session = get_order_session(contact_id)
 
+    # Buyer name is ALWAYS the Facebook/ManyChat account name for ManyChat orders.
+    # Typed names, OCR names, and AI-extracted names must never overwrite it.
+    if account_name:
+        lock_facebook_account_name(session, account_name)
+        print("ORDER NAME FROM MANYCHAT ACCOUNT (LOCKED):", account_name, flush=True)
+
     # Explicit human/Admin request only.
     if wants_admin(message):
         pause_for_admin(contact_id)
@@ -2173,6 +2313,30 @@ def handle_manychat_request(data):
 
     if asks_delivery_time(message):
         return done(manychat_text(delivery_time_reply(message)))
+
+    # If a product is already selected and the buyer sends an image, first check
+    # whether that image contains delivery address/phone details. This lets buyers
+    # send address screenshots/photos in Burmese or English. Product-only photos
+    # still continue to normal product-image recognition below.
+    pre_extracted_order_image = {}
+    image_has_order_details = False
+    if incoming_image_url and session.get("last_product_code") in PRODUCTS:
+        try:
+            pre_extracted_order_image = extract_order_fields_from_image(
+                incoming_image_url, message
+            )
+            if isinstance(pre_extracted_order_image, dict):
+                pre_extracted_order_image["name"] = ""  # FB account name always wins.
+                image_has_order_details = bool(
+                    str(pre_extracted_order_image.get("address", "") or "").strip()
+                    or str(pre_extracted_order_image.get("phone", "") or "").strip()
+                )
+                if image_has_order_details:
+                    session = merge_extracted_order_data(session, pre_extracted_order_image)
+                    lock_facebook_account_name(session, account_name)
+                    print("ORDER DETAILS FROM IMAGE:", pre_extracted_order_image, flush=True)
+        except Exception as e:
+            print("PRE-ORDER IMAGE EXTRACTION ERROR:", str(e), flush=True)
 
     # If the current message explicitly contains product code(s), those codes
     # are authoritative for THIS order. Do not carry an older browsed product
@@ -2215,6 +2379,7 @@ def handle_manychat_request(data):
             if message:
                 print("V22 FAST ORDER TEXT:", message, flush=True)
                 session = merge_order_message(contact_id, message)
+                lock_facebook_account_name(session, account_name)
                 print("V22 FAST ORDER SESSION:", session, flush=True)
 
             explicit_qty = extract_explicit_quantity(message)
@@ -2230,6 +2395,7 @@ def handle_manychat_request(data):
                 bad_code, bad_status = first_unavailable_session_item(session)
                 if bad_code:
                     ORDER_SESSIONS[contact_id] = new_order_session()
+                    lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
                     return done(manychat_text(unavailable_order_reply(bad_code, bad_status)))
 
                 telegram_text = build_telegram_order(session)
@@ -2237,6 +2403,7 @@ def handle_manychat_request(data):
                 if queue_telegram_order(contact_id, telegram_text):
                     buyer_text = buyer_order_confirmation(session)
                     ORDER_SESSIONS[contact_id] = new_order_session()
+                    lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
                     return done(manychat_text(buyer_text))
 
                 # Do not erase the session when Telegram configuration is missing.
@@ -2283,8 +2450,9 @@ def handle_manychat_request(data):
     # A customer image that identifies a catalog product is a PRODUCT QUERY, not
     # an order screenshot. V20 treated every incoming image as order intent and
     # therefore asked for Name/Address/Phone instead of showing the matched item.
-    if product and recognized_from_image and not looks_like_order_details(message):
+    if product and recognized_from_image and not image_has_order_details and not looks_like_order_details(message):
         ORDER_SESSIONS[contact_id] = new_order_session()
+        lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
         if product_is_sellable(product):
             ORDER_SESSIONS[contact_id]["last_product_code"] = code
         return done(manychat_product_response(code, product))
@@ -2292,6 +2460,7 @@ def handle_manychat_request(data):
     # A bare product code/name is browsing and refreshes the current product.
     if product and is_pure_product_query(message, code, product):
         ORDER_SESSIONS[contact_id] = new_order_session()
+        lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
         if product_is_sellable(product):
             ORDER_SESSIONS[contact_id]["last_product_code"] = code
         else:
@@ -2311,10 +2480,10 @@ def handle_manychat_request(data):
 
     active_order = bool(
         session.get("items")
-        or session.get("name")
         or session.get("address")
         or session.get("phone")
         or session.get("quantity_confirmed")
+        or image_has_order_details
     )
 
     # Generic "လိုချင်ပါတယ်" / "Can I make a purchase?" with no product known:
@@ -2328,6 +2497,7 @@ def handle_manychat_request(data):
         or (last_product_ready and looks_like_order_details(message))
         or (last_product_ready and looks_like_order_progress(message, session))
         or (extract_explicit_quantity(message) is not None and last_product_ready)
+        or (image_has_order_details and last_product_ready)
     )
 
     # -------- Order collection --------
@@ -2351,17 +2521,21 @@ def handle_manychat_request(data):
         ):
             print("ORDER TEXT RECEIVED:", message, flush=True)
             session = merge_order_message(contact_id, message)
+            lock_facebook_account_name(session, account_name)
             print("ORDER SESSION AFTER TEXT:", session, flush=True)
 
         if incoming_image_url:
-            extracted_from_image = extract_order_fields_from_image(
+            extracted_from_image = pre_extracted_order_image or extract_order_fields_from_image(
                 incoming_image_url,
                 message,
             )
+            if isinstance(extracted_from_image, dict):
+                extracted_from_image["name"] = ""  # FB account name always wins.
             session = merge_extracted_order_data(
                 session,
                 extracted_from_image,
             )
+            lock_facebook_account_name(session, account_name)
             session = infer_delivery_area_for_complete_order(session)
 
         explicit_qty = extract_explicit_quantity(message)
@@ -2394,6 +2568,7 @@ def handle_manychat_request(data):
         bad_code, bad_status = first_unavailable_session_item(session)
         if bad_code:
             ORDER_SESSIONS[contact_id] = new_order_session()
+            lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
             return done(manychat_text(unavailable_order_reply(bad_code, bad_status)))
 
         telegram_text = build_telegram_order(session)
@@ -2404,6 +2579,7 @@ def handle_manychat_request(data):
         if queue_telegram_order(contact_id, telegram_text):
             buyer_text = buyer_order_confirmation(session)
             ORDER_SESSIONS[contact_id] = new_order_session()
+            lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
             return done(manychat_text(buyer_text))
 
         # Keep the session when Telegram configuration is missing.
