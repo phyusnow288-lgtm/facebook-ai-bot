@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V23-FINAL-COMPLETE"
+BOT_VERSION = "V30-AUDITED-4-FIXES"
 
 app = Flask(__name__)
 
@@ -44,6 +44,9 @@ PROCESSED_MESSAGE_IDS = set()
 BOT_SENT_MESSAGE_IDS = set()
 ADMIN_PAUSE_UNTIL = {}
 MANYCHAT_ECHO_IGNORE_UNTIL = {}
+RECENT_MANYCHAT_REPLY_TEXTS = {}
+RECENT_MANYCHAT_REPLY_LOCK = threading.Lock()
+MANYCHAT_REPLY_TEXT_TTL_SECONDS = int(os.environ.get("MANYCHAT_REPLY_TEXT_TTL_SECONDS", "120"))
 RECENT_TELEGRAM_ORDERS = {}
 RECENT_TELEGRAM_LOCK = threading.Lock()
 TELEGRAM_ORDER_DEDUP_SECONDS = 300
@@ -1106,6 +1109,50 @@ def is_duplicate_manychat_input(data, message, contact_id, image_url):
     return False
 
 
+
+def _normalize_reply_fingerprint(value):
+    value = str(value or "").strip().lower()
+    return re.sub(r"\s+", " ", value)
+
+
+def remember_manychat_reply_text(value):
+    fp = _normalize_reply_fingerprint(value)
+    if not fp:
+        return
+    now = now_ts()
+    expiry = now + MANYCHAT_REPLY_TEXT_TTL_SECONDS
+    with RECENT_MANYCHAT_REPLY_LOCK:
+        for old_fp, expiries in list(RECENT_MANYCHAT_REPLY_TEXTS.items()):
+            live = [x for x in (expiries or []) if x > now]
+            if live:
+                RECENT_MANYCHAT_REPLY_TEXTS[old_fp] = live
+            else:
+                RECENT_MANYCHAT_REPLY_TEXTS.pop(old_fp, None)
+        RECENT_MANYCHAT_REPLY_TEXTS.setdefault(fp, []).append(expiry)
+
+
+def is_recent_manychat_reply_text(value):
+    fp = _normalize_reply_fingerprint(value)
+    if not fp:
+        return False
+    now = now_ts()
+    with RECENT_MANYCHAT_REPLY_LOCK:
+        expiries = [x for x in RECENT_MANYCHAT_REPLY_TEXTS.get(fp, []) if x > now]
+        if not expiries:
+            RECENT_MANYCHAT_REPLY_TEXTS.pop(fp, None)
+            return False
+
+        # Consume only one expected echo. The same standard reply can be sent
+        # to several customers at nearly the same time.
+        expiries.sort()
+        expiries.pop(0)
+        if expiries:
+            RECENT_MANYCHAT_REPLY_TEXTS[fp] = expiries
+        else:
+            RECENT_MANYCHAT_REPLY_TEXTS.pop(fp, None)
+        return True
+
+
 # =========================
 # ADMIN TAKEOVER
 # =========================
@@ -1140,18 +1187,18 @@ def admin_is_active(customer_id):
 
 def handle_echo_message(event, message_data):
     """
-    Page/Admin outgoing message handling.
-
-    - Python-bot messages are ignored by message id.
-    - ManyChat-generated replies are ignored for a short grace period so they
-      are not mistaken for a human Admin reply.
-    - A real manual Page/Admin reply pauses ONLY that one customer.
+    Ignore Python-bot and ManyChat-generated echoes.
+    Only an unmatched Page echo is treated as a real manual Admin reply.
     """
     mid = str(message_data.get("mid", "") or "").strip()
-
     if mid and mid in BOT_SENT_MESSAGE_IDS:
         BOT_SENT_MESSAGE_IDS.discard(mid)
         print("BOT ECHO IGNORED:", mid, flush=True)
+        return
+
+    echo_text = str(message_data.get("text", "") or "").strip()
+    if echo_text and is_recent_manychat_reply_text(echo_text):
+        print("MANYCHAT TEXT ECHO IGNORED:", echo_text[:120], flush=True)
         return
 
     customer_id = str(
@@ -1159,25 +1206,17 @@ def handle_echo_message(event, message_data):
         or event.get("sender", {}).get("id")
         or ""
     ).strip()
-
     if not customer_id:
         return
 
     ignore_until = MANYCHAT_ECHO_IGNORE_UNTIL.get(customer_id, 0)
     if ignore_until > now_ts():
-        print("MANYCHAT ECHO IGNORED:", customer_id, flush=True)
+        print("MANYCHAT ID ECHO IGNORED:", customer_id, flush=True)
         return
 
     MANYCHAT_ECHO_IGNORE_UNTIL.pop(customer_id, None)
     pause_for_admin(customer_id)
-
-    print(
-        "MANUAL ADMIN MESSAGE DETECTED - BOT PAUSED:",
-        customer_id,
-        f"{ADMIN_PAUSE_MINUTES} minutes",
-        flush=True,
-    )
-
+    print("MANUAL ADMIN MESSAGE DETECTED - BOT PAUSED:", customer_id, flush=True)
 
 def new_order_session():
     return {
@@ -1367,9 +1406,9 @@ def detect_delivery_area_from_text(value):
 
     yangon_words = (
         # City / common spellings
-        "ရန်ကုန်", "yangon", "rangoon",
+        "ရန်ကုန်", "ရန်ကုန်တိုင်း", "yangon", "yangon region", "rangoon",
         # Yangon townships / common customer spellings
-        "တာမွေ", "tamwe", "tarmwe",
+        "တာမွေ", "tamwe", "tarmwe", "tamwe township", "tarmwe township",
         "ဗဟန်း", "bahan",
         "စမ်းချောင်း", "sanchaung",
         "ကမာရွတ်", "kamayut", "kamaryut",
@@ -1631,18 +1670,26 @@ def extract_order_fields_locally(message, session=None):
     # "Hpone Myint 16 Kyaik Kasan Rd Tamwe 09777888899" lost the address and
     # forced the buyer to send the phone again separately.
     phone_source = _western_digits(value)
-    phone_match = re.search(r"(?<![0-9])(09[0-9 \t-]{7,12}[0-9])(?![0-9])", phone_source)
-    if not phone_match:
-        phone_match = re.search(r"(?<![0-9])([0-9][0-9 \t-]{7,12}[0-9])(?![0-9])", phone_source)
 
-    value_without_phone = value
+    phone_match = re.search(
+        r"(?<![0-9])(09(?:[\s\-().]*[0-9]){7,11})(?![0-9])",
+        phone_source,
+        flags=re.IGNORECASE,
+    )
+    if not phone_match:
+        phone_match = re.search(
+            r"(?<![0-9])(09[0-9\s\-().]{7,22})(?![0-9])",
+            phone_source,
+            flags=re.IGNORECASE,
+        )
+
+    value_without_phone = phone_source
     if phone_match:
-        result["phone"] = re.sub(r"[^\d+]", "", phone_match.group(1))
-        # Remove the matched phone from a western-digit copy, then use that copy
-        # for deterministic field parsing. This is safe for Burmese text because
-        # _western_digits() changes only digit glyphs.
-        start, end = phone_match.span(1)
-        value_without_phone = (phone_source[:start] + " " + phone_source[end:]).strip()
+        phone_digits = re.sub(r"\D", "", phone_match.group(1))
+        if 9 <= len(phone_digits) <= 13 and phone_digits.startswith("09"):
+            result["phone"] = phone_digits
+            start, end = phone_match.span(1)
+            value_without_phone = (phone_source[:start] + " " + phone_source[end:]).strip()
 
     parts = [p.strip() for p in re.split(r"[/\n|]+", value_without_phone) if p.strip()]
 
@@ -2063,24 +2110,23 @@ def extract_product_context_from_manychat(data):
 
 
 def finalize_manychat(contact_id, response):
-    """
-    Remember that ManyChat is about to send a reply for this customer.
-    This prevents the Page echo of that automated reply from being mistaken
-    for a manual Admin takeover.
-    """
+    """Remember outgoing ManyChat replies so their Meta echoes are never treated as manual Admin."""
     try:
         messages = (
             response.get("content", {}).get("messages", [])
             if isinstance(response, dict)
             else []
         )
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("type") == "text":
+                remember_manychat_reply_text(msg.get("text", ""))
+
         if contact_id and messages:
             MANYCHAT_ECHO_IGNORE_UNTIL[str(contact_id)] = (
-                now_ts() + MANYCHAT_ECHO_GRACE_SECONDS
+                now_ts() + max(MANYCHAT_ECHO_GRACE_SECONDS, 60)
             )
     except Exception as e:
         print("MANYCHAT FINALIZE WARNING:", str(e), flush=True)
-
     return response
 
 
@@ -2311,7 +2357,7 @@ def handle_manychat_request(data):
     # Typed names, OCR names, and AI-extracted names must never overwrite it.
     if account_name:
         lock_facebook_account_name(session, account_name)
-        print("ORDER NAME FROM MANYCHAT ACCOUNT (LOCKED):", account_name, flush=True)
+        print("ORDER NAME FROM MANYCHAT FULL NAME (LOCKED):", account_name, flush=True)
 
     # Explicit human/Admin request only.
     if wants_admin(message):
@@ -2372,6 +2418,24 @@ def handle_manychat_request(data):
             if len(sellable_explicit) == 1:
                 session["last_product_code"] = next(iter(sellable_explicit))
 
+    # V30: parse address + phone before deciding whether the message is order progress.
+    pre_local_order = {}
+    pre_local_has_order_fields = False
+    if message and session.get("last_product_code") in PRODUCTS:
+        try:
+            pre_local_order = extract_order_fields_locally(message, session=session)
+            pre_local_order["name"] = ""  # Facebook/ManyChat Full Name always wins.
+            pre_local_has_order_fields = bool(
+                str(pre_local_order.get("address", "") or "").strip()
+                or str(pre_local_order.get("phone", "") or "").strip()
+            )
+            if pre_local_has_order_fields:
+                session = merge_extracted_order_data(session, pre_local_order)
+                lock_facebook_account_name(session, account_name)
+                print("V30 PRE-MERGED ORDER FIELDS:", pre_local_order, flush=True)
+        except Exception as e:
+            print("V30 PRE-MERGE ERROR:", str(e), flush=True)
+
     # -------- FAST ORDER PATH (V22) --------
     # Keep this before product/AI/image recognition. Once a customer has just
     # viewed a sellable product, a message containing order details must be
@@ -2382,7 +2446,10 @@ def handle_manychat_request(data):
     # follow-up, a one-shot address+phone message, or an address screenshot/photo.
     # Use the stricter order-progress classifier so ordinary product questions are
     # not swallowed as addresses.
-    order_progress_now = looks_like_order_progress(message, session=session)
+    order_progress_now = (
+        pre_local_has_order_fields
+        or looks_like_order_progress(message, session=session)
+    )
     if remembered_code in PRODUCTS and (
         order_progress_now
         or generic_purchase_intent(message)
