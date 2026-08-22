@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V32-GLOBAL-QTY-NO-CODE-CONFUSION"
+BOT_VERSION = "V33-IMAGE-FIRST-ORDER-REPLY-FIX"
 
 app = Flask(__name__)
 
@@ -664,32 +664,59 @@ Never invent a code.
 # IMAGE PRODUCT IDENTIFICATION
 # =========================
 def ai_find_product_from_image(image_url, caption=""):
-    """Fast one-call image identification designed for ManyChat's 10s timeout."""
+    """Identify a catalog product from a customer image in one vision call.
+
+    ManyChat gives us short-lived Facebook CDN URLs.  Instead of asking the model
+    to fetch that URL itself, first make a *short* server-side download and send
+    the bytes as a data URL.  This is more reliable for scontent/fbcdn links while
+    still respecting ManyChat's fixed 10-second Dynamic Block timeout.  If the
+    short download fails, fall back to the original HTTPS URL.
+    """
     if not OPENAI_API_KEY or not image_url:
         return None, None
 
     load_products()
     catalog = product_catalog_text()
-
-    # Prefer the original public FB/HTTP URL so Render does not spend up to 30s
-    # downloading and base64-encoding it before calling OpenAI.
     source_url = str(image_url or "").strip()
     if not source_url.startswith(("http://", "https://", "data:")):
         return None, None
+
+    vision_url = source_url
+    if source_url.startswith(("http://", "https://")):
+        try:
+            r = requests.get(
+                source_url,
+                timeout=2.0,
+                allow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            r.raise_for_status()
+            ctype = (r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+                     or "image/jpeg")
+            if ctype.startswith("image/") and r.content:
+                vision_url = (
+                    f"data:{ctype};base64,"
+                    + base64.b64encode(r.content).decode("ascii")
+                )
+                print("IMAGE INPUT: DOWNLOADED FB/CDN BYTES", len(r.content), flush=True)
+        except Exception as e:
+            print("IMAGE FAST DOWNLOAD FALLBACK TO URL:", str(e), flush=True)
 
     content = [
         {
             "type": "text",
             "text": (
-                "Identify the ONE product from this shop catalog shown in the customer image. "
-                "The image may be a product photo, screenshot, or photo of a phone screen. "
-                "Use visible Burmese/English/Chinese text, packaging, shape and catalog descriptions. "
-                "Return ONLY JSON: {\"code\":\"0001\"}. "
-                "If no confident catalog match, return {\"code\":null}. Never invent a code.\n\n"
+                "Identify exactly ONE matching product from this shop catalog. "
+                "The customer image can be the actual product, packaging, an ad screenshot, "
+                "or a photo of a phone screen. Compare visible text, brand/model markings, "
+                "shape, color/layout, and catalog descriptions. Text can be Burmese, English, "
+                "or Chinese. Return ONLY JSON: {\"code\":\"0001\"}. "
+                "If there is no confident catalog match, return {\"code\":null}. "
+                "Never invent a code.\n\n"
                 f"CATALOG:\n{catalog}\n\nCUSTOMER TEXT: {caption}"
             ),
         },
-        {"type": "image_url", "image_url": {"url": source_url}},
+        {"type": "image_url", "image_url": {"url": vision_url}},
     ]
 
     answer = openai_chat(
@@ -2295,6 +2322,32 @@ def manychat_product_response(code, product):
 
 
 
+def manychat_product_order_response(code, product, missing):
+    """Show product info first, then ask only for still-missing order fields.
+
+    Used when the buyer's *first* mention already contains an order quantity,
+    e.g. "Mini vise 2 ခုယူမယ်".  The old flow jumped straight to asking for
+    address/phone and never showed Code / Detail / Price.
+    """
+    messages = []
+    image_url = product_public_image_url(code, product)
+    if image_url:
+        print("MANYCHAT PUBLIC IMAGE URL:", image_url, flush=True)
+        messages.append({"type": "image", "url": image_url})
+
+    detail = product_detail(product)
+    if detail:
+        messages.append({"type": "text", "text": detail})
+
+    messages.append({"type": "text", "text": product_reply(code, product)})
+
+    prompt = order_prompt_for_missing(missing) if missing else ""
+    if prompt:
+        messages.append({"type": "text", "text": prompt})
+
+    return manychat_response(messages)
+
+
 def asks_delivery_time(text):
     low = str(text or "").strip().lower()
 
@@ -2468,6 +2521,7 @@ def handle_manychat_request(data):
         return manychat_response([])
 
     session = get_order_session(contact_id)
+    initial_last_product_code = str(session.get("last_product_code", "") or "").strip()
 
     # Buyer name is ALWAYS the Facebook/ManyChat account name for ManyChat orders.
     # Typed names, OCR names, and AI-extracted names must never overwrite it.
@@ -2677,6 +2731,29 @@ def handle_manychat_request(data):
             session["items"] = {}
             return done(manychat_product_response(code, product))
 
+    # V33: If the buyer identifies a NEW product and orders a quantity in the
+    # same first message (e.g. "Mini vise 2 ခုယူမယ်"), show the product image,
+    # detail and price BEFORE asking for address/phone.  Do not do this for a
+    # product already shown in the immediately preceding turn, so "2 ခုယူမယ်"
+    # after viewing a product remains a short order-progress reply.
+    explicit_qty_now = extract_explicit_quantity(message)
+    newly_identified_order = bool(
+        product
+        and product_is_sellable(product)
+        and explicit_qty_now is not None
+        and initial_last_product_code != code
+        and not image_has_order_details
+        and not looks_like_order_details(message)
+    )
+    if newly_identified_order:
+        session["last_product_code"] = code
+        session["items"] = {code: explicit_qty_now}
+        session["quantity_confirmed"] = True
+        lock_facebook_account_name(session, account_name)
+        missing_now = order_missing_fields(session)
+        print("V33 FIRST PRODUCT+QTY SHOW INFO FIRST:", code, explicit_qty_now, missing_now, flush=True)
+        return done(manychat_product_order_response(code, product, missing_now))
+
     last_product_ready = session.get("last_product_code") in PRODUCTS
 
     active_order = bool(
@@ -2792,11 +2869,18 @@ def handle_manychat_request(data):
     if product:
         return done(manychat_product_response(code, product))
 
+    # V33: A product image that cannot be matched must NOT put this customer into
+    # Admin pause.  Otherwise one failed vision attempt makes every later image/code
+    # silent for ADMIN_PAUSE_MINUTES. Ask which product instead and keep bot active.
+    if incoming_image_url:
+        print("UNRESOLVED IMAGE - BOT REMAINS ACTIVE", flush=True)
+        return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
+
     greeting = simple_greeting(message)
     if greeting:
         return done(manychat_text(greeting))
 
-    # An unresolved image, an unknown/non-shopping question, or anything the
+    # An unresolved non-image unknown/non-shopping question or anything the
     # bot cannot confidently classify goes to a human Admin. Generic purchase
     # intent without a product was already handled above with the exact
     # "which product" sentence, so it never reaches this fallback.
@@ -3102,3 +3186,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
+
