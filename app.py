@@ -5,10 +5,12 @@ import json
 import time
 import base64
 import mimetypes
+import threading
+from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V17-YANGON-ORDER-FIX"
+BOT_VERSION = "V19-FULL-AUDIT"
 
 app = Flask(__name__)
 
@@ -43,6 +45,8 @@ BOT_SENT_MESSAGE_IDS = set()
 ADMIN_PAUSE_UNTIL = {}
 MANYCHAT_ECHO_IGNORE_UNTIL = {}
 MANYCHAT_ECHO_GRACE_SECONDS = int(os.environ.get("MANYCHAT_ECHO_GRACE_SECONDS", "20"))
+PRODUCT_REFRESH_LOCK = threading.Lock()
+PRODUCT_REFRESH_RUNNING = False
 
 
 # =========================
@@ -109,37 +113,68 @@ def sheet_export_url(url):
     return url
 
 
-def load_products(force=False):
-    global PRODUCTS, LAST_PRODUCT_REFRESH
-
+def _fetch_products_from_sheet():
     if not GOOGLE_SHEET_URL:
         print("GOOGLE_SHEET_URL IS MISSING", flush=True)
-        return
+        return None
 
-    if not force and PRODUCTS and now_ts() - LAST_PRODUCT_REFRESH < PRODUCT_REFRESH_SECONDS:
-        return
+    response = requests.get(sheet_export_url(GOOGLE_SHEET_URL), timeout=12)
+    response.raise_for_status()
+    reader = csv.DictReader(response.text.splitlines())
+    products = {}
+    for row in reader:
+        code = normalize_code(get_row_value(row, "Code", "code", "CODE"))
+        if code:
+            products[code] = row
+    return products
 
+
+def _background_product_refresh():
+    global PRODUCTS, LAST_PRODUCT_REFRESH, PRODUCT_REFRESH_RUNNING
     try:
-        response = requests.get(sheet_export_url(GOOGLE_SHEET_URL), timeout=20)
-        response.raise_for_status()
-
-        reader = csv.DictReader(response.text.splitlines())
-
-        products = {}
-
-        for row in reader:
-            code = normalize_code(get_row_value(row, "Code", "code", "CODE"))
-            if code:
-                products[code] = row
-
-        PRODUCTS = products
-        LAST_PRODUCT_REFRESH = now_ts()
-
-        print("PRODUCTS LOADED:", len(PRODUCTS), flush=True)
-        print("PRODUCT CODES:", list(PRODUCTS.keys()), flush=True)
-
+        products = _fetch_products_from_sheet()
+        if products is not None:
+            PRODUCTS = products
+            LAST_PRODUCT_REFRESH = now_ts()
+            print("PRODUCTS LOADED:", len(PRODUCTS), flush=True)
+            print("PRODUCT CODES:", list(PRODUCTS.keys()), flush=True)
     except Exception as e:
-        print("SHEET ERROR:", str(e), flush=True)
+        print("SHEET BACKGROUND ERROR:", str(e), flush=True)
+    finally:
+        with PRODUCT_REFRESH_LOCK:
+            PRODUCT_REFRESH_RUNNING = False
+
+
+def load_products(force=False):
+    """
+    Keep ManyChat fast. If we already have a catalog, a stale refresh happens in
+    the background instead of making the live customer request wait on Google.
+    A forced/first load is synchronous so the bot has a catalog after startup.
+    """
+    global PRODUCTS, LAST_PRODUCT_REFRESH, PRODUCT_REFRESH_RUNNING
+
+    stale = (not PRODUCTS) or (now_ts() - LAST_PRODUCT_REFRESH >= PRODUCT_REFRESH_SECONDS)
+    if not stale and not force:
+        return
+
+    if force or not PRODUCTS:
+        try:
+            products = _fetch_products_from_sheet()
+            if products is not None:
+                PRODUCTS = products
+                LAST_PRODUCT_REFRESH = now_ts()
+                print("PRODUCTS LOADED:", len(PRODUCTS), flush=True)
+                print("PRODUCT CODES:", list(PRODUCTS.keys()), flush=True)
+        except Exception as e:
+            print("SHEET ERROR:", str(e), flush=True)
+        return
+
+    with PRODUCT_REFRESH_LOCK:
+        if PRODUCT_REFRESH_RUNNING:
+            return
+        PRODUCT_REFRESH_RUNNING = True
+
+    threading.Thread(target=_background_product_refresh, daemon=True).start()
 
 
 load_products(force=True)
@@ -703,8 +738,64 @@ def ai_find_product_from_image(image_url, caption=""):
 # =========================
 def product_status(product):
     return str(
-        get_row_value(product, "Stock status", "Stock Status", "Status")
+        get_row_value(
+            product,
+            "Stock status", "Stock Status", "StockStatus", "stock_status",
+            "Availability", "availability", "Status", "status",
+            "ပစ္စည်းအခြေအနေ", "လက်ကျန်အခြေအနေ",
+        )
+        or ""
     ).strip().lower()
+
+
+def product_availability(product):
+    """Normalize Sheet stock wording into in_stock / coming / out / unknown."""
+    raw = product_status(product)
+    compact = re.sub(r"[\s_\-]+", " ", raw).strip()
+    joined = re.sub(r"[^a-z0-9က-အ]+", "", compact)
+
+    # Check unavailable states BEFORE any positive word such as "stock" / "ရှိ".
+    out_words = (
+        "out of stock", "outofstock", "sold out", "soldout", "no stock",
+        "nostock", "unavailable", "ကုန်နေ", "ပစ္စည်းကုန်", "ကုန်ပြီ",
+        "လက်ကျန်မရှိ", "stock out", "stockout",
+    )
+    coming_words = (
+        "coming soon", "comingsoon", "coming", "not arrived", "notarrived",
+        "not arrive", "not yet arrived", "on the way", "ontheway",
+        "preorder", "pre order", "မရောက်သေး", "ပစ္စည်းမရောက်သေး",
+        "လမ်းမှာ", "လမ်းတွင်", "ကြိုတင်မှာ", "မှာထားဆဲ",
+    )
+    in_words = (
+        "in stock", "instock", "available", "ready stock", "readystock",
+        "ready", "လက်ကျန်ရှိ", "ပစ္စည်းရှိ", "ရှိပါတယ်", "ရှိ",
+    )
+
+    def hit(words):
+        return any(w in compact or re.sub(r"[^a-z0-9က-အ]+", "", w) in joined for w in words)
+
+    if compact in ("out", "ကုန်", "ကုန်ပြီ"):
+        return "out"
+    if compact in ("coming", "coming soon", "မရောက်သေး"):
+        return "coming"
+    if compact in ("in stock", "instock", "ရှိ", "available"):
+        return "in_stock"
+
+    if hit(out_words):
+        return "out"
+    if hit(coming_words):
+        return "coming"
+    if hit(in_words):
+        return "in_stock"
+
+    # Preserve compatibility with existing rows that predate the Stock Status column.
+    if not compact:
+        return "in_stock"
+    return "unknown"
+
+
+def product_is_sellable(product):
+    return product_availability(product) == "in_stock"
 
 
 def product_detail(product):
@@ -746,13 +837,16 @@ def product_reply(code, product):
     if not other_delivery:
         other_delivery = DEFAULT_OTHER_DELIVERY
 
-    status = product_status(product)
+    availability = product_availability(product)
 
-    if status in ("out of stock", "sold out", "out"):
+    if availability == "out":
         return f"Code {code} {name}\nလက်ရှိ ပစ္စည်းကုန်နေပါတယ်ရှင်။"
 
-    if status in ("coming soon", "coming"):
+    if availability == "coming":
         return f"Code {code} {name}\nလက်ရှိ ပစ္စည်းမရောက်သေးပါရှင်။"
+
+    if availability == "unknown":
+        return f"Code {code} {name}\nပစ္စည်းအခြေအနေကို Admin က စစ်ဆေးပေးပါမယ်ရှင်။"
 
     yangon_total = price + yangon_delivery
     other_total = price + other_delivery
@@ -1264,6 +1358,25 @@ def detect_delivery_area_from_text(value):
     if any(word in low for word in other_words):
         return "other"
 
+    # Region/state clues are strong non-Yangon signals once Yangon names above
+    # have already been ruled out.
+    other_region_words = (
+        "ကချင်", "ကယား", "ကရင်", "ချင်း", "မွန်", "ရခိုင်", "ရှမ်း",
+        "စစ်ကိုင်းတိုင်း", "မကွေးတိုင်း", "မန္တလေးတိုင်း", "ပဲခူးတိုင်း",
+        "ဧရာဝတီတိုင်း", "တနင်္သာရီတိုင်း", "နေပြည်တော်",
+        "kachin", "kayah", "kayin", "chin", "mon state", "rakhine", "shan",
+        "sagaing region", "magway region", "mandalay region", "bago region",
+        "ayeyarwady", "tanintharyi",
+    )
+    if any(word in low for word in other_region_words):
+        return "other"
+
+    # A literal city marker such as "...မြို့" (but not only "မြို့နယ်") is
+    # usually how up-country buyers identify their town.
+    without_township = low.replace("မြို့နယ်", "")
+    if "မြို့" in without_township:
+        return "other"
+
     return ""
 
 
@@ -1334,6 +1447,26 @@ def looks_like_order_progress(message, session=None):
 
     return False
 
+def is_order_noise_segment(text):
+    """True for purchase/quantity filler that must never become Name or Address."""
+    low = str(text or "").strip().lower()
+    if not low:
+        return True
+    compact = re.sub(r"\s+", "", low)
+    phrases = (
+        "ယူမယ်", "ယူပါမယ်", "ယူချင်တယ်", "ယူချင်ပါတယ်", "လိုချင်တယ်",
+        "လိုချင်ပါတယ်", "မှာမယ်", "မှာယူမယ်", "မှာယူပါမယ်", "အော်ဒါတင်မယ်",
+        "တခုယူ", "တစ်ခုယူ", "၁ခုယူ", "၁ ခုယူ", "တခုယူမယ်",
+        "တစ်ခုယူမယ်", "one", "1pc", "1pcs", "x1", "order", "buy",
+    )
+    phrase_compact = tuple(re.sub(r"\s+", "", p.lower()) for p in phrases)
+    if compact in phrase_compact:
+        return True
+    if re.fullmatch(r"[xX*]?\s*[0-9၀-၉]+\s*(?:pcs?|ခု|စုံ)?", low, flags=re.IGNORECASE):
+        return True
+    return False
+
+
 def extract_order_fields_locally(message, session=None):
     """Fast deterministic parser for one-shot and multi-message orders."""
     value = str(message or "").strip()
@@ -1351,9 +1484,9 @@ def extract_order_fields_locally(message, session=None):
     parts = [p.strip() for p in re.split(r"[/\n|]+", value) if p.strip()]
 
     # Phone: Myanmar 09... or a reasonable 9-13 digit phone-like number.
-    phone_match = re.search(r"(?<!\d)(09[\d\s-]{7,12}\d)(?!\d)", value)
+    phone_match = re.search(r"(?<![0-9])(09[0-9 \t-]{7,12}[0-9])(?![0-9])", value)
     if not phone_match:
-        phone_match = re.search(r"(?<!\d)(\d[\d\s-]{7,12}\d)(?!\d)", value)
+        phone_match = re.search(r"(?<![0-9])([0-9][0-9 \t-]{7,12}[0-9])(?![0-9])", value)
     if phone_match:
         result["phone"] = re.sub(r"[^\d+]", "", phone_match.group(1))
 
@@ -1367,6 +1500,8 @@ def extract_order_fields_locally(message, session=None):
         if result["phone"] and result["phone"] == normalized_part_digits:
             continue
         if find_codes_and_quantities(part):
+            continue
+        if is_order_noise_segment(part):
             continue
         clean_parts.append(part)
 
@@ -1400,6 +1535,8 @@ def extract_order_fields_locally(message, session=None):
             if result["phone"] and pd == result["phone"]:
                 continue
             if find_codes_and_quantities(part):
+                continue
+            if is_order_noise_segment(part):
                 continue
             leftovers.append(part)
         if leftovers:
@@ -1483,9 +1620,9 @@ def order_missing_fields(session):
     if not session.get("items"):
         missing.append("ပစ္စည်း")
 
-    if not session.get("delivery_area"):
-        missing.append("ရန်ကုန်/နယ်")
-
+    # Do not make Yangon buyers type "ရန်ကုန်". Once core order details are
+    # complete, infer_delivery_area_for_complete_order() resolves the area; an
+    # unknown complete address defaults to Yangon by the shop rule.
     return missing
 
 
@@ -1521,6 +1658,28 @@ def delivery_fee_for_area(area):
         return DEFAULT_OTHER_DELIVERY
 
     return 0
+
+
+def first_unavailable_session_item(session):
+    """Re-check stock immediately before Telegram so stale sessions cannot order it."""
+    for code in list(session.get("items", {}).keys()):
+        product = PRODUCTS.get(code)
+        if not product:
+            return code, "unknown"
+        availability = product_availability(product)
+        if availability != "in_stock":
+            return code, availability
+    return "", ""
+
+
+def unavailable_order_reply(code, availability):
+    product = PRODUCTS.get(code, {})
+    name = str(get_row_value(product, "Product Name", "Name")).strip()
+    if availability == "coming":
+        return f"Code {code} {name}\nလက်ရှိ ပစ္စည်းမရောက်သေးပါရှင်။"
+    if availability == "out":
+        return f"Code {code} {name}\nလက်ရှိ ပစ္စည်းကုန်နေပါတယ်ရှင်။"
+    return f"Code {code} {name}\nပစ္စည်းအခြေအနေကို Admin က စစ်ဆေးပေးပါမယ်ရှင်။"
 
 
 def build_telegram_order(session):
@@ -1596,8 +1755,14 @@ ORDER_WORDS = (
     "လိုချင်ပါတယ်",
     "ယူချင်တယ်",
     "တစ်ခုယူမယ်",
+    "တခုယူမယ်",
+    "တစ်ခုယူ",
+    "တခုယူ",
     "၁ခုယူမယ်",
     "၁ ခုယူမယ်",
+    "၁ခုယူ",
+    "၁ ခုယူ",
+    "ယူ",
 )
 
 
@@ -1674,36 +1839,62 @@ def generic_purchase_intent(text):
 
 def extract_product_context_from_manychat(data):
     """
-    Optional forward-compatible Ad/Product context.
+    Read product context supplied by ManyChat/Meta ad flows.
 
-    If ManyChat later sends any product/ad field containing a 4-digit code
-    (e.g. product_code=0016, ad_name='0016 Chain Breaker'), use it.
-    The current flow can keep sending only message + contact_id; this helper
-    does not break that setup.
+    IMPORTANT: the Python service cannot see Messenger's visual "View ad" card
+    by itself. ManyChat must include an ad/code/ref/title/custom-field value in
+    the POST body. Once any such value is sent, this function resolves it to a
+    catalog product and keeps the product in the customer's order session.
     """
     if not isinstance(data, dict):
         return "", None
 
     preferred_keys = (
         "product_code", "code", "ad_code", "source_code", "ref_code",
-        "ad_name", "ad_title", "campaign_name", "source", "ref",
+        "ad_context", "ad_id", "ad_ref", "referral", "referral_payload",
+        "ad_name", "ad_title", "ad_headline", "ad_message",
+        "ad_description", "source", "ref", "campaign_name", "adset_name",
+        "manychat_ad_product", "last_ad_product",
     )
 
-    for key in preferred_keys:
-        value = str(data.get(key, "") or "").strip()
-        if not value:
-            continue
-        code, product = find_product_by_code(value)
+    def match_value(value):
+        text = str(value or "").strip()
+        if not text:
+            return "", None
+        code, product = find_product_by_code(text)
         if product:
             return code, product
+        code, product = find_product_by_name(text)
+        if product:
+            return code, product
+        return "", None
 
-    # Last-resort scan of simple scalar fields only.
+    for key in preferred_keys:
+        if key not in data:
+            continue
+        value = data.get(key)
+        # Referral/context objects may contain nested ad payloads.
+        if isinstance(value, dict):
+            for nested_key in ("ref", "payload", "ad_id", "ad_name", "title", "headline", "product_code", "code"):
+                if nested_key in value:
+                    code, product = match_value(value.get(nested_key))
+                    if product:
+                        print("AD CONTEXT MATCH:", key, nested_key, code, flush=True)
+                        return code, product
+        else:
+            code, product = match_value(value)
+            if product:
+                print("AD CONTEXT MATCH:", key, code, flush=True)
+                return code, product
+
+    # Last-resort scan of all simple scalar fields except the customer's text/id.
     for key, value in data.items():
-        if key in ("message", "contact_id"):
+        if key in ("message", "contact_id", "image_url", "attachment_url"):
             continue
         if isinstance(value, (str, int, float)):
-            code, product = find_product_by_code(str(value))
+            code, product = match_value(value)
             if product:
+                print("AD CONTEXT SCALAR MATCH:", key, code, flush=True)
                 return code, product
 
     return "", None
@@ -1765,14 +1956,16 @@ def manychat_product_response(code, product):
 
     messages.append({"type": "text", "text": product_reply(code, product)})
 
-    messages.append(
-        {
-            "type": "text",
-            "text": (
-                'မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။'
-            ),
-        }
-    )
+    # Never invite an order for stock that is not sellable.
+    if product_is_sellable(product):
+        messages.append(
+            {
+                "type": "text",
+                "text": (
+                    'မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။'
+                ),
+            }
+        )
 
     return manychat_response(messages)
 
@@ -1833,7 +2026,7 @@ def handle_manychat_request(data):
       message      = Last Text Input
       contact_id   = Contact Id
       image_url    = optional customer attachment URL
-      product_code/ad_code/ad_name = optional future Ad context
+      product_code/ad_code/ad_context/ad_name = optional Ad context from ManyChat
 
     Rules:
     - Unclear product => exactly "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"
@@ -1873,6 +2066,14 @@ def handle_manychat_request(data):
         {"message": message, "contact_id": contact_id, "image_url": incoming_image_url},
         flush=True,
     )
+
+    ad_debug = {k: data.get(k) for k in (
+        "product_code", "ad_code", "ad_context", "ad_id", "ad_ref",
+        "referral", "ad_name", "ad_title", "ad_headline", "campaign_name",
+        "manychat_ad_product", "last_ad_product"
+    ) if data.get(k) not in (None, "", {})}
+    if ad_debug:
+        print("MANYCHAT AD CONTEXT:", ad_debug, flush=True)
 
     def done(response):
         return finalize_manychat(contact_id, response)
@@ -1928,11 +2129,20 @@ def handle_manychat_request(data):
     # A bare product code/name is browsing and refreshes the current product.
     if product and is_pure_product_query(message, code, product):
         ORDER_SESSIONS[contact_id] = new_order_session()
-        ORDER_SESSIONS[contact_id]["last_product_code"] = code
+        if product_is_sellable(product):
+            ORDER_SESSIONS[contact_id]["last_product_code"] = code
+        else:
+            print("PRODUCT NOT SELLABLE:", code, product_status(product), flush=True)
         return done(manychat_product_response(code, product))
 
     if product:
-        session["last_product_code"] = code
+        if product_is_sellable(product):
+            session["last_product_code"] = code
+        else:
+            # Unavailable products can be shown, but never become an order item.
+            session["last_product_code"] = ""
+            session["items"] = {}
+            return done(manychat_product_response(code, product))
 
     last_product_ready = session.get("last_product_code") in PRODUCTS
 
@@ -2006,11 +2216,17 @@ def handle_manychat_request(data):
 
             session["quantity_confirmed"] = True
 
+        session = infer_delivery_area_for_complete_order(session)
         missing = order_missing_fields(session)
         print("ORDER MISSING:", missing, flush=True)
 
         if missing:
             return done(manychat_text(order_prompt_for_missing(missing)))
+
+        bad_code, bad_status = first_unavailable_session_item(session)
+        if bad_code:
+            ORDER_SESSIONS[contact_id] = new_order_session()
+            return done(manychat_text(unavailable_order_reply(bad_code, bad_status)))
 
         telegram_text = build_telegram_order(session)
         print("TELEGRAM ORDER TEXT:", telegram_text, flush=True)
@@ -2065,7 +2281,7 @@ def is_duplicate_message(message_data):
 # =========================
 @app.route("/", methods=["GET"])
 def home():
-    return "Facebook AI Bot is running!", 200
+    return f"Facebook AI Bot is running! {BOT_VERSION}", 200
 
 
 @app.route("/webhook", methods=["GET"])
