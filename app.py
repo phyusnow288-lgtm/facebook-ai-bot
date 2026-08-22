@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V35-ALL-PRODUCT-CODE-TEXT-IMAGE"
+BOT_VERSION = "V36-ADMIN-ON-OFF-SAFE"
 
 app = Flask(__name__)
 
@@ -486,13 +486,19 @@ def find_product_by_code(message):
     return None, None
 
 
+def _compact_product_match_text(value):
+    """Normalize harmless spacing/punctuation differences for product-name matching."""
+    return re.sub(r"[^0-9a-zA-Zက-႟一-鿿]+", "", str(value or "").casefold())
+
+
 def find_product_by_name(message):
     load_products()
 
     if not message:
         return None, None
 
-    text = str(message).lower().strip()
+    text = str(message).casefold().strip()
+    compact_text = _compact_product_match_text(text)
 
     best_code = None
     best_product = None
@@ -501,17 +507,37 @@ def find_product_by_name(message):
     for code, product in PRODUCTS.items():
         candidates = [
             get_row_value(product, "Product Name", "Name", "product_name"),
-            get_row_value(product, "Myanmar Name", "MyanmarName"),
-            get_row_value(product, "English Name", "EnglishName"),
-            get_row_value(product, "Chinese Name", "ChineseName"),
+            get_row_value(product, "Myanmar Name", "MyanmarName", "Burmese Name", "MM Name"),
+            get_row_value(product, "English Name", "EnglishName", "EN Name"),
+            get_row_value(product, "Chinese Name", "ChineseName", "CN Name"),
+            get_row_value(product, "Model", "Model No", "Model Number", "SKU"),
         ]
 
+        # Sheet-maintained aliases/keywords are split into independent candidates.
+        # This stays data-driven, so future products still require no Python edit.
+        alias_blob = str(get_row_value(product, "Alias", "Aliases", "Keywords", "Keyword") or "")
+        if alias_blob:
+            candidates.extend(
+                part.strip()
+                for part in re.split(r"[,;|\n]+", alias_blob)
+                if part.strip()
+            )
+
         for candidate in candidates:
-            name = str(candidate or "").lower().strip()
-            if len(name) >= 3 and name in text and len(name) > best_score:
-                best_score = len(name)
-                best_code = code
-                best_product = product
+            name = str(candidate or "").casefold().strip()
+            if len(name) < 2:
+                continue
+
+            compact_name = _compact_product_match_text(name)
+            direct_match = name in text
+            compact_match = len(compact_name) >= 3 and compact_name in compact_text
+
+            if direct_match or compact_match:
+                score = max(len(name), len(compact_name))
+                if score > best_score:
+                    best_score = score
+                    best_code = code
+                    best_product = product
 
     return best_code, best_product
 
@@ -1419,6 +1445,12 @@ def handle_echo_message(event, message_data):
     """
     Ignore Python-bot and ManyChat-generated echoes.
     Only an unmatched Page echo is treated as a real manual Admin reply.
+
+    Manual Admin commands (case-insensitive):
+    - ON  -> immediately re-enable the bot for this customer.
+    - OFF -> keep the bot disabled for this customer until Admin sends ON.
+
+    Any other real manual Admin reply keeps the existing timed Admin-pause logic.
     """
     mid = str(message_data.get("mid", "") or "").strip()
     if mid and mid in BOT_SENT_MESSAGE_IDS:
@@ -1445,6 +1477,20 @@ def handle_echo_message(event, message_data):
         return
 
     MANYCHAT_ECHO_IGNORE_UNTIL.pop(customer_id, None)
+
+    # Admin ON/OFF controls are exact commands only, so normal sentences that
+    # merely contain the words "on" or "off" cannot accidentally change state.
+    admin_command = echo_text.casefold()
+    if admin_command == "on":
+        ADMIN_PAUSE_UNTIL.pop(customer_id, None)
+        print("ADMIN COMMAND ON - BOT ENABLED:", customer_id, flush=True)
+        return
+
+    if admin_command == "off":
+        ADMIN_PAUSE_UNTIL[customer_id] = float("inf")
+        print("ADMIN COMMAND OFF - BOT DISABLED UNTIL ON:", customer_id, flush=True)
+        return
+
     pause_for_admin(customer_id)
     print("MANUAL ADMIN MESSAGE DETECTED - BOT PAUSED:", customer_id, flush=True)
 
@@ -2372,6 +2418,33 @@ def generic_purchase_intent(text):
     return bool(low and is_order_message(low))
 
 
+def has_catalog_product_clue_text(text):
+    """Return True when an order sentence contains a catalog-product clue.
+
+    This rule is GLOBAL for every current and future Google Sheet item. Product
+    names, Burmese/English/Chinese names, aliases, keywords, model numbers, or
+    descriptive text can be followed by quantity/order wording. A bare quantity
+    such as ``2ခုယူမယ်`` still does not make AI guess a product.
+    """
+    value = _western_digits(str(text or "")).casefold()
+    if not value:
+        return False
+
+    # Remove known purchase phrases longest-first.
+    for word in sorted(ORDER_WORDS, key=len, reverse=True):
+        value = value.replace(str(word).casefold(), " ")
+
+    # Remove explicit quantities and unit words.
+    value = re.sub(r"[xX*]?\s*\d{1,3}\s*" + QUANTITY_UNITS_RE, " ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\b(?:qty|quantity)\b\s*[:=]?\s*\d{1,3}", " ", value, flags=re.IGNORECASE)
+    for word in BURMESE_QUANTITY_WORDS:
+        value = value.replace(word, " ")
+
+    # Ignore punctuation/whitespace; keep real Latin/Burmese/Chinese clue text.
+    clue = re.sub(r"[^a-z0-9က-႟一-鿿]+", "", value)
+    return len(clue) >= 2
+
+
 def extract_product_context_from_manychat(data):
     """
     Read product context supplied by ManyChat/Meta ad flows.
@@ -2877,7 +2950,9 @@ def handle_manychat_request(data):
     generic_order = generic_purchase_intent(message)
 
     # 3) Description / Burmese / English / Chinese text.
-    if not product and message and not generic_order:
+    # GLOBAL ALL-ITEM RULE: any catalog item name/alias/description + quantity/order
+    # wording must still go through recognition. Bare purchase phrases never make AI guess.
+    if not product and message and (not generic_order or has_catalog_product_clue_text(message)):
         code, product = ai_find_product_from_text(message)
 
     # Use optional Ad context if current message did not identify a product.
