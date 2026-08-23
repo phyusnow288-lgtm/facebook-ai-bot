@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V39-SAFE-MULTI-PHOTO-AD-FALLBACK"
+BOT_VERSION = "V40-SAFE-MULTI-PHOTO-AD-AUTO-ON-OFF"
 
 app = Flask(__name__)
 
@@ -1672,8 +1672,30 @@ def bind_customer_identities(*ids):
     merged = set()
     for cid in clean:
         merged.update(_identity_aliases(cid) or {cid})
+
+    # Preserve/propagate per-customer state when ManyChat Contact Id and Meta PSID
+    # become correlated after one side has already been paused/locked/echo-muted.
+    # This is critical because ManyChat Dynamic Block replies are keyed by Contact Id,
+    # while Meta outgoing is_echo events are normally keyed by the customer's PSID.
+    now = now_ts()
+    pause_until = 0
+    echo_until = 0
+    for cid in merged:
+        p = ADMIN_PAUSE_UNTIL.get(cid, 0)
+        if p == float("inf"):
+            pause_until = float("inf")
+        elif pause_until != float("inf") and p > now:
+            pause_until = max(pause_until, p)
+        e = MANYCHAT_ECHO_IGNORE_UNTIL.get(cid, 0)
+        if e > now:
+            echo_until = max(echo_until, e)
+
     for cid in merged:
         CUSTOMER_ID_ALIASES[cid] = set(merged - {cid})
+        if pause_until == float("inf") or pause_until > now:
+            ADMIN_PAUSE_UNTIL[cid] = pause_until
+        if echo_until > now:
+            MANYCHAT_ECHO_IGNORE_UNTIL[cid] = echo_until
     print("CUSTOMER IDS BOUND:", sorted(merged), flush=True)
 
 
@@ -1772,15 +1794,52 @@ def admin_is_active(customer_id):
 
 def _set_admin_command_state(customer_id, command):
     aliases = _identity_aliases(customer_id) or {str(customer_id or "")}
+    aliases.discard("")
     if command == "on":
+        # ON must clear BOTH the hard OFF lock and any temporary manual-admin pause
+        # for every known identity of this same customer.
         for cid in aliases:
             ADMIN_PAUSE_UNTIL.pop(cid, None)
+            MANYCHAT_ECHO_IGNORE_UNTIL.pop(cid, None)
         print("ADMIN COMMAND ON - BOT ENABLED:", sorted(aliases), flush=True)
         return True
     if command == "off":
+        # OFF is a hard per-customer lock and survives ordinary pause expiry.
         for cid in aliases:
             ADMIN_PAUSE_UNTIL[cid] = float("inf")
+            MANYCHAT_ECHO_IGNORE_UNTIL.pop(cid, None)
         print("ADMIN COMMAND OFF - BOT HARD LOCKED:", sorted(aliases), flush=True)
+        return True
+    return False
+
+
+def _set_manychat_echo_ignore(customer_id, seconds=None):
+    """Mute Meta echoes of ManyChat output for ALL aliases of this customer."""
+    if not customer_id:
+        return
+    ttl = max(int(seconds or MANYCHAT_ECHO_GRACE_SECONDS), 60)
+    until = now_ts() + ttl
+    aliases = _identity_aliases(customer_id) or {str(customer_id)}
+    for cid in aliases:
+        if cid:
+            MANYCHAT_ECHO_IGNORE_UNTIL[cid] = max(MANYCHAT_ECHO_IGNORE_UNTIL.get(cid, 0), until)
+
+
+def _manychat_echo_ignore_active(customer_id):
+    """Check/propagate the short ManyChat echo-ignore window across Contact Id/PSID aliases."""
+    aliases = _identity_aliases(customer_id) or {str(customer_id or "")}
+    aliases.discard("")
+    now = now_ts()
+    active_until = 0
+    for cid in aliases:
+        until = MANYCHAT_ECHO_IGNORE_UNTIL.get(cid, 0)
+        if until > now:
+            active_until = max(active_until, until)
+        elif cid in MANYCHAT_ECHO_IGNORE_UNTIL:
+            MANYCHAT_ECHO_IGNORE_UNTIL.pop(cid, None)
+    if active_until > now:
+        for cid in aliases:
+            MANYCHAT_ECHO_IGNORE_UNTIL[cid] = active_until
         return True
     return False
 
@@ -1813,11 +1872,13 @@ def handle_echo_message(event, message_data):
         _set_admin_command_state(customer_id, admin_command)
         return
 
-    ignore_until = MANYCHAT_ECHO_IGNORE_UNTIL.get(customer_id, 0)
-    if ignore_until > now_ts():
-        print("MANYCHAT ID ECHO IGNORED:", customer_id, flush=True)
+    # Product replies commonly start with an IMAGE. Those Meta image echoes have no
+    # text fingerprint, so checking only a ManyChat Contact-Id keyed timeout caused
+    # them to be mistaken for manual Admin replies whenever Meta used the PSID.
+    # Check the timeout across all correlated aliases instead.
+    if _manychat_echo_ignore_active(customer_id):
+        print("MANYCHAT ID/PSID ECHO IGNORED:", customer_id, flush=True)
         return
-    MANYCHAT_ECHO_IGNORE_UNTIL.pop(customer_id, None)
 
     pause_for_admin(customer_id)
     print("MANUAL ADMIN MESSAGE DETECTED - BOT PAUSED:", customer_id, flush=True)
@@ -2862,9 +2923,9 @@ def finalize_manychat(contact_id, response):
                 remember_manychat_reply_text(msg.get("text", ""))
 
         if contact_id and messages:
-            MANYCHAT_ECHO_IGNORE_UNTIL[str(contact_id)] = (
-                now_ts() + max(MANYCHAT_ECHO_GRACE_SECONDS, 60)
-            )
+            # Set the short ignore window for both ManyChat Contact Id and any bound
+            # Meta PSID, so outgoing text/image echoes never trigger Admin takeover.
+            _set_manychat_echo_ignore(contact_id)
     except Exception as e:
         print("MANYCHAT FINALIZE WARNING:", str(e), flush=True)
     return response
