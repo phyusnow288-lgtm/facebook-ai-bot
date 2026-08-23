@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V39-SAFE-V38-PRESERVED-4-FIXES"
+BOT_VERSION = "V39-SAFE-MULTI-PHOTO-AD-FALLBACK"
 
 app = Flask(__name__)
 
@@ -68,6 +68,15 @@ MANYCHAT_ECHO_GRACE_SECONDS = int(os.environ.get("MANYCHAT_ECHO_GRACE_SECONDS", 
 PRODUCT_REFRESH_LOCK = threading.Lock()
 PRODUCT_REFRESH_RUNNING = False
 
+# V39: keep every recently observed customer image for a few seconds.
+# Messenger/ManyChat can deliver a multi-photo send as separate webhook events,
+# while Last Text Input may expose only the newest attachment.  This short-lived
+# buffer lets the next ManyChat request recover all photos without changing any
+# order/session behavior from V38.
+RECENT_CUSTOMER_IMAGES = {}
+RECENT_CUSTOMER_IMAGES_LOCK = threading.Lock()
+RECENT_CUSTOMER_IMAGE_TTL_SECONDS = int(os.environ.get("RECENT_CUSTOMER_IMAGE_TTL_SECONDS", "20"))
+
 
 # =========================
 # BASIC HELPERS
@@ -117,6 +126,112 @@ def mark_bot_message_id(response):
                 BOT_SENT_MESSAGE_IDS.add(mid)
     except Exception:
         pass
+
+
+# =========================
+# V39 MULTI-PHOTO BUFFER
+# =========================
+def _flatten_image_urls(value):
+    """Return every plausible image URL found in a ManyChat/Meta payload value."""
+    out = []
+
+    def add(v):
+        if isinstance(v, str):
+            text = v.strip()
+            if text.startswith(("http://", "https://", "data:")):
+                low = text.lower()
+                if any(x in low for x in (".jpg", ".jpeg", ".png", ".webp", ".gif", "scontent", "fbcdn", "googleusercontent", "drive.google")):
+                    if text not in out:
+                        out.append(text)
+            return
+        if isinstance(v, dict):
+            # Known attachment/url keys first, then recurse safely through nested data.
+            for key in ("url", "image_url", "attachment_url", "last_image_url", "customer_image_url", "file_url", "src"):
+                if key in v:
+                    add(v.get(key))
+            for key, nested in v.items():
+                if key not in ("url", "image_url", "attachment_url", "last_image_url", "customer_image_url", "file_url", "src"):
+                    if isinstance(nested, (dict, list, tuple)):
+                        add(nested)
+            return
+        if isinstance(v, (list, tuple)):
+            for item in v:
+                add(item)
+
+    add(value)
+    return out
+
+
+def extract_manychat_image_urls(data, message=""):
+    """Collect ALL image URLs ManyChat may provide, not only Last Image URL."""
+    urls = []
+    if isinstance(data, dict):
+        for key in (
+            "image_urls", "images", "attachments", "attachment_urls", "files",
+            "image_url", "attachment_url", "last_image_url", "customer_image_url",
+            "image", "file_url", "last_attachment", "last_attachments",
+        ):
+            if key in data:
+                for url in _flatten_image_urls(data.get(key)):
+                    if url not in urls:
+                        urls.append(url)
+
+    # ManyChat sometimes places a Facebook CDN URL in Last Text Input.
+    text = str(message or "").strip()
+    if text.startswith(("http://", "https://")):
+        for url in _flatten_image_urls(text):
+            if url not in urls:
+                urls.append(url)
+    return urls
+
+
+def remember_customer_images(customer_id, urls):
+    cid = str(customer_id or "").strip()
+    if not cid:
+        return
+    now = now_ts()
+    clean = [str(u or "").strip() for u in (urls or []) if str(u or "").strip()]
+    if not clean:
+        return
+    ids = _identity_aliases(cid) or {cid}
+    with RECENT_CUSTOMER_IMAGES_LOCK:
+        # prune stale buffers globally
+        for old_id, rows in list(RECENT_CUSTOMER_IMAGES.items()):
+            live = [(u, ts) for u, ts in (rows or []) if now - ts <= RECENT_CUSTOMER_IMAGE_TTL_SECONDS]
+            if live:
+                RECENT_CUSTOMER_IMAGES[old_id] = live
+            else:
+                RECENT_CUSTOMER_IMAGES.pop(old_id, None)
+        for ident in ids:
+            bucket = RECENT_CUSTOMER_IMAGES.setdefault(str(ident), [])
+            known = {u for u, ts in bucket if now - ts <= RECENT_CUSTOMER_IMAGE_TTL_SECONDS}
+            for url in clean:
+                if url not in known:
+                    bucket.append((url, now))
+                    known.add(url)
+
+
+def recent_customer_images(customer_id):
+    cid = str(customer_id or "").strip()
+    if not cid:
+        return []
+    now = now_ts()
+    ids = _identity_aliases(cid) or {cid}
+    out = []
+    with RECENT_CUSTOMER_IMAGES_LOCK:
+        for ident in ids:
+            rows = RECENT_CUSTOMER_IMAGES.get(str(ident), []) or []
+            live = []
+            for url, ts in rows:
+                if now - ts <= RECENT_CUSTOMER_IMAGE_TTL_SECONDS:
+                    live.append((url, ts))
+                    if url not in out:
+                        out.append(url)
+            if live:
+                RECENT_CUSTOMER_IMAGES[str(ident)] = live
+            else:
+                RECENT_CUSTOMER_IMAGES.pop(str(ident), None)
+    return out
 
 
 # =========================
@@ -1716,6 +1831,7 @@ def new_order_session():
         "delivery_area": "",
         "items": {},
         "last_product_code": "",
+        "ad_product_code": "",
         "quantity_confirmed": False,
         "_account_name_locked": False,
     }
@@ -2804,24 +2920,60 @@ def manychat_product_response(code, product):
 
 
 def manychat_products_response(codes, include_order_prompt=True):
-    """Send image + Sheet detail + price for every matched item, then one order prompt."""
-    messages = []
+    """Send every matched product without exceeding ManyChat's 10-message block limit.
+
+    V39 keeps the same image/detail/price content. For 1-3 products it preserves
+    V38's separate image/detail/price messages. For larger sets it combines each
+    product's detail + price into one text and caps images only when required so
+    no recognized code is silently dropped from the returned data.
+    """
+    normalized = []
     seen = set()
     for raw_code in codes or []:
         code = normalize_code(raw_code)
-        if code in seen or code not in PRODUCTS:
-            continue
-        seen.add(code)
-        product = PRODUCTS[code]
-        image_url = product_public_image_url(code, product)
-        if image_url:
-            messages.append({"type": "image", "url": image_url})
-        detail = product_detail(product)
-        if detail:
-            messages.append({"type": "text", "text": detail})
-        messages.append({"type": "text", "text": product_reply(code, product)})
-    if include_order_prompt and any(product_is_sellable(PRODUCTS[c]) for c in seen):
+        if code in PRODUCTS and code not in seen:
+            seen.add(code)
+            normalized.append(code)
+
+    messages = []
+    if len(normalized) <= 3:
+        for code in normalized:
+            product = PRODUCTS[code]
+            image_url = product_public_image_url(code, product)
+            if image_url:
+                messages.append({"type": "image", "url": image_url})
+            detail = product_detail(product)
+            if detail:
+                messages.append({"type": "text", "text": detail})
+            messages.append({"type": "text", "text": product_reply(code, product)})
+    else:
+        # Reserve one message for the final order prompt. Use one combined text per
+        # product and as many product images as fit in the remaining message budget.
+        reserve = 1 if include_order_prompt else 0
+        max_images = max(0, 10 - reserve - len(normalized))
+        for code in normalized[:max_images]:
+            product = PRODUCTS[code]
+            image_url = product_public_image_url(code, product)
+            if image_url:
+                messages.append({"type": "image", "url": image_url})
+        for code in normalized:
+            product = PRODUCTS[code]
+            detail = product_detail(product)
+            combined_text = (detail + "\n\n" if detail else "") + product_reply(code, product)
+            messages.append({"type": "text", "text": combined_text})
+
+    if include_order_prompt and any(product_is_sellable(PRODUCTS[c]) for c in normalized):
         messages.append({"type": "text", "text": "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။"})
+
+    # Hard safety: Dynamic Block accepts at most 10 messages. If an unusually
+    # large catalog match occurs, merge overflow text into the last text message
+    # instead of dropping product data.
+    if len(messages) > 10:
+        head = messages[:9]
+        overflow_texts = [m.get("text", "") for m in messages[9:] if m.get("type") == "text" and m.get("text")]
+        if overflow_texts:
+            head.append({"type": "text", "text": "\n\n".join(overflow_texts)})
+        messages = head[:10]
     return manychat_response(messages)
 
 
@@ -2861,12 +3013,6 @@ def asks_delivery_time(text):
         "ဘယ်နရက်",
         "ဘယ်တော့ရောက်",
         "ဘယ်တော့ရောက်မလဲ",
-        "ဘယ်နေ့ရောက်",
-        "ဘယ်နေ့ ရောက်",
-        "ဘယ်ရက်ရောက်",
-        "ဘယ်ရက် ရောက်",
-        "ရောက်မယ့်နေ့",
-        "ရောက်မဲ့နေ့",
         "ဘယ်အချိန်ရောက်",
         "ကြာမလား",
         "ရောက်ဖို့ကြာ",
@@ -2978,25 +3124,16 @@ def handle_manychat_request(data):
     message = str(data.get("message", "") or "").strip()
     contact_id = str(data.get("contact_id", "") or "").strip()
     account_name = extract_manychat_account_name(data)
-    incoming_image_url = str(
-        data.get("image_url", "")
-        or data.get("attachment_url", "")
-        or data.get("last_image_url", "")
-        or data.get("customer_image_url", "")
-        or data.get("image", "")
-        or data.get("file_url", "")
-        or ""
-    ).strip()
+    incoming_image_urls = extract_manychat_image_urls(data, message)
+    incoming_image_url = incoming_image_urls[-1] if incoming_image_urls else ""
 
     # ManyChat can sometimes put a Facebook CDN image URL into Last Text Input.
-    # Treat that as an image instead of customer text.
+    # Treat that as image data instead of customer text.
     low_message = message.lower()
     if (
-        not incoming_image_url
-        and low_message.startswith(("http://", "https://"))
+        low_message.startswith(("http://", "https://"))
         and any(token in low_message for token in ("scontent", ".jpg", ".jpeg", ".png", ".webp", "fbcdn"))
     ):
-        incoming_image_url = message
         message = ""
         print("MANYCHAT MESSAGE PROMOTED TO IMAGE URL", flush=True)
 
@@ -3017,11 +3154,20 @@ def handle_manychat_request(data):
     # V38 identity bridge: bind any PSID-like field ManyChat provides and also
     # remember this inbound so the matching Meta webhook event can correlate IDs.
     _manychat_identity_from_payload(data, contact_id)
+    remember_customer_images(contact_id, incoming_image_urls)
+    # Recover sibling photos that arrived through Meta or a neighboring ManyChat
+    # webhook event.  Preserve arrival order and avoid duplicates.
+    for buffered_url in recent_customer_images(contact_id):
+        if buffered_url not in incoming_image_urls:
+            incoming_image_urls.append(buffered_url)
+    incoming_image_url = incoming_image_urls[-1] if incoming_image_urls else ""
     remember_manychat_inbound(contact_id, message, incoming_image_url)
 
     # ManyChat can retry a Dynamic Block request. Never send the exact same
-    # reply twice to the same contact inside the short dedup window.
-    if is_duplicate_manychat_input(data, message, contact_id, incoming_image_url):
+    # reply twice to the same contact inside the short dedup window. Include all
+    # current/recovered photo URLs in the fingerprint so sibling photos survive.
+    image_fingerprint = "||".join(incoming_image_urls)
+    if is_duplicate_manychat_input(data, message, contact_id, image_fingerprint):
         return manychat_response([])
 
     def done(response):
@@ -3060,21 +3206,24 @@ def handle_manychat_request(data):
     # still continue to normal product-image recognition below.
     pre_extracted_order_image = {}
     image_has_order_details = False
-    if incoming_image_url and session.get("last_product_code") in PRODUCTS:
+    if incoming_image_urls and session.get("last_product_code") in PRODUCTS:
         try:
-            pre_extracted_order_image = extract_order_fields_from_image(
-                incoming_image_url, message
-            )
-            if isinstance(pre_extracted_order_image, dict):
-                pre_extracted_order_image["name"] = ""  # FB account name always wins.
-                image_has_order_details = bool(
-                    str(pre_extracted_order_image.get("address", "") or "").strip()
-                    or str(pre_extracted_order_image.get("phone", "") or "").strip()
+            for one_image_url in incoming_image_urls:
+                extracted_piece = extract_order_fields_from_image(one_image_url, message)
+                if not isinstance(extracted_piece, dict):
+                    continue
+                extracted_piece["name"] = ""  # FB account name always wins.
+                has_piece = bool(
+                    str(extracted_piece.get("address", "") or "").strip()
+                    or str(extracted_piece.get("phone", "") or "").strip()
                 )
-                if image_has_order_details:
-                    session = merge_extracted_order_data(session, pre_extracted_order_image)
+                if has_piece:
+                    image_has_order_details = True
+                    session = merge_extracted_order_data(session, extracted_piece)
+                    # keep the last useful extraction for the later order path
+                    pre_extracted_order_image = extracted_piece
                     lock_facebook_account_name(session, account_name)
-                    print("ORDER DETAILS FROM IMAGE:", pre_extracted_order_image, flush=True)
+                    print("ORDER DETAILS FROM IMAGE:", extracted_piece, flush=True)
         except Exception as e:
             print("PRE-ORDER IMAGE EXTRACTION ERROR:", str(e), flush=True)
 
@@ -3100,10 +3249,8 @@ def handle_manychat_request(data):
                 )
             session["items"] = dict(sellable_explicit)
             session["quantity_confirmed"] = True
-            # Current explicit selection is authoritative. Never keep a stale
-            # last_product_code from an older browse, because FAST ORDER may
-            # otherwise append that old product to a new multi-item order.
-            session["last_product_code"] = next(reversed(sellable_explicit))
+            if len(sellable_explicit) == 1:
+                session["last_product_code"] = next(iter(sellable_explicit))
 
     # V38 global multi-name/multi-code order selection.
     # A current message explicitly naming/listing multiple products is authoritative
@@ -3121,9 +3268,8 @@ def handle_manychat_request(data):
         if sellable_now:
             session["items"] = dict(sellable_now)
             session["quantity_confirmed"] = True
-            # Also refresh context for multi-item selections; leaving an older
-            # last_product_code here caused phantom items (e.g. 0001) later.
-            session["last_product_code"] = next(reversed(sellable_now))
+            if len(sellable_now) == 1:
+                session["last_product_code"] = next(iter(sellable_now))
             print("V38 EXPLICIT CURRENT ITEMS:", sellable_now, flush=True)
 
     # V30: parse address + phone before deciding whether the message is order progress.
@@ -3165,11 +3311,8 @@ def handle_manychat_request(data):
     ):
         remembered_product = PRODUCTS.get(remembered_code, {})
         if product_is_sellable(remembered_product):
-            # Default quantity is 1 only when the cart is empty. If a current
-            # explicit multi-item selection already exists, NEVER append the
-            # remembered context product. This blocks phantom/stale products.
-            if not session.get("items"):
-                session["items"][remembered_code] = 1
+            # Default quantity is 1 when omitted.
+            session["items"].setdefault(remembered_code, 1)
             session["quantity_confirmed"] = True
 
             if message:
@@ -3214,27 +3357,42 @@ def handle_manychat_request(data):
     recognized_from_image = False
     recognized_from_ad = False
 
-    # 0) Optional ad/product context.
+    # 0) Optional ad/product context. Persist it so later Hi/photo/question messages
+    # still know which advertisement brought this customer into Messenger.
     context_code, context_product = extract_product_context_from_manychat(data)
+    if context_product and context_code in PRODUCTS:
+        session["ad_product_code"] = context_code
+        print("V39 AD PRODUCT REMEMBERED:", context_code, flush=True)
+    else:
+        remembered_ad_code = normalize_code(session.get("ad_product_code", ""))
+        if remembered_ad_code in PRODUCTS:
+            context_code = remembered_ad_code
+            context_product = PRODUCTS[remembered_ad_code]
+            print("V39 AD PRODUCT RESTORED FROM SESSION:", remembered_ad_code, flush=True)
 
     # 1) Direct code/name from current message.
     code, product = find_product_by_code(message)
     if not product:
         code, product = find_product_by_name(message)
 
-    # 2) Customer image/screenshot. V38 recognizes EVERY visible catalog item.
+    # 2) Customer image/screenshot. V39 recognizes EVERY visible catalog item
+    # across EVERY photo supplied/recovered for this customer event.
     image_codes = []
-    if not product and incoming_image_url:
-        image_codes = ai_find_products_from_image(incoming_image_url, message)
+    if not product and incoming_image_urls:
+        for one_image_url in incoming_image_urls:
+            matched_codes = ai_find_products_from_image(one_image_url, message)
+            if not matched_codes:
+                one_code, one_product = ai_find_product_from_image(one_image_url, message)
+                matched_codes = [one_code] if one_product and one_code else []
+            for matched_code in matched_codes:
+                matched_code = normalize_code(matched_code)
+                if matched_code in PRODUCTS and matched_code not in image_codes:
+                    image_codes.append(matched_code)
         if image_codes:
             code = image_codes[0]
             product = PRODUCTS.get(code)
             recognized_from_image = True
-        else:
-            code, product = ai_find_product_from_image(incoming_image_url, message)
-            recognized_from_image = bool(product)
-            if product and code:
-                image_codes = [code]
+            print("V39 ALL PHOTO MATCH CODES:", image_codes, flush=True)
 
     # If this is only a generic purchase phrase and there is no remembered/ad
     # product context, DO NOT ask OpenAI to guess a product.
@@ -3384,17 +3542,18 @@ def handle_manychat_request(data):
             lock_facebook_account_name(session, account_name)
             print("ORDER SESSION AFTER TEXT:", session, flush=True)
 
-        if incoming_image_url:
-            extracted_from_image = pre_extracted_order_image or extract_order_fields_from_image(
-                incoming_image_url,
-                message,
-            )
-            if isinstance(extracted_from_image, dict):
-                extracted_from_image["name"] = ""  # FB account name always wins.
-            session = merge_extracted_order_data(
-                session,
-                extracted_from_image,
-            )
+        if incoming_image_urls and not image_has_order_details:
+            for one_image_url in incoming_image_urls:
+                extracted_from_image = extract_order_fields_from_image(
+                    one_image_url,
+                    message,
+                )
+                if isinstance(extracted_from_image, dict):
+                    extracted_from_image["name"] = ""  # FB account name always wins.
+                session = merge_extracted_order_data(
+                    session,
+                    extracted_from_image,
+                )
             lock_facebook_account_name(session, account_name)
             session = infer_delivery_area_for_complete_order(session)
 
@@ -3454,7 +3613,7 @@ def handle_manychat_request(data):
     # V33: A product image that cannot be matched must NOT put this customer into
     # Admin pause.  Otherwise one failed vision attempt makes every later image/code
     # silent for ADMIN_PAUSE_MINUTES. Ask which product instead and keep bot active.
-    if incoming_image_url:
+    if incoming_image_urls:
         print("UNRESOLVED IMAGE - BOT REMAINS ACTIVE", flush=True)
         return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
 
@@ -3589,19 +3748,22 @@ def webhook():
             text = str(message_data.get("text", "") or "").strip()
             attachments = message_data.get("attachments", []) or []
 
-            incoming_image_url = ""
-
+            incoming_image_urls = []
             for attachment in attachments:
                 if attachment.get("type") == "image":
-                    incoming_image_url = str(
-                        attachment.get("payload", {}).get("url", "")
-                    ).strip()
+                    url = str(attachment.get("payload", {}).get("url", "") or "").strip()
+                    if url and url not in incoming_image_urls:
+                        incoming_image_urls.append(url)
+            incoming_image_url = incoming_image_urls[-1] if incoming_image_urls else ""
 
-                    if incoming_image_url:
-                        break
+            # Keep all Meta-delivered sibling photos so the ManyChat Dynamic Block
+            # can recover them even when Last Text Input exposes only the newest URL.
+            remember_customer_images(sender_id, incoming_image_urls)
 
             # Correlate Meta PSID with the recent ManyChat contact for the same inbound.
             correlate_meta_sender_to_manychat(sender_id, text, incoming_image_url)
+            # Correlation may have just created an alias; mirror the buffer again.
+            remember_customer_images(sender_id, incoming_image_urls)
 
             # Hard OFF / Admin pause is checked only after identity correlation so
             # both Meta and ManyChat routes honor the same per-customer switch.
@@ -3629,11 +3791,23 @@ def webhook():
             # ---------------------------------
             # 3) CUSTOMER IMAGE / SCREENSHOT
             # ---------------------------------
-            if not product and incoming_image_url:
-                code, product = ai_find_product_from_image(
-                    incoming_image_url,
-                    text,
-                )
+            if not product and incoming_image_urls:
+                meta_codes = []
+                for one_image_url in incoming_image_urls:
+                    for matched_code in ai_find_products_from_image(one_image_url, text):
+                        if matched_code in PRODUCTS and matched_code not in meta_codes:
+                            meta_codes.append(matched_code)
+                    if not meta_codes:
+                        one_code, one_product = ai_find_product_from_image(one_image_url, text)
+                        if one_product and one_code and one_code not in meta_codes:
+                            meta_codes.append(one_code)
+                if meta_codes:
+                    code = meta_codes[0]
+                    product = PRODUCTS.get(code)
+                    for matched_code in meta_codes:
+                        session["items"].setdefault(matched_code, 1)
+                    session["last_product_code"] = meta_codes[-1]
+                    session["quantity_confirmed"] = True
 
             # ---------------------------------
             # 4) DESCRIPTION / OTHER LANGUAGE
