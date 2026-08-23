@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V40-SAFE-MULTI-PHOTO-AD-AUTO-ON-OFF"
+BOT_VERSION = "V41-SAFE-OFF-ON-AD-TEXT-FINAL"
 
 app = Flask(__name__)
 
@@ -56,6 +56,21 @@ CUSTOMER_ID_ALIASES = {}
 RECENT_MANYCHAT_INBOUND = []
 RECENT_MANYCHAT_INBOUND_LOCK = threading.Lock()
 RECENT_MANYCHAT_INBOUND_TTL_SECONDS = 90
+
+# V41: Meta and ManyChat can reach this server in either order for the same
+# customer message.  Keep the Meta side too, so Contact ID <-> PSID binding is
+# bidirectional instead of depending on webhook arrival order.
+RECENT_META_INBOUND = []
+RECENT_META_INBOUND_LOCK = threading.Lock()
+RECENT_META_INBOUND_TTL_SECONDS = int(os.environ.get("RECENT_META_INBOUND_TTL_SECONDS", "90"))
+
+# V41: remember referral/ad context delivered by Meta.  This is intentionally
+# data-driven: an ad becomes a product only when its ID/name/ref is present in a
+# Google Sheet ad-related column, or ManyChat explicitly supplies a product code.
+META_AD_CONTEXT = {}
+META_AD_CONTEXT_LOCK = threading.Lock()
+META_AD_CONTEXT_TTL_SECONDS = int(os.environ.get("META_AD_CONTEXT_TTL_SECONDS", "86400"))
+
 RECENT_TELEGRAM_LOCK = threading.Lock()
 TELEGRAM_ORDER_DEDUP_SECONDS = 300
 
@@ -665,6 +680,64 @@ def find_product_by_name(message):
     return best_code, best_product
 
 
+def find_product_by_rich_sheet_text(message):
+    """Data-driven local matcher using names, aliases AND detail fields.
+
+    This does not hard-code any product/code.  It only uses Google Sheet text,
+    so future products participate automatically.  It is deliberately conservative:
+    a match is returned only when one product has a clearly stronger useful phrase.
+    """
+    load_products()
+    text = str(message or "").casefold().strip()
+    compact_text = _compact_product_match_text(text)
+    if len(compact_text) < 3:
+        return None, None
+
+    field_keys = (
+        "Product Name", "Name", "product_name",
+        "Myanmar Name", "MyanmarName", "Burmese Name", "MM Name",
+        "English Name", "EnglishName", "EN Name",
+        "Chinese Name", "ChineseName", "CN Name",
+        "Alias", "Aliases", "Keywords", "Keyword",
+        "Model", "Model No", "Model Number", "SKU",
+        "Description", "Details", "Detail", "Product Detail", "Product Details",
+        "Description Myanmar", "Myanmar Description", "အသေးစိတ်",
+    )
+    scored = []
+    for code, product in PRODUCTS.items():
+        best = 0
+        for key in field_keys:
+            raw = str(get_row_value(product, key) or "").casefold().strip()
+            if not raw:
+                continue
+            # Whole field / alias fragments.
+            fragments = [raw]
+            fragments += [x.strip() for x in re.split(r"[,;|/\n•·]+", raw) if x.strip()]
+            # Useful word/phrase fragments from long descriptions.
+            fragments += [x.strip() for x in re.split(r"[\s()\[\]{}:：,;|/\n]+", raw) if x.strip()]
+            for frag in fragments:
+                cf = _compact_product_match_text(frag)
+                if len(cf) < 3:
+                    continue
+                if cf in compact_text:
+                    best = max(best, min(len(cf), 60))
+                elif len(compact_text) >= 5 and compact_text in cf:
+                    best = max(best, min(len(compact_text), 45))
+        if best:
+            scored.append((best, code, product))
+
+    if not scored:
+        return None, None
+    scored.sort(reverse=True, key=lambda x: x[0])
+    top = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0
+    # Require a meaningful phrase and avoid ambiguous equal/near-equal detail words.
+    if top[0] >= 4 and (second == 0 or top[0] >= second + 2):
+        print("RICH SHEET TEXT MATCH:", top[1], "SCORE", top[0], flush=True)
+        return top[1], top[2]
+    return None, None
+
+
 def find_named_products_and_quantities(message):
     """Return every distinct catalog product explicitly named in one message."""
     load_products()
@@ -856,8 +929,11 @@ The customer may:
 IMPORTANT RULES:
 - Match ONLY a product that exists in CATALOG. Never invent a code.
 - Quantity numbers are NOT product codes. For example, "2 ခု" must never mean Code 0002.
-- Use names, aliases, model markings, and details together.
-- If the text does not confidently identify one catalog item, return null.
+- Use names, aliases, model markings, details, product purpose, category, and common everyday/colloquial names together.
+- Translate meaning across Burmese, English and Chinese when needed; exact word overlap is NOT required.
+- A customer may describe what the product is normally called in daily speech rather than the formal catalog name.
+- If exactly one catalog product clearly fits that meaning/use, return it.
+- If two or more products are genuinely plausible, or the text is too generic, return null.
 
 CATALOG:
 {catalog}
@@ -1690,12 +1766,23 @@ def bind_customer_identities(*ids):
         if e > now:
             echo_until = max(echo_until, e)
 
+    # Preserve a remembered ad product across the same customer's IDs too.
+    ad_product_code = ""
+    for cid in merged:
+        sess = ORDER_SESSIONS.get(cid)
+        candidate = normalize_code(sess.get("ad_product_code", "")) if isinstance(sess, dict) else ""
+        if candidate in PRODUCTS:
+            ad_product_code = candidate
+            break
+
     for cid in merged:
         CUSTOMER_ID_ALIASES[cid] = set(merged - {cid})
         if pause_until == float("inf") or pause_until > now:
             ADMIN_PAUSE_UNTIL[cid] = pause_until
         if echo_until > now:
             MANYCHAT_ECHO_IGNORE_UNTIL[cid] = echo_until
+        if ad_product_code:
+            get_order_session(cid)["ad_product_code"] = ad_product_code
     print("CUSTOMER IDS BOUND:", sorted(merged), flush=True)
 
 
@@ -1758,6 +1845,63 @@ def correlate_meta_sender_to_manychat(sender_id, message="", image_url=""):
                 break
     if best:
         bind_customer_identities(sender_id, best)
+
+
+def remember_meta_inbound(sender_id, message="", image_url=""):
+    """Remember native Meta inbound so a later ManyChat POST can bind to its PSID."""
+    sid = str(sender_id or "").strip()
+    if not sid:
+        return
+    now = now_ts()
+    row = {
+        "ts": now,
+        "sender_id": sid,
+        "text": _normalize_reply_fingerprint(message),
+        "image": str(image_url or "").strip().split("?")[0][-180:],
+        "claimed_by": "",
+    }
+    with RECENT_META_INBOUND_LOCK:
+        RECENT_META_INBOUND[:] = [
+            r for r in RECENT_META_INBOUND
+            if now - r.get("ts", 0) <= RECENT_META_INBOUND_TTL_SECONDS
+        ]
+        RECENT_META_INBOUND.append(row)
+
+
+def correlate_manychat_to_meta(contact_id, message="", image_url=""):
+    """Bind ManyChat Contact ID to Meta PSID regardless of webhook arrival order."""
+    cid = str(contact_id or "").strip()
+    if not cid:
+        return ""
+    text_fp = _normalize_reply_fingerprint(message)
+    image_fp = str(image_url or "").strip().split("?")[0][-180:]
+    now = now_ts()
+    best = None
+    best_age = None
+    with RECENT_META_INBOUND_LOCK:
+        RECENT_META_INBOUND[:] = [
+            r for r in RECENT_META_INBOUND
+            if now - r.get("ts", 0) <= RECENT_META_INBOUND_TTL_SECONDS
+        ]
+        for row in RECENT_META_INBOUND:
+            if row.get("claimed_by") not in ("", cid):
+                continue
+            text_match = bool(text_fp and row.get("text") == text_fp)
+            image_match = bool(image_fp and row.get("image") == image_fp)
+            if not (text_match or image_match):
+                continue
+            age = abs(now - row.get("ts", now))
+            if best is None or age < best_age:
+                best, best_age = row, age
+        if best:
+            best["claimed_by"] = cid
+    if best:
+        psid = str(best.get("sender_id", "") or "").strip()
+        if psid:
+            bind_customer_identities(cid, psid)
+            print("V41 MANYCHAT/META IDS CORRELATED:", cid, "<->", psid, flush=True)
+            return psid
+    return ""
 
 
 # =========================
@@ -2847,6 +2991,84 @@ def has_catalog_product_clue_text(text):
     return len(clue) >= 2
 
 
+def find_product_from_ad_context_value(value):
+    """Resolve ad/referral metadata using Google Sheet ad-related columns only.
+
+    Supported automatically when a Sheet column name contains words such as
+    Ad ID, Ad Name, Campaign, Referral, Ref, Payload, Source, or Ad Code.
+    No product-specific Python mapping is required.
+    """
+    load_products()
+    text = str(value or "").strip()
+    if not text:
+        return "", None
+
+    # Product code/name embedded directly in a value remains valid.
+    code, product = find_product_by_code(text)
+    if product:
+        return code, product
+    code, product = find_product_by_name(text)
+    if product:
+        return code, product
+
+    target = _compact_product_match_text(text)
+    if not target:
+        return "", None
+    ad_key_words = ("ad", "campaign", "ref", "referral", "payload", "source", "ကြော်ငြာ")
+    for code, product in PRODUCTS.items():
+        for key, raw in product.items():
+            klow = str(key or "").casefold()
+            if not any(word in klow for word in ad_key_words):
+                continue
+            raw_text = str(raw or "").strip()
+            if not raw_text:
+                continue
+            for part in re.split(r"[,;|\n]+", raw_text):
+                if _compact_product_match_text(part) == target:
+                    print("SHEET AD CONTEXT MATCH:", key, text, "->", code, flush=True)
+                    return code, product
+    return "", None
+
+
+def remember_meta_ad_context(customer_id, referral):
+    cid = str(customer_id or "").strip()
+    if not cid or not isinstance(referral, dict):
+        return "", None
+    now = now_ts()
+    with META_AD_CONTEXT_LOCK:
+        for old_id, row in list(META_AD_CONTEXT.items()):
+            if now - row.get("ts", 0) > META_AD_CONTEXT_TTL_SECONDS:
+                META_AD_CONTEXT.pop(old_id, None)
+        META_AD_CONTEXT[cid] = {"ts": now, "referral": dict(referral)}
+
+    for key in ("product_code", "code", "ad_id", "ad_name", "ref", "payload", "source"):
+        if key in referral:
+            code, product = find_product_from_ad_context_value(referral.get(key))
+            if product:
+                get_order_session(cid)["ad_product_code"] = code
+                print("META AD PRODUCT REMEMBERED:", cid, code, key, flush=True)
+                return code, product
+    print("META AD CONTEXT SAVED (NO SHEET MAP YET):", cid, referral, flush=True)
+    return "", None
+
+
+def restore_meta_ad_product(customer_id):
+    aliases = _identity_aliases(customer_id) or {str(customer_id or "")}
+    now = now_ts()
+    with META_AD_CONTEXT_LOCK:
+        rows = [(cid, META_AD_CONTEXT.get(cid)) for cid in aliases]
+    for cid, row in rows:
+        if not row or now - row.get("ts", 0) > META_AD_CONTEXT_TTL_SECONDS:
+            continue
+        referral = row.get("referral", {}) or {}
+        for key in ("product_code", "code", "ad_id", "ad_name", "ref", "payload", "source"):
+            if key in referral:
+                code, product = find_product_from_ad_context_value(referral.get(key))
+                if product:
+                    return code, product
+    return "", None
+
+
 def extract_product_context_from_manychat(data):
     """
     Read product context supplied by ManyChat/Meta ad flows.
@@ -2875,6 +3097,9 @@ def extract_product_context_from_manychat(data):
         if product:
             return code, product
         code, product = find_product_by_name(text)
+        if product:
+            return code, product
+        code, product = find_product_from_ad_context_value(text)
         if product:
             return code, product
         return "", None
@@ -3223,6 +3448,13 @@ def handle_manychat_request(data):
             incoming_image_urls.append(buffered_url)
     incoming_image_url = incoming_image_urls[-1] if incoming_image_urls else ""
     remember_manychat_inbound(contact_id, message, incoming_image_url)
+    # V41 fixes the race where Meta arrived first: bind Contact ID to PSID now too.
+    correlate_manychat_to_meta(contact_id, message, incoming_image_url)
+    # Binding can expose sibling photos stored under the PSID.
+    for buffered_url in recent_customer_images(contact_id):
+        if buffered_url not in incoming_image_urls:
+            incoming_image_urls.append(buffered_url)
+    incoming_image_url = incoming_image_urls[-1] if incoming_image_urls else ""
 
     # ManyChat can retry a Dynamic Block request. Never send the exact same
     # reply twice to the same contact inside the short dedup window. Include all
@@ -3421,20 +3653,27 @@ def handle_manychat_request(data):
     # 0) Optional ad/product context. Persist it so later Hi/photo/question messages
     # still know which advertisement brought this customer into Messenger.
     context_code, context_product = extract_product_context_from_manychat(data)
+    if not context_product:
+        context_code, context_product = restore_meta_ad_product(contact_id)
     if context_product and context_code in PRODUCTS:
         session["ad_product_code"] = context_code
-        print("V39 AD PRODUCT REMEMBERED:", context_code, flush=True)
+        # mirror remembered ad product to all correlated IDs
+        for ident in (_identity_aliases(contact_id) or {contact_id}):
+            get_order_session(ident)["ad_product_code"] = context_code
+        print("V41 AD PRODUCT REMEMBERED:", context_code, flush=True)
     else:
         remembered_ad_code = normalize_code(session.get("ad_product_code", ""))
         if remembered_ad_code in PRODUCTS:
             context_code = remembered_ad_code
             context_product = PRODUCTS[remembered_ad_code]
-            print("V39 AD PRODUCT RESTORED FROM SESSION:", remembered_ad_code, flush=True)
+            print("V41 AD PRODUCT RESTORED FROM SESSION:", remembered_ad_code, flush=True)
 
     # 1) Direct code/name from current message.
     code, product = find_product_by_code(message)
     if not product:
         code, product = find_product_by_name(message)
+    if not product:
+        code, product = find_product_by_rich_sheet_text(message)
 
     # 2) Customer image/screenshot. V39 recognizes EVERY visible catalog item
     # across EVERY photo supplied/recovered for this customer event.
@@ -3787,6 +4026,14 @@ def webhook():
     for entry in data.get("entry", []):
         for event in entry.get("messaging", []):
             message_data = event.get("message", {})
+            referral = event.get("referral") or (message_data.get("referral") if isinstance(message_data, dict) else None)
+
+            # messaging_referrals may arrive without a message object. Capture it
+            # before the normal message-only flow so AD attribution is not discarded.
+            if isinstance(referral, dict):
+                referral_sender = str(event.get("sender", {}).get("id", "") or "").strip()
+                if referral_sender:
+                    remember_meta_ad_context(referral_sender, referral)
 
             if not message_data:
                 continue
@@ -3816,6 +4063,10 @@ def webhook():
                     if url and url not in incoming_image_urls:
                         incoming_image_urls.append(url)
             incoming_image_url = incoming_image_urls[-1] if incoming_image_urls else ""
+
+            # V41 stores the Meta side before correlation. If ManyChat arrives later,
+            # its current message can still bind Contact ID <-> PSID and inherit OFF.
+            remember_meta_inbound(sender_id, text, incoming_image_url)
 
             # Keep all Meta-delivered sibling photos so the ManyChat Dynamic Block
             # can recover them even when Last Text Input exposes only the newest URL.
@@ -3848,6 +4099,8 @@ def webhook():
             # ---------------------------------
             if not product:
                 code, product = find_product_by_name(text)
+            if not product:
+                code, product = find_product_by_rich_sheet_text(text)
 
             # ---------------------------------
             # 3) CUSTOMER IMAGE / SCREENSHOT
