@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V41-SAFE-OFF-ON-AD-TEXT-FINAL"
+BOT_VERSION = "V42-SAFE-OFF-ON-IDENTITY-FIX"
 
 app = Flask(__name__)
 
@@ -63,6 +63,16 @@ RECENT_MANYCHAT_INBOUND_TTL_SECONDS = 90
 RECENT_META_INBOUND = []
 RECENT_META_INBOUND_LOCK = threading.Lock()
 RECENT_META_INBOUND_TTL_SECONDS = int(os.environ.get("RECENT_META_INBOUND_TTL_SECONDS", "90"))
+
+# V42: Admin echoes from Messenger use the customer's Meta PSID, while the
+# ManyChat Dynamic Block often gives only Contact Id + Full Name. Keep a
+# conservative recent Full Name -> Contact Id bridge. It is used only when the
+# PSID is not already bound and Meta's User Profile API returns the same name.
+RECENT_MANYCHAT_IDENTITIES = {}
+RECENT_MANYCHAT_IDENTITIES_LOCK = threading.Lock()
+RECENT_MANYCHAT_IDENTITIES_TTL_SECONDS = int(
+    os.environ.get("RECENT_MANYCHAT_IDENTITIES_TTL_SECONDS", "86400")
+)
 
 # V41: remember referral/ad context delivered by Meta.  This is intentionally
 # data-driven: an ad becomes a product only when its ID/name/ref is present in a
@@ -1807,6 +1817,104 @@ def _manychat_identity_from_payload(data, contact_id):
     return ids
 
 
+def _normalize_person_identity_name(value):
+    value = str(value or "").strip().casefold()
+    value = re.sub(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]", "", value)
+    value = re.sub(r"[^0-9a-zက-႟一-鿿]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def remember_manychat_identity(contact_id, account_name=""):
+    """Remember a recent ManyChat Full Name -> Contact Id mapping."""
+    cid = str(contact_id or "").strip()
+    name_key = _normalize_person_identity_name(account_name)
+    if not cid or not name_key:
+        return
+    now = now_ts()
+    with RECENT_MANYCHAT_IDENTITIES_LOCK:
+        for old_key, row in list(RECENT_MANYCHAT_IDENTITIES.items()):
+            if now - float(row.get("ts", 0) or 0) > RECENT_MANYCHAT_IDENTITIES_TTL_SECONDS:
+                RECENT_MANYCHAT_IDENTITIES.pop(old_key, None)
+        RECENT_MANYCHAT_IDENTITIES[name_key] = {
+            "contact_id": cid,
+            "ts": now,
+            "display_name": str(account_name or "").strip(),
+        }
+
+
+def _facebook_profile_name(psid):
+    """Best-effort PSID -> Facebook profile name using the Page access token."""
+    sid = str(psid or "").strip()
+    if not sid or not PAGE_ACCESS_TOKEN:
+        return ""
+    try:
+        url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{sid}"
+        r = requests.get(
+            url,
+            params={"fields": "name,first_name,last_name", "access_token": PAGE_ACCESS_TOKEN},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            print("V42 PROFILE LOOKUP FAILED:", sid, r.status_code, r.text[:200], flush=True)
+            return ""
+        payload = r.json() if r.content else {}
+        name = str(payload.get("name", "") or "").strip()
+        if not name:
+            name = " ".join(
+                x for x in (
+                    str(payload.get("first_name", "") or "").strip(),
+                    str(payload.get("last_name", "") or "").strip(),
+                ) if x
+            ).strip()
+        return name
+    except Exception as e:
+        print("V42 PROFILE LOOKUP ERROR:", sid, str(e), flush=True)
+        return ""
+
+
+def resolve_admin_psid_to_manychat_contact(psid):
+    """Bind an Admin echo PSID to the same ManyChat Contact Id before ON/OFF."""
+    sid = str(psid or "").strip()
+    if not sid:
+        return ""
+
+    # Already correlated: nothing else to do.
+    aliases = _identity_aliases(sid)
+    if len(aliases) > 1:
+        for alias in aliases:
+            if alias != sid:
+                return alias
+
+    profile_name = _facebook_profile_name(sid)
+    name_key = _normalize_person_identity_name(profile_name)
+    if not name_key:
+        return ""
+
+    now = now_ts()
+    row = None
+    with RECENT_MANYCHAT_IDENTITIES_LOCK:
+        for old_key, old_row in list(RECENT_MANYCHAT_IDENTITIES.items()):
+            if now - float(old_row.get("ts", 0) or 0) > RECENT_MANYCHAT_IDENTITIES_TTL_SECONDS:
+                RECENT_MANYCHAT_IDENTITIES.pop(old_key, None)
+        row = RECENT_MANYCHAT_IDENTITIES.get(name_key)
+
+    if not row:
+        print("V42 ADMIN PSID NAME NOT FOUND IN MANYCHAT:", sid, profile_name, flush=True)
+        return ""
+
+    cid = str(row.get("contact_id", "") or "").strip()
+    if not cid:
+        return ""
+
+    bind_customer_identities(sid, cid)
+    print(
+        "V42 ADMIN PSID/MANYCHAT CONTACT BOUND BY FULL NAME:",
+        sid, "<->", cid, profile_name,
+        flush=True,
+    )
+    return cid
+
+
 def remember_manychat_inbound(contact_id, message="", image_url=""):
     cid = str(contact_id or "").strip()
     if not cid:
@@ -2008,6 +2116,11 @@ def handle_echo_message(event, message_data):
     ).strip()
     if not customer_id:
         return
+
+    # V42: outgoing Page/Admin echoes are keyed by Meta PSID. ManyChat may have
+    # supplied only Contact Id + Full Name, so resolve/bind the two identities
+    # before applying a manual command.
+    resolve_admin_psid_to_manychat_contact(customer_id)
 
     # ON/OFF must be checked BEFORE the short ManyChat echo-ignore window.
     # This avoids a manual command being swallowed by an unrelated recent bot reply.
@@ -3410,6 +3523,7 @@ def handle_manychat_request(data):
     message = str(data.get("message", "") or "").strip()
     contact_id = str(data.get("contact_id", "") or "").strip()
     account_name = extract_manychat_account_name(data)
+    remember_manychat_identity(contact_id, account_name)
     incoming_image_urls = extract_manychat_image_urls(data, message)
     incoming_image_url = incoming_image_urls[-1] if incoming_image_urls else ""
 
