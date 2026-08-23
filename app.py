@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V42-SAFE-OFF-ON-IDENTITY-FIX"
+BOT_VERSION = "V44-SAFE-CONSOLIDATED-IMAGE-SPEED-ORDER"
 
 app = Flask(__name__)
 
@@ -259,6 +259,88 @@ def recent_customer_images(customer_id):
     return out
 
 
+
+def clear_recent_customer_images(customer_id, only_urls=None):
+    """Remove processed URLs so an old product photo cannot bleed into a later event."""
+    cid = str(customer_id or "").strip()
+    if not cid:
+        return
+    ids = _identity_aliases(cid) or {cid}
+    wanted = None
+    if only_urls is not None:
+        wanted = {str(u or "").strip() for u in only_urls if str(u or "").strip()}
+    with RECENT_CUSTOMER_IMAGES_LOCK:
+        for ident in ids:
+            key = str(ident)
+            rows = RECENT_CUSTOMER_IMAGES.get(key, []) or []
+            if wanted is None:
+                RECENT_CUSTOMER_IMAGES.pop(key, None)
+                continue
+            kept = [(u, ts) for u, ts in rows if u not in wanted]
+            if kept:
+                RECENT_CUSTOMER_IMAGES[key] = kept
+            else:
+                RECENT_CUSTOMER_IMAGES.pop(key, None)
+
+
+def _image_match_cache_key(image_url):
+    value = str(image_url or "").strip()
+    if not value:
+        return ""
+    if value.startswith(("http://", "https://")):
+        value = value.split("?", 1)[0]
+    return value[-500:]
+
+
+def _get_cached_image_match(image_url):
+    key = _image_match_cache_key(image_url)
+    if not key:
+        return None
+    now = now_ts()
+    with IMAGE_MATCH_CACHE_LOCK:
+        for old_key, row in list(IMAGE_MATCH_CACHE.items()):
+            if now - float(row.get("ts", 0) or 0) > IMAGE_MATCH_CACHE_TTL_SECONDS:
+                IMAGE_MATCH_CACHE.pop(old_key, None)
+        row = IMAGE_MATCH_CACHE.get(key)
+        if row is None:
+            return None
+        return list(row.get("codes", []) or [])
+
+
+def _set_cached_image_match(image_url, codes):
+    key = _image_match_cache_key(image_url)
+    if not key:
+        return
+    with IMAGE_MATCH_CACHE_LOCK:
+        IMAGE_MATCH_CACHE[key] = {"ts": now_ts(), "codes": list(codes or [])}
+
+
+def _warm_reference_images_worker():
+    global _REFERENCE_WARM_RUNNING
+    try:
+        catalog_reference_content_parts()
+    except Exception as e:
+        print("REFERENCE WARM WARNING:", str(e), flush=True)
+    finally:
+        with _REFERENCE_WARM_LOCK:
+            _REFERENCE_WARM_RUNNING = False
+
+
+def warm_reference_images_async():
+    """Prepare cached reference images in background; never block a live webhook."""
+    global _REFERENCE_WARM_RUNNING
+    if not PRODUCTS:
+        return
+    key = _catalog_image_cache_key()
+    if key and _REFERENCE_IMAGES_CACHE.get("key") == key and _REFERENCE_IMAGES_CACHE.get("parts"):
+        return
+    with _REFERENCE_WARM_LOCK:
+        if _REFERENCE_WARM_RUNNING:
+            return
+        _REFERENCE_WARM_RUNNING = True
+    threading.Thread(target=_warm_reference_images_worker, daemon=True).start()
+
+
 # =========================
 # GOOGLE SHEET
 # =========================
@@ -298,6 +380,7 @@ def _background_product_refresh():
             LAST_PRODUCT_REFRESH = now_ts()
             print("PRODUCTS LOADED:", len(PRODUCTS), flush=True)
             print("PRODUCT CODES:", list(PRODUCTS.keys()), flush=True)
+            warm_reference_images_async()
     except Exception as e:
         print("SHEET BACKGROUND ERROR:", str(e), flush=True)
     finally:
@@ -325,6 +408,7 @@ def load_products(force=False):
                 LAST_PRODUCT_REFRESH = now_ts()
                 print("PRODUCTS LOADED:", len(PRODUCTS), flush=True)
                 print("PRODUCT CODES:", list(PRODUCTS.keys()), flush=True)
+                warm_reference_images_async()
         except Exception as e:
             print("SHEET ERROR:", str(e), flush=True)
         return
@@ -980,6 +1064,15 @@ Or if not confident:
 _REFERENCE_IMAGES_CACHE = {"key": "", "parts": []}
 _REFERENCE_IMAGES_LOCK = threading.Lock()
 
+# V44: avoid repeated expensive vision calls for duplicate/retried image events.
+IMAGE_MATCH_CACHE = {}
+IMAGE_MATCH_CACHE_LOCK = threading.Lock()
+IMAGE_MATCH_CACHE_TTL_SECONDS = int(os.environ.get("IMAGE_MATCH_CACHE_TTL_SECONDS", "900"))
+
+# Warm labelled catalog images after Sheet load so the first buyer photo is faster.
+_REFERENCE_WARM_LOCK = threading.Lock()
+_REFERENCE_WARM_RUNNING = False
+
 
 def _catalog_image_cache_key():
     """Change automatically whenever a Sheet product code or image URL changes."""
@@ -1216,6 +1309,11 @@ def ai_find_products_from_image(image_url, caption=""):
     if not source_url.startswith(("http://", "https://", "data:")):
         return []
 
+    cached_codes = _get_cached_image_match(source_url)
+    if cached_codes is not None:
+        print("IMAGE MATCH CACHE HIT:", cached_codes, flush=True)
+        return [c for c in cached_codes if c in PRODUCTS]
+
     customer_vision_url = source_url
     if source_url.startswith(("http://", "https://")):
         try:
@@ -1264,6 +1362,7 @@ def ai_find_products_from_image(image_url, caption=""):
         code = normalize_code(raw_code)
         if code in PRODUCTS and code not in out:
             out.append(code)
+    _set_cached_image_match(source_url, out)
     print("MULTI IMAGE MATCH CODES:", out, flush=True)
     return out
 
@@ -2994,6 +3093,10 @@ ORDER_WORDS = (
     "လိုချင်တယ်",
     "လိုချင်ပါတယ်",
     "ယူချင်တယ်",
+    "ဝယ်ချင်ပါတယ်",
+    "ဝယ်ချင်တယ်",
+    "ဝယ်မယ်",
+    "ဝယ်ပါမယ်",
     "တစ်ခုယူမယ်",
     "တခုယူမယ်",
     "တစ်ခုယူ",
@@ -3554,20 +3657,16 @@ def handle_manychat_request(data):
     # V38 identity bridge: bind any PSID-like field ManyChat provides and also
     # remember this inbound so the matching Meta webhook event can correlate IDs.
     _manychat_identity_from_payload(data, contact_id)
-    remember_customer_images(contact_id, incoming_image_urls)
-    # Recover sibling photos that arrived through Meta or a neighboring ManyChat
-    # webhook event.  Preserve arrival order and avoid duplicates.
-    for buffered_url in recent_customer_images(contact_id):
-        if buffered_url not in incoming_image_urls:
-            incoming_image_urls.append(buffered_url)
-    incoming_image_url = incoming_image_urls[-1] if incoming_image_urls else ""
+
+    # V44: current-event images are authoritative. Do not append old buffered
+    # product images to a new event. Separate photo messages can still accumulate
+    # recognized product codes in the order session without mixing image URLs.
+    current_event_image_urls = list(incoming_image_urls)
+    remember_customer_images(contact_id, current_event_image_urls)
+    incoming_image_url = current_event_image_urls[-1] if current_event_image_urls else ""
     remember_manychat_inbound(contact_id, message, incoming_image_url)
-    # V41 fixes the race where Meta arrived first: bind Contact ID to PSID now too.
     correlate_manychat_to_meta(contact_id, message, incoming_image_url)
-    # Binding can expose sibling photos stored under the PSID.
-    for buffered_url in recent_customer_images(contact_id):
-        if buffered_url not in incoming_image_urls:
-            incoming_image_urls.append(buffered_url)
+    incoming_image_urls = list(current_event_image_urls)
     incoming_image_url = incoming_image_urls[-1] if incoming_image_urls else ""
 
     # ManyChat can retry a Dynamic Block request. Never send the exact same
@@ -3794,10 +3893,9 @@ def handle_manychat_request(data):
     image_codes = []
     if not product and incoming_image_urls:
         for one_image_url in incoming_image_urls:
+            # One multi-capable vision call handles both single and multi-product
+            # images. Avoid the old second full-catalog call on a miss.
             matched_codes = ai_find_products_from_image(one_image_url, message)
-            if not matched_codes:
-                one_code, one_product = ai_find_product_from_image(one_image_url, message)
-                matched_codes = [one_code] if one_product and one_code else []
             for matched_code in matched_codes:
                 matched_code = normalize_code(matched_code)
                 if matched_code in PRODUCTS and matched_code not in image_codes:
@@ -3840,6 +3938,7 @@ def handle_manychat_request(data):
             session["quantity_confirmed"] = True
         lock_facebook_account_name(session, account_name)
         print("V38 IMAGE BASKET ITEMS:", session.get("items"), flush=True)
+        clear_recent_customer_images(contact_id, incoming_image_urls)
         return done(manychat_products_response(image_codes or [code], include_order_prompt=True))
 
     # A bare product code/name is browsing and refreshes the current product.
@@ -4029,6 +4128,7 @@ def handle_manychat_request(data):
     # silent for ADMIN_PAUSE_MINUTES. Ask which product instead and keep bot active.
     if incoming_image_urls:
         print("UNRESOLVED IMAGE - BOT REMAINS ACTIVE", flush=True)
+        clear_recent_customer_images(contact_id, incoming_image_urls)
         return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
 
     greeting = simple_greeting(message)
@@ -4042,7 +4142,7 @@ def handle_manychat_request(data):
     productish_words = (
         "ပစ္စည်း", "ဘယ်ဟာ", "ဒီဟာ", "ဒီပစ္စည်း", "စျေး", "ဈေး", "price",
         "stock", "ရှိလား", "ပို့ခ", "delivery", "အသုံး", "ဘယ်လိုသုံး",
-        "ယူ", "မှာ", "order", "buy", "want", "item", "product",
+        "ယူ", "မှာ", "ဝယ်", "order", "buy", "want", "item", "product",
     )
     if any(word in low_unknown for word in productish_words):
         print("UNRESOLVED PRODUCT TEXT - ASK WHICH PRODUCT", flush=True)
@@ -4225,10 +4325,6 @@ def webhook():
                     for matched_code in ai_find_products_from_image(one_image_url, text):
                         if matched_code in PRODUCTS and matched_code not in meta_codes:
                             meta_codes.append(matched_code)
-                    if not meta_codes:
-                        one_code, one_product = ai_find_product_from_image(one_image_url, text)
-                        if one_product and one_code and one_code not in meta_codes:
-                            meta_codes.append(one_code)
                 if meta_codes:
                     code = meta_codes[0]
                     product = PRODUCTS.get(code)
