@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V38-SAFE-9-FIXES-MULTI-IMAGE-ORDER"
+BOT_VERSION = "V39-SAFE-V38-PRESERVED-4-FIXES"
 
 app = Flask(__name__)
 
@@ -2861,6 +2861,12 @@ def asks_delivery_time(text):
         "ဘယ်နရက်",
         "ဘယ်တော့ရောက်",
         "ဘယ်တော့ရောက်မလဲ",
+        "ဘယ်နေ့ရောက်",
+        "ဘယ်နေ့ ရောက်",
+        "ဘယ်ရက်ရောက်",
+        "ဘယ်ရက် ရောက်",
+        "ရောက်မယ့်နေ့",
+        "ရောက်မဲ့နေ့",
         "ဘယ်အချိန်ရောက်",
         "ကြာမလား",
         "ရောက်ဖို့ကြာ",
@@ -3094,8 +3100,10 @@ def handle_manychat_request(data):
                 )
             session["items"] = dict(sellable_explicit)
             session["quantity_confirmed"] = True
-            if len(sellable_explicit) == 1:
-                session["last_product_code"] = next(iter(sellable_explicit))
+            # Current explicit selection is authoritative. Never keep a stale
+            # last_product_code from an older browse, because FAST ORDER may
+            # otherwise append that old product to a new multi-item order.
+            session["last_product_code"] = next(reversed(sellable_explicit))
 
     # V38 global multi-name/multi-code order selection.
     # A current message explicitly naming/listing multiple products is authoritative
@@ -3113,8 +3121,9 @@ def handle_manychat_request(data):
         if sellable_now:
             session["items"] = dict(sellable_now)
             session["quantity_confirmed"] = True
-            if len(sellable_now) == 1:
-                session["last_product_code"] = next(iter(sellable_now))
+            # Also refresh context for multi-item selections; leaving an older
+            # last_product_code here caused phantom items (e.g. 0001) later.
+            session["last_product_code"] = next(reversed(sellable_now))
             print("V38 EXPLICIT CURRENT ITEMS:", sellable_now, flush=True)
 
     # V30: parse address + phone before deciding whether the message is order progress.
@@ -3156,8 +3165,11 @@ def handle_manychat_request(data):
     ):
         remembered_product = PRODUCTS.get(remembered_code, {})
         if product_is_sellable(remembered_product):
-            # Default quantity is 1 when omitted.
-            session["items"].setdefault(remembered_code, 1)
+            # Default quantity is 1 only when the cart is empty. If a current
+            # explicit multi-item selection already exists, NEVER append the
+            # remembered context product. This blocks phantom/stale products.
+            if not session.get("items"):
+                session["items"][remembered_code] = 1
             session["quantity_confirmed"] = True
 
             if message:
