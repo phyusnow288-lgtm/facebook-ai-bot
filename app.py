@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request
 
-BOT_VERSION = "V48-SAFE-FULL-HISTORY-MULTI-CODE-MULTI-PHOTO-IMAGE-FLOW-FIX"
+BOT_VERSION = "V49-SAFE-SHEET-FIRST-ADMIN-ORDER-FLOW-NO-DATA-LOSS"
 
 app = Flask(__name__)
 
@@ -451,6 +451,27 @@ def load_products(force=False):
     threading.Thread(target=_background_product_refresh, daemon=True).start()
 
 
+def refresh_catalog_for_customer_request(source="REQUEST"):
+    """Synchronously refresh Google Sheet before deciding any customer product reply.
+
+    V49 strict source-of-truth gate:
+    - code/name/photo/ad recognition must use the newest Sheet rows available now;
+    - newly-added Sheet items work without a Python edit/deploy;
+    - if refresh fails, keep the last known catalog rather than erasing working data.
+    """
+    before_codes = tuple(PRODUCTS.keys())
+    load_products(force=True)
+    after_codes = tuple(PRODUCTS.keys())
+    print(
+        "V49 SHEET-FIRST CATALOG CHECK:",
+        source,
+        "COUNT", len(PRODUCTS),
+        "CHANGED" if before_codes != after_codes else "UNCHANGED",
+        flush=True,
+    )
+    return bool(PRODUCTS)
+
+
 # =========================
 # DRIVE / IMAGE HELPERS
 # =========================
@@ -715,6 +736,58 @@ def image_as_data_url(url):
 # =========================
 # PRODUCT SEARCH
 # =========================
+def explicit_catalog_code_candidates(message):
+    """Return code-looking tokens the buyer explicitly supplied.
+
+    Labelled 1-4 digit codes are always candidates. Bare four-digit tokens are
+    candidates unless the whole message clearly looks like delivery/address data.
+    This catches an unknown/new code such as 0020 without confusing a quantity
+    such as 2 or x5 with Product Code 0002/0005.
+    """
+    text = _western_digits(str(message or "")).strip()
+    if not text:
+        return []
+
+    found = []
+    for pattern in (
+        r"(?i)(?:code|product\s*code)\s*[:#-]?\s*(\d{1,4})(?!\d)",
+        r"ကုဒ်\s*[:#-]?\s*(\d{1,4})(?!\d)",
+    ):
+        for match in re.finditer(pattern, text):
+            code = normalize_code(match.group(1))
+            if code and code not in found:
+                found.append(code)
+
+    # A normal order address can legitimately contain a 4-digit house/postal number.
+    # Do not reinterpret it as a product code when strong order/address structure exists.
+    address_like = False
+    try:
+        address_like = looks_like_order_details(text) or is_likely_delivery_address(text)
+    except Exception:
+        address_like = False
+
+    if not address_like:
+        for match in re.finditer(r"(?<!\d)(\d{4})(?!\d)", text):
+            code = normalize_code(match.group(1))
+            if code and code not in found:
+                found.append(code)
+    return found
+
+
+def reset_order_context_for_unknown_product(customer_id, account_name=""):
+    """Clear stale product/order state after an explicit code is not in the Sheet.
+
+    Keep the Facebook/ManyChat account name lock, but never let an older product,
+    address or quantity make an unknown code continue a previous order.
+    """
+    session = new_order_session()
+    if account_name:
+        lock_facebook_account_name(session, account_name)
+    ORDER_SESSIONS[str(customer_id or "").strip()] = session
+    print("V49 UNKNOWN CODE - STALE ORDER CONTEXT CLEARED:", customer_id, flush=True)
+    return session
+
+
 def find_product_by_code(message):
     """Find only an EXPLICIT catalog code; never reinterpret quantity as a code.
 
@@ -2242,8 +2315,23 @@ def is_post_order_ack(text):
 
 
 def handle_echo_message(event, message_data):
-    """Ignore bot/ManyChat echoes; any real Admin text pauses only that customer."""
+    """Ignore bot/ManyChat echoes; any real Admin text pauses only that customer.
+
+    This can work only when Meta sends the Page message echo to this webhook. V49
+    logs every received echo so a missing Meta message_echoes subscription is obvious
+    instead of being mistaken for an order-parser problem.
+    """
     message_data = message_data or {}
+    print(
+        "V49 PAGE ECHO RECEIVED:",
+        {
+            "sender": event.get("sender", {}).get("id"),
+            "recipient": event.get("recipient", {}).get("id"),
+            "text": str(message_data.get("text", "") or "")[:120],
+            "mid": message_data.get("mid"),
+        },
+        flush=True,
+    )
     mid = str(message_data.get("mid", "") or "").strip()
     if mid and mid in BOT_SENT_MESSAGE_IDS:
         BOT_SENT_MESSAGE_IDS.discard(mid)
@@ -3660,11 +3748,11 @@ def handle_manychat_request(data):
     - No quantity supplied => defaults to 1 item.
     - Buyer name always comes from Facebook/ManyChat Full Name.
     - Burmese/English/mixed text or image address + phone completion => buyer confirmation + Telegram.
-    - Unknown/non-shopping/unresolved => Admin handoff/pause for that customer.
+    - Unknown/non-shopping/unresolved => ask exactly which product; do not pause.
     - Exact duplicate ManyChat input => no second customer reply.
     - Completed order => Telegram is queued once with retry + duplicate suppression.
     """
-    load_products()
+    refresh_catalog_for_customer_request("MANYCHAT")
 
     message = str(data.get("message", "") or "").strip()
     contact_id = str(data.get("contact_id", "") or "").strip()
@@ -3759,6 +3847,25 @@ def handle_manychat_request(data):
     if account_name:
         lock_facebook_account_name(session, account_name)
         print("ORDER NAME FROM MANYCHAT FULL NAME (LOCKED):", account_name, flush=True)
+
+    # V49 STRICT SHEET-FIRST CODE GATE. The catalog was refreshed synchronously
+    # above. An explicit code that is still absent from Google Sheet must never
+    # inherit an older product/order session and must never ask for address/phone.
+    explicit_candidates_now = explicit_catalog_code_candidates(message)
+    valid_candidates_now = [c for c in explicit_candidates_now if c in PRODUCTS]
+    invalid_candidates_now = [c for c in explicit_candidates_now if c not in PRODUCTS]
+    if invalid_candidates_now:
+        print(
+            "V49 CODE(S) NOT IN GOOGLE SHEET:",
+            invalid_candidates_now,
+            "VALID IN SAME MESSAGE:", valid_candidates_now,
+            flush=True,
+        )
+        if not valid_candidates_now:
+            reset_order_context_for_unknown_product(contact_id, account_name)
+            return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
+        # Mixed valid+invalid input: process only Sheet-backed products below.
+        # Invalid tokens are never added to the order session.
 
     # Explicit human/Admin request only.
     if wants_admin(message):
@@ -4116,12 +4223,13 @@ def handle_manychat_request(data):
 
     order_intent = (
         generic_order
-        or active_order
         or (last_product_ready and looks_like_order_details(message))
         or (last_product_ready and looks_like_order_progress(message, session))
         or (extract_explicit_quantity(message) is not None and last_product_ready)
         or (image_has_order_details and last_product_ready)
     )
+    if active_order and not order_intent:
+        print("V49 ACTIVE ORDER + NON-ORDER TEXT - DO NOT REPEAT ADDRESS PROMPT:", message, flush=True)
 
     # -------- Order collection --------
     if order_intent:
@@ -4305,7 +4413,7 @@ def webhook():
     if not data or data.get("object") != "page":
         return manychat_text("EVENT_RECEIVED"), 200
 
-    load_products()
+    refresh_catalog_for_customer_request("META")
 
     for entry in data.get("entry", []):
         for event in entry.get("messaging", []):
@@ -4374,6 +4482,16 @@ def webhook():
             print("IMAGE:", incoming_image_url, flush=True)
 
             session = get_order_session(sender_id)
+
+            # V49 strict Sheet-first invalid-code gate for native Meta delivery.
+            # Do this before stale session/order logic so 0020 cannot continue 0012.
+            meta_candidates = explicit_catalog_code_candidates(text)
+            meta_valid_candidates = [c for c in meta_candidates if c in PRODUCTS]
+            meta_invalid_candidates = [c for c in meta_candidates if c not in PRODUCTS]
+            if meta_invalid_candidates and not meta_valid_candidates:
+                reset_order_context_for_unknown_product(sender_id)
+                send_facebook_text(sender_id, "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။")
+                continue
 
             # ---------------------------------
             # 1) DIRECT CODE
@@ -4459,10 +4577,12 @@ def webhook():
 
             order_intent = (
                 generic_order
-                or active_order
                 or (last_product_ready and looks_like_order_details(text))
-                        or (extract_explicit_quantity(text) is not None and last_product_ready)
+                or (last_product_ready and looks_like_order_progress(text, session))
+                or (extract_explicit_quantity(text) is not None and last_product_ready)
             )
+            if active_order and not order_intent:
+                print("V49 META ACTIVE ORDER + NON-ORDER TEXT - NO REPEATED PROMPT:", text, flush=True)
 
             if order_intent:
                 if product and is_order_message(text):
@@ -4537,9 +4657,10 @@ def webhook():
 
             # ---------------------------------
             # TRULY UNKNOWN / NON-PRODUCT
-            # Hand to Admin once; handoff_to_admin also pauses this customer.
+            # V49: unknown buyer text is NOT a human takeover. Keep the bot active
+            # and ask which Sheet-backed product the buyer wants.
             # ---------------------------------
-            handoff_to_admin(sender_id)
+            send_facebook_text(sender_id, "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။")
 
     return "EVENT_RECEIVED", 200
 
