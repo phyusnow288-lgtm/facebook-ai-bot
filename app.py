@@ -8,9 +8,9 @@ import mimetypes
 import threading
 from datetime import datetime, timezone, timedelta
 import requests
-from flask import Flask, request, Response
+from flask import Flask, request
 
-BOT_VERSION = "V45-SAFE-CODE-ORDER-MULTI-PHOTO-DETAIL"
+BOT_VERSION = "V46-CLEAN-MULTI-PHOTO-PRODUCT-IMAGE-FIX"
 
 app = Flask(__name__)
 
@@ -28,7 +28,6 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
-ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 
 DEFAULT_YANGON_DELIVERY = int(os.environ.get("YANGON_DELIVERY", "5000"))
 DEFAULT_OTHER_DELIVERY = int(os.environ.get("OTHER_DELIVERY", "7500"))
@@ -42,7 +41,6 @@ LAST_PRODUCT_REFRESH = 0.0
 ORDER_SESSIONS = {}
 PROCESSED_MESSAGE_IDS = set()
 BOT_SENT_MESSAGE_IDS = set()
-ADMIN_PAUSE_UNTIL = {}
 MANYCHAT_ECHO_IGNORE_UNTIL = {}
 RECENT_MANYCHAT_REPLY_TEXTS = {}
 RECENT_MANYCHAT_REPLY_LOCK = threading.Lock()
@@ -488,21 +486,18 @@ def product_image_url(product):
 
 
 
-def product_public_image_url(code, product):
-    """
-    Return a stable public HTTPS image URL served by this Render app.
+def manychat_product_image_url(product):
+    """Return the catalog image URL directly for ManyChat/Messenger.
 
-    IMPORTANT: never download/verify the Google Drive image inside the ManyChat
-    Dynamic Block request. That extra network call can make ManyChat time out even
-    when Render eventually logs HTTP 200. The /product-image/<code> endpoint will
-    fetch the image only when ManyChat/Meta requests the image itself.
+    Google Drive share links are converted to a stable googleusercontent URL.
+    Avoid routing product images back through Render: the extra proxy/download
+    step was unnecessary and could make Dynamic Content return text while the
+    image itself failed or timed out.
     """
     source = product_image_url(product)
     if not source:
         return ""
-
-    base = request.host_url.rstrip("/")
-    return f"{base}/product-image/{normalize_code(code)}"
+    return google_drive_view_url(source)
 
 
 def looks_like_order_details(message):
@@ -1858,22 +1853,8 @@ def bind_customer_identities(*ids):
     for cid in clean:
         merged.update(_identity_aliases(cid) or {cid})
 
-    # Preserve/propagate per-customer state when ManyChat Contact Id and Meta PSID
-    # become correlated after one side has already been paused/locked/echo-muted.
-    # This is critical because ManyChat Dynamic Block replies are keyed by Contact Id,
-    # while Meta outgoing is_echo events are normally keyed by the customer's PSID.
-    now = now_ts()
-    pause_until = 0
-    echo_until = 0
-    for cid in merged:
-        p = ADMIN_PAUSE_UNTIL.get(cid, 0)
-        if p == float("inf"):
-            pause_until = float("inf")
-        elif pause_until != float("inf") and p > now:
-            pause_until = max(pause_until, p)
-        e = MANYCHAT_ECHO_IGNORE_UNTIL.get(cid, 0)
-        if e > now:
-            echo_until = max(echo_until, e)
+    # Keep identity correlation because it is useful for recovering sibling
+    # Meta photo attachments that ManyChat may not expose in Dynamic Content.
 
     # Preserve a remembered ad product across the same customer's IDs too.
     ad_product_code = ""
@@ -1886,10 +1867,6 @@ def bind_customer_identities(*ids):
 
     for cid in merged:
         CUSTOMER_ID_ALIASES[cid] = set(merged - {cid})
-        if pause_until == float("inf") or pause_until > now:
-            ADMIN_PAUSE_UNTIL[cid] = pause_until
-        if echo_until > now:
-            MANYCHAT_ECHO_IGNORE_UNTIL[cid] = echo_until
         if ad_product_code:
             get_order_session(cid)["ad_product_code"] = ad_product_code
     print("CUSTOMER IDS BOUND:", sorted(merged), flush=True)
@@ -2112,132 +2089,18 @@ def correlate_manychat_to_meta(contact_id, message="", image_url=""):
 
 
 # =========================
-# ADMIN TAKEOVER
+# PAGE / BOT ECHO
 # =========================
-def pause_for_admin(customer_id):
-    if not customer_id:
-        return
-    until = now_ts() + ADMIN_PAUSE_MINUTES * 60
-    aliases = _identity_aliases(customer_id) or {str(customer_id)}
-    for cid in aliases:
-        ADMIN_PAUSE_UNTIL[cid] = until
-    print("ADMIN PAUSE:", sorted(aliases), "UNTIL", until, flush=True)
-
-
-def admin_is_active(customer_id):
-    aliases = _identity_aliases(customer_id) or {str(customer_id or "")}
-    now = now_ts()
-    active_until = 0
-    for cid in list(aliases):
-        until = ADMIN_PAUSE_UNTIL.get(cid, 0)
-        if until == float("inf"):
-            return True
-        if until > now:
-            active_until = max(active_until, until)
-        elif cid in ADMIN_PAUSE_UNTIL:
-            ADMIN_PAUSE_UNTIL.pop(cid, None)
-    if active_until > now:
-        for cid in aliases:
-            ADMIN_PAUSE_UNTIL[cid] = active_until
-        return True
-    return False
-
-
-def _set_admin_command_state(customer_id, command):
-    aliases = _identity_aliases(customer_id) or {str(customer_id or "")}
-    aliases.discard("")
-    if command == "on":
-        # ON must clear BOTH the hard OFF lock and any temporary manual-admin pause
-        # for every known identity of this same customer.
-        for cid in aliases:
-            ADMIN_PAUSE_UNTIL.pop(cid, None)
-            MANYCHAT_ECHO_IGNORE_UNTIL.pop(cid, None)
-        print("ADMIN COMMAND ON - BOT ENABLED:", sorted(aliases), flush=True)
-        return True
-    if command == "off":
-        # OFF is a hard per-customer lock and survives ordinary pause expiry.
-        for cid in aliases:
-            ADMIN_PAUSE_UNTIL[cid] = float("inf")
-            MANYCHAT_ECHO_IGNORE_UNTIL.pop(cid, None)
-        print("ADMIN COMMAND OFF - BOT HARD LOCKED:", sorted(aliases), flush=True)
-        return True
-    return False
-
-
-def _set_manychat_echo_ignore(customer_id, seconds=None):
-    """Mute Meta echoes of ManyChat output for ALL aliases of this customer."""
-    if not customer_id:
-        return
-    ttl = max(int(seconds or MANYCHAT_ECHO_GRACE_SECONDS), 60)
-    until = now_ts() + ttl
-    aliases = _identity_aliases(customer_id) or {str(customer_id)}
-    for cid in aliases:
-        if cid:
-            MANYCHAT_ECHO_IGNORE_UNTIL[cid] = max(MANYCHAT_ECHO_IGNORE_UNTIL.get(cid, 0), until)
-
-
-def _manychat_echo_ignore_active(customer_id):
-    """Check/propagate the short ManyChat echo-ignore window across Contact Id/PSID aliases."""
-    aliases = _identity_aliases(customer_id) or {str(customer_id or "")}
-    aliases.discard("")
-    now = now_ts()
-    active_until = 0
-    for cid in aliases:
-        until = MANYCHAT_ECHO_IGNORE_UNTIL.get(cid, 0)
-        if until > now:
-            active_until = max(active_until, until)
-        elif cid in MANYCHAT_ECHO_IGNORE_UNTIL:
-            MANYCHAT_ECHO_IGNORE_UNTIL.pop(cid, None)
-    if active_until > now:
-        for cid in aliases:
-            MANYCHAT_ECHO_IGNORE_UNTIL[cid] = active_until
-        return True
-    return False
-
-
 def handle_echo_message(event, message_data):
-    """Ignore bot/ManyChat echoes; real Admin ON/OFF is a hard per-customer switch."""
-    mid = str(message_data.get("mid", "") or "").strip()
-    if mid and mid in BOT_SENT_MESSAGE_IDS:
+    """Ignore every outgoing Page/Bot echo.
+
+    V46 intentionally removes the old Admin ON/OFF and timed pause system.
+    Outgoing Page messages must never disable the sales bot for that customer.
+    """
+    mid = str((message_data or {}).get("mid", "") or "").strip()
+    if mid:
         BOT_SENT_MESSAGE_IDS.discard(mid)
-        print("BOT ECHO IGNORED:", mid, flush=True)
-        return
-
-    echo_text = str(message_data.get("text", "") or "").strip()
-    if echo_text and is_recent_manychat_reply_text(echo_text):
-        print("MANYCHAT TEXT ECHO IGNORED:", echo_text[:120], flush=True)
-        return
-
-    customer_id = str(
-        event.get("recipient", {}).get("id")
-        or event.get("sender", {}).get("id")
-        or ""
-    ).strip()
-    if not customer_id:
-        return
-
-    # V42: outgoing Page/Admin echoes are keyed by Meta PSID. ManyChat may have
-    # supplied only Contact Id + Full Name, so resolve/bind the two identities
-    # before applying a manual command.
-    resolve_admin_psid_to_manychat_contact(customer_id)
-
-    # ON/OFF must be checked BEFORE the short ManyChat echo-ignore window.
-    # This avoids a manual command being swallowed by an unrelated recent bot reply.
-    admin_command = echo_text.casefold()
-    if admin_command in ("on", "off"):
-        _set_admin_command_state(customer_id, admin_command)
-        return
-
-    # Product replies commonly start with an IMAGE. Those Meta image echoes have no
-    # text fingerprint, so checking only a ManyChat Contact-Id keyed timeout caused
-    # them to be mistaken for manual Admin replies whenever Meta used the PSID.
-    # Check the timeout across all correlated aliases instead.
-    if _manychat_echo_ignore_active(customer_id):
-        print("MANYCHAT ID/PSID ECHO IGNORED:", customer_id, flush=True)
-        return
-
-    pause_for_admin(customer_id)
-    print("MANUAL ADMIN MESSAGE DETECTED - BOT PAUSED:", customer_id, flush=True)
+    print("PAGE/BOT ECHO IGNORED:", mid or "(no mid)", flush=True)
 
 
 def new_order_session():
@@ -3167,9 +3030,6 @@ def handoff_to_admin(sender_id):
         "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
     )
 
-    # After this exact sentence is sent, a human Admin should take over.
-    # The bot stays silent for ADMIN_PAUSE_MINUTES after a manual Page reply.
-    pause_for_admin(sender_id)
 
 
 
@@ -3395,7 +3255,7 @@ def manychat_text(text):
 def manychat_product_response(code, product):
     messages = []
 
-    image_url = product_public_image_url(code, product)
+    image_url = manychat_product_image_url(product)
     if image_url:
         print("MANYCHAT PUBLIC IMAGE URL:", image_url, flush=True)
         messages.append({"type": "image", "url": image_url})
@@ -3441,7 +3301,7 @@ def manychat_products_response(codes, include_order_prompt=True):
     if len(normalized) <= 3:
         for code in normalized:
             product = PRODUCTS[code]
-            image_url = product_public_image_url(code, product)
+            image_url = manychat_product_image_url(product)
             if image_url:
                 messages.append({"type": "image", "url": image_url})
             detail = product_detail(product)
@@ -3455,7 +3315,7 @@ def manychat_products_response(codes, include_order_prompt=True):
         max_images = max(0, 10 - reserve - len(normalized))
         for code in normalized[:max_images]:
             product = PRODUCTS[code]
-            image_url = product_public_image_url(code, product)
+            image_url = manychat_product_image_url(product)
             if image_url:
                 messages.append({"type": "image", "url": image_url})
         for code in normalized:
@@ -3488,7 +3348,7 @@ def manychat_product_order_response(code, product, missing):
     address/phone and never showed Code / Detail / Price.
     """
     messages = []
-    image_url = product_public_image_url(code, product)
+    image_url = manychat_product_image_url(product)
     if image_url:
         print("MANYCHAT PUBLIC IMAGE URL:", image_url, flush=True)
         messages.append({"type": "image", "url": image_url})
@@ -3658,7 +3518,7 @@ def handle_manychat_request(data):
     # remember this inbound so the matching Meta webhook event can correlate IDs.
     _manychat_identity_from_payload(data, contact_id)
 
-    # V45 MULTI-PHOTO RECOVERY:
+    # V46 MULTI-PHOTO RECOVERY:
     # Messenger can deliver a multi-photo send through Meta as sibling attachment
     # events while ManyChat exposes only the LAST attachment in Dynamic Content.
     # First remember the image(s) visible in this ManyChat request, then merge any
@@ -3682,7 +3542,7 @@ def handle_manychat_request(data):
     incoming_image_urls = recovered_image_urls or list(current_event_image_urls)
     incoming_image_url = incoming_image_urls[-1] if incoming_image_urls else ""
     if len(incoming_image_urls) > 1:
-        print("V45 MULTI-PHOTO BATCH URLS:", len(incoming_image_urls), flush=True)
+        print("V46 MULTI-PHOTO BATCH URLS:", len(incoming_image_urls), flush=True)
 
     # ManyChat can retry a Dynamic Block request. Never send the exact same
     # reply twice to the same contact inside the short dedup window. Include all
@@ -3697,11 +3557,6 @@ def handle_manychat_request(data):
     if not contact_id:
         return manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။")
 
-    # Pause is per customer only. Other customers continue normally.
-    if admin_is_active(contact_id):
-        print("MANYCHAT ADMIN ACTIVE - BOT SILENT:", contact_id, flush=True)
-        return manychat_response([])
-
     session = get_order_session(contact_id)
     initial_last_product_code = str(session.get("last_product_code", "") or "").strip()
 
@@ -3713,7 +3568,6 @@ def handle_manychat_request(data):
 
     # Explicit human/Admin request only.
     if wants_admin(message):
-        pause_for_admin(contact_id)
         return done(manychat_text(
             "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
         ))
@@ -3773,7 +3627,7 @@ def handle_manychat_request(data):
             if len(sellable_explicit) == 1:
                 session["last_product_code"] = next(iter(sellable_explicit))
 
-    # V45 EXPLICIT CODE + PURCHASE INTENT (GLOBAL, CURRENT + FUTURE SHEET ITEMS)
+    # V46 EXPLICIT CODE + PURCHASE INTENT (GLOBAL, CURRENT + FUTURE SHEET ITEMS)
     # Examples: "Code 0008 လေးမှာယူချင်ပါတယ်", "0013 ဝယ်ချင်တယ်".
     # An explicit valid code must NEVER fall through to Admin/unknown handling.
     # It must show Image -> Google Sheet Detail -> Price/Delivery/COD first, then
@@ -3794,7 +3648,7 @@ def handle_manychat_request(data):
             session["quantity_confirmed"] = True
             lock_facebook_account_name(session, account_name)
             missing_now = order_missing_fields(session)
-            print("V45 EXPLICIT CODE ORDER INFO-FIRST:", explicit_code_value, qty_now, missing_now, flush=True)
+            print("V46 EXPLICIT CODE ORDER INFO-FIRST:", explicit_code_value, qty_now, missing_now, flush=True)
             return done(manychat_product_order_response(
                 explicit_code_value, explicit_code_product, missing_now
             ))
@@ -4167,7 +4021,7 @@ def handle_manychat_request(data):
 
     # V33: A product image that cannot be matched must NOT put this customer into
     # Admin pause.  Otherwise one failed vision attempt makes every later image/code
-    # silent for ADMIN_PAUSE_MINUTES. Ask which product instead and keep bot active.
+    # A failed vision attempt must not make later image/code messages silent.
     if incoming_image_urls:
         print("UNRESOLVED IMAGE - BOT REMAINS ACTIVE", flush=True)
         clear_recent_customer_images(contact_id, incoming_image_urls)
@@ -4192,7 +4046,6 @@ def handle_manychat_request(data):
 
     # Explicit Admin requests were handled earlier. Truly unrelated/unknown
     # non-product questions can still go to a human.
-    pause_for_admin(contact_id)
     return done(manychat_text(
         "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
     ))
@@ -4239,27 +4092,6 @@ def verify_webhook():
 
     return "Verification failed", 403
 
-
-
-@app.route("/product-image/<code>", methods=["GET"])
-def product_image_proxy(code):
-    load_products()
-
-    code = normalize_code(code)
-    product = PRODUCTS.get(code)
-
-    if not product:
-        return "Not found", 404
-
-    source_url = product_image_url(product)
-    image_bytes, content_type = download_image_bytes(source_url)
-
-    if not image_bytes:
-        return "Image unavailable", 404
-
-    response = Response(image_bytes, mimetype=content_type or "image/jpeg")
-    response.headers["Cache-Control"] = "public, max-age=3600"
-    return response
 
 
 @app.route("/webhook", methods=["POST"])
@@ -4332,12 +4164,6 @@ def webhook():
             correlate_meta_sender_to_manychat(sender_id, text, incoming_image_url)
             # Correlation may have just created an alias; mirror the buffer again.
             remember_customer_images(sender_id, incoming_image_urls)
-
-            # Hard OFF / Admin pause is checked only after identity correlation so
-            # both Meta and ManyChat routes honor the same per-customer switch.
-            if admin_is_active(sender_id):
-                print("ADMIN ACTIVE - BOT SILENT:", sender_id, flush=True)
-                continue
 
             print("CUSTOMER:", sender_id, flush=True)
             print("TEXT:", text, flush=True)
