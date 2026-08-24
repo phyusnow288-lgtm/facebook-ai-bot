@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request, Response
 
-BOT_VERSION = "V44-SAFE-CONSOLIDATED-IMAGE-SPEED-ORDER"
+BOT_VERSION = "V45-SAFE-CODE-ORDER-MULTI-PHOTO-DETAIL"
 
 app = Flask(__name__)
 
@@ -3658,16 +3658,31 @@ def handle_manychat_request(data):
     # remember this inbound so the matching Meta webhook event can correlate IDs.
     _manychat_identity_from_payload(data, contact_id)
 
-    # V44: current-event images are authoritative. Do not append old buffered
-    # product images to a new event. Separate photo messages can still accumulate
-    # recognized product codes in the order session without mixing image URLs.
+    # V45 MULTI-PHOTO RECOVERY:
+    # Messenger can deliver a multi-photo send through Meta as sibling attachment
+    # events while ManyChat exposes only the LAST attachment in Dynamic Content.
+    # First remember the image(s) visible in this ManyChat request, then merge any
+    # very recent sibling URLs already observed through the Meta webhook/identity
+    # bridge. This restores the old V6-style expectation: 2 photos => both products
+    # can be recognized and BOTH Detail + Price replies are returned.
     current_event_image_urls = list(incoming_image_urls)
     remember_customer_images(contact_id, current_event_image_urls)
     incoming_image_url = current_event_image_urls[-1] if current_event_image_urls else ""
     remember_manychat_inbound(contact_id, message, incoming_image_url)
     correlate_manychat_to_meta(contact_id, message, incoming_image_url)
-    incoming_image_urls = list(current_event_image_urls)
+
+    recovered_image_urls = []
+    if current_event_image_urls:
+        for buffered_url in recent_customer_images(contact_id):
+            if buffered_url not in recovered_image_urls:
+                recovered_image_urls.append(buffered_url)
+        for current_url in current_event_image_urls:
+            if current_url not in recovered_image_urls:
+                recovered_image_urls.append(current_url)
+    incoming_image_urls = recovered_image_urls or list(current_event_image_urls)
     incoming_image_url = incoming_image_urls[-1] if incoming_image_urls else ""
+    if len(incoming_image_urls) > 1:
+        print("V45 MULTI-PHOTO BATCH URLS:", len(incoming_image_urls), flush=True)
 
     # ManyChat can retry a Dynamic Block request. Never send the exact same
     # reply twice to the same contact inside the short dedup window. Include all
@@ -3757,6 +3772,33 @@ def handle_manychat_request(data):
             session["quantity_confirmed"] = True
             if len(sellable_explicit) == 1:
                 session["last_product_code"] = next(iter(sellable_explicit))
+
+    # V45 EXPLICIT CODE + PURCHASE INTENT (GLOBAL, CURRENT + FUTURE SHEET ITEMS)
+    # Examples: "Code 0008 လေးမှာယူချင်ပါတယ်", "0013 ဝယ်ချင်တယ်".
+    # An explicit valid code must NEVER fall through to Admin/unknown handling.
+    # It must show Image -> Google Sheet Detail -> Price/Delivery/COD first, then
+    # continue the order flow by asking only for still-missing customer fields.
+    explicit_code_product = None
+    explicit_code_value = ""
+    if explicit_message_items:
+        for _code in explicit_message_items:
+            if _code in PRODUCTS:
+                explicit_code_value = _code
+                explicit_code_product = PRODUCTS[_code]
+                break
+    if explicit_code_product and is_order_message(message):
+        if product_is_sellable(explicit_code_product):
+            qty_now = explicit_message_items.get(explicit_code_value, 1) or 1
+            session["items"] = {explicit_code_value: max(1, int(qty_now))}
+            session["last_product_code"] = explicit_code_value
+            session["quantity_confirmed"] = True
+            lock_facebook_account_name(session, account_name)
+            missing_now = order_missing_fields(session)
+            print("V45 EXPLICIT CODE ORDER INFO-FIRST:", explicit_code_value, qty_now, missing_now, flush=True)
+            return done(manychat_product_order_response(
+                explicit_code_value, explicit_code_product, missing_now
+            ))
+        return done(manychat_product_response(explicit_code_value, explicit_code_product))
 
     # V38 global multi-name/multi-code order selection.
     # A current message explicitly naming/listing multiple products is authoritative
