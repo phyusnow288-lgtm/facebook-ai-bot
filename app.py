@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request
 
-BOT_VERSION = "V47-SAFE-ADMIN-PAUSE-ORDER-COMPLETE-FIX"
+BOT_VERSION = "V48-SAFE-FULL-HISTORY-MULTI-CODE-MULTI-PHOTO-IMAGE-FLOW-FIX"
 
 app = Flask(__name__)
 
@@ -192,23 +192,45 @@ def _flatten_image_urls(value):
 def extract_manychat_image_urls(data, message=""):
     """Collect ALL image URLs ManyChat may provide, not only Last Image URL."""
     urls = []
+
+    def add_urls(value):
+        # Existing recursive extractor handles normal ManyChat/Meta objects.
+        for url in _flatten_image_urls(value):
+            if url not in urls:
+                urls.append(url)
+
+        # Some ManyChat custom fields arrive as one JSON/string value containing
+        # several attachment URLs. Extract every URL instead of keeping only the
+        # last attachment.
+        if isinstance(value, str):
+            for match in re.findall(r'https?://[^\s"\'<>\],}]+', value):
+                clean = match.rstrip(").,;")
+                low = clean.lower()
+                if any(token in low for token in (
+                    ".jpg", ".jpeg", ".png", ".webp", ".gif",
+                    "scontent", "fbcdn", "googleusercontent", "drive.google",
+                )):
+                    if clean not in urls:
+                        urls.append(clean)
+
     if isinstance(data, dict):
+        # Explicit known fields.
         for key in (
             "image_urls", "images", "attachments", "attachment_urls", "files",
             "image_url", "attachment_url", "last_image_url", "customer_image_url",
             "image", "file_url", "last_attachment", "last_attachments",
+            "image_url_1", "image_url_2", "image_url_3", "image_url_4", "image_url_5",
+            "attachment_1", "attachment_2", "attachment_3", "attachment_4", "attachment_5",
         ):
             if key in data:
-                for url in _flatten_image_urls(data.get(key)):
-                    if url not in urls:
-                        urls.append(url)
+                add_urls(data.get(key))
 
-    # ManyChat sometimes places a Facebook CDN URL in Last Text Input.
-    text = str(message or "").strip()
-    if text.startswith(("http://", "https://")):
-        for url in _flatten_image_urls(text):
-            if url not in urls:
-                urls.append(url)
+        # Also inspect nested payload fields so future ManyChat mappings do not
+        # require another code change.
+        add_urls(data)
+
+    # ManyChat sometimes places Facebook CDN URL(s) in Last Text Input.
+    add_urls(str(message or "").strip())
     return urls
 
 
@@ -366,7 +388,13 @@ def _fetch_products_from_sheet():
     response.raise_for_status()
     reader = csv.DictReader(response.text.splitlines())
     products = {}
-    for row in reader:
+    for raw_row in reader:
+        # Normalize Google Sheet headers once. Stray spaces/BOMs in headers were
+        # enough to make some rows look as if their Image URL/Detail was missing.
+        row = {}
+        for raw_key, value in (raw_row or {}).items():
+            key = str(raw_key or "").replace("\ufeff", "").strip()
+            row[key] = value
         code = normalize_code(get_row_value(row, "Code", "code", "CODE"))
         if code:
             products[code] = row
@@ -423,9 +451,6 @@ def load_products(force=False):
     threading.Thread(target=_background_product_refresh, daemon=True).start()
 
 
-load_products(force=True)
-
-
 # =========================
 # DRIVE / IMAGE HELPERS
 # =========================
@@ -476,17 +501,31 @@ def google_drive_view_url(url):
 
 
 def product_image_url(product):
-    return str(
-        get_row_value(
-            product,
-            "Image URL",
-            "ImageURL",
-            "image_url",
-            "Image",
-            "image",
-        )
-        or ""
-    ).strip()
+    """Return a product image from common Google Sheet header variants."""
+    if not isinstance(product, dict):
+        return ""
+
+    # First use the known historical headers.
+    value = get_row_value(
+        product,
+        "Image URL", "ImageURL", "image_url", "Image Url", "Image url",
+        "Image Link", "ImageLink", "Product Image", "Product Image URL",
+        "Photo", "Photo URL", "PhotoURL", "image",
+    )
+    if value not in (None, ""):
+        return str(value).strip()
+
+    # Last-resort normalized header lookup protects future Sheet edits such as
+    # "Image URL " or different punctuation/case without requiring Python edits.
+    for key, raw_value in product.items():
+        normalized_key = re.sub(r"[^a-z0-9]+", "", str(key or "").lower())
+        if normalized_key in {
+            "image", "imageurl", "imagelink",
+            "productimage", "productimageurl",
+            "photo", "photourl",
+        } and raw_value not in (None, ""):
+            return str(raw_value).strip()
+    return ""
 
 
 
@@ -1197,6 +1236,13 @@ def catalog_reference_content_parts():
             flush=True,
         )
         return parts
+
+# Initial catalog load must happen only after image/cache helpers are defined.
+load_products(force=True)
+for _catalog_code, _catalog_product in PRODUCTS.items():
+    if not product_image_url(_catalog_product):
+        print("CATALOG IMAGE MISSING:", _catalog_code, flush=True)
+
 
 
 # =========================
@@ -3414,12 +3460,12 @@ def manychat_product_response(code, product):
 
 
 def manychat_products_response(codes, include_order_prompt=True):
-    """Send every matched product without exceeding ManyChat's 10-message block limit.
+    """Return every recognized product, preserving image + detail + price.
 
-    V39 keeps the same image/detail/price content. For 1-3 products it preserves
-    V38's separate image/detail/price messages. For larger sets it combines each
-    product's detail + price into one text and caps images only when required so
-    no recognized code is silently dropped from the returned data.
+    ManyChat Dynamic Content accepts at most 10 messages. For 1-3 products keep
+    the historical 3-message flow (image, detail, price). For 4-5 products use
+    exactly 2 messages per product (image, then combined detail+price), placing
+    the order prompt inside the final text so NO product image/code is dropped.
     """
     normalized = []
     seen = set()
@@ -3429,46 +3475,51 @@ def manychat_products_response(codes, include_order_prompt=True):
             seen.add(code)
             normalized.append(code)
 
+    if not normalized:
+        return manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။")
+
+    # The shop flow is designed for up to five products in one buyer selection.
+    # If an AI result ever contains more, keep the first five deterministic codes
+    # rather than silently overflowing ManyChat's 10-message hard limit.
+    normalized = normalized[:5]
     messages = []
+    order_prompt = "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။"
+    has_sellable = any(product_is_sellable(PRODUCTS[c]) for c in normalized)
+
     if len(normalized) <= 3:
         for code in normalized:
             product = PRODUCTS[code]
             image_url = manychat_product_image_url(product)
             if image_url:
                 messages.append({"type": "image", "url": image_url})
+            else:
+                print("PRODUCT IMAGE MISSING:", code, flush=True)
+
             detail = product_detail(product)
             if detail:
                 messages.append({"type": "text", "text": detail})
             messages.append({"type": "text", "text": product_reply(code, product)})
+
+        if include_order_prompt and has_sellable:
+            messages.append({"type": "text", "text": order_prompt})
     else:
-        # Reserve one message for the final order prompt. Use one combined text per
-        # product and as many product images as fit in the remaining message budget.
-        reserve = 1 if include_order_prompt else 0
-        max_images = max(0, 10 - reserve - len(normalized))
-        for code in normalized[:max_images]:
+        # 4 products => 8 messages; 5 products => exactly 10 messages.
+        # Every product gets its own image and its own detail+price text.
+        for idx, code in enumerate(normalized):
             product = PRODUCTS[code]
             image_url = manychat_product_image_url(product)
             if image_url:
                 messages.append({"type": "image", "url": image_url})
-        for code in normalized:
-            product = PRODUCTS[code]
+            else:
+                print("PRODUCT IMAGE MISSING:", code, flush=True)
+
             detail = product_detail(product)
             combined_text = (detail + "\n\n" if detail else "") + product_reply(code, product)
+            if include_order_prompt and has_sellable and idx == len(normalized) - 1:
+                combined_text += "\n\n" + order_prompt
             messages.append({"type": "text", "text": combined_text})
 
-    if include_order_prompt and any(product_is_sellable(PRODUCTS[c]) for c in normalized):
-        messages.append({"type": "text", "text": "မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။"})
-
-    # Hard safety: Dynamic Block accepts at most 10 messages. If an unusually
-    # large catalog match occurs, merge overflow text into the last text message
-    # instead of dropping product data.
-    if len(messages) > 10:
-        head = messages[:9]
-        overflow_texts = [m.get("text", "") for m in messages[9:] if m.get("type") == "text" and m.get("text")]
-        if overflow_texts:
-            head.append({"type": "text", "text": "\n\n".join(overflow_texts)})
-        messages = head[:10]
-    return manychat_response(messages)
+    return manychat_response(messages[:10])
 
 
 
@@ -3784,7 +3835,7 @@ def handle_manychat_request(data):
                 explicit_code_value = _code
                 explicit_code_product = PRODUCTS[_code]
                 break
-    if explicit_code_product and is_order_message(message):
+    if len(explicit_message_items) == 1 and explicit_code_product and is_order_message(message):
         if product_is_sellable(explicit_code_product):
             qty_now = explicit_message_items.get(explicit_code_value, 1) or 1
             session["items"] = {explicit_code_value: max(1, int(qty_now))}
@@ -4190,12 +4241,10 @@ def handle_manychat_request(data):
         print("UNRESOLVED PRODUCT TEXT - ASK WHICH PRODUCT", flush=True)
         return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
 
-    # Truly unrelated/unknown questions are handed to a human once, then this
-    # customer is paused so the bot cannot keep talking over the Admin.
-    pause_for_admin(contact_id)
-    return done(manychat_text(
-        "ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"
-    ))
+    # Ordinary unknown buyer text is NOT an Admin takeover. Ask which product
+    # instead of pausing the bot. Explicit Admin requests were handled above.
+    print("UNKNOWN BUYER TEXT - ASK WHICH PRODUCT", flush=True)
+    return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
 
 
 # =========================
