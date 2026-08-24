@@ -1,3 +1,13 @@
+
+# =========================
+# V51 BUILD MARKER
+# Restores the pre-V46 Admin pause path while preserving V50 Sheet-first,
+# multi-code, multi-photo, product image/detail/price, order and Telegram logic.
+# ON/OFF commands are intentionally NOT restored.
+# =========================
+BOT_BUILD = "V51_SAFE_RESTORE_PRE_V46_ADMIN_PAUSE_NO_DATA_LOSS"
+print("BOT BUILD:", BOT_BUILD, flush=True)
+
 import os
 import re
 import csv
@@ -2316,57 +2326,74 @@ def is_post_order_ack(text):
 
 
 def handle_echo_message(event, message_data):
-    """Ignore bot/ManyChat echoes; any real Admin text pauses only that customer.
+    """Restore the proven pre-V46 Admin-pause path without restoring ON/OFF commands.
 
-    This can work only when Meta sends the Page message echo to this webhook. V49
-    logs every received echo so a missing Meta message_echoes subscription is obvious
-    instead of being mistaken for an order-parser problem.
+    Bot/ManyChat echoes are ignored. A real manual Page/Admin outgoing message pauses
+    only that customer for ADMIN_PAUSE_MINUTES. Identity aliases are resolved first so
+    a Meta PSID pause propagates to the matching ManyChat Contact ID.
     """
     message_data = message_data or {}
+    sender_id = str(event.get("sender", {}).get("id", "") or "").strip()
+    recipient_id = str(event.get("recipient", {}).get("id", "") or "").strip()
+    echo_text = str(message_data.get("text", "") or "").strip()
+    mid = str(message_data.get("mid", "") or "").strip()
+
     print(
-        "V49 PAGE ECHO RECEIVED:",
+        "V51 PAGE ECHO RECEIVED:",
         {
-            "sender": event.get("sender", {}).get("id"),
-            "recipient": event.get("recipient", {}).get("id"),
-            "text": str(message_data.get("text", "") or "")[:120],
-            "mid": message_data.get("mid"),
+            "sender": sender_id,
+            "recipient": recipient_id,
+            "text": echo_text[:120],
+            "mid": mid,
         },
         flush=True,
     )
-    mid = str(message_data.get("mid", "") or "").strip()
+
+    # Direct Graph API messages sent by this bot are known by message id.
     if mid and mid in BOT_SENT_MESSAGE_IDS:
         BOT_SENT_MESSAGE_IDS.discard(mid)
-        print("BOT ECHO IGNORED:", mid, flush=True)
+        print("V51 BOT ECHO IGNORED:", mid, flush=True)
         return
 
-    echo_text = str(message_data.get("text", "") or "").strip()
+    # ManyChat Dynamic Content text echoed back by Meta must not look like Admin.
     if echo_text and is_recent_manychat_reply_text(echo_text):
-        print("MANYCHAT TEXT ECHO IGNORED:", echo_text[:120], flush=True)
+        print("V51 MANYCHAT TEXT ECHO IGNORED:", echo_text[:120], flush=True)
         return
 
-    customer_id = str(
-        event.get("recipient", {}).get("id")
-        or event.get("sender", {}).get("id")
-        or ""
-    ).strip()
+    # For Page is_echo events recipient is normally the customer's PSID.
+    customer_id = recipient_id or sender_id
     if not customer_id:
+        print("V51 PAGE ECHO IGNORED: NO CUSTOMER ID", flush=True)
         return
 
-    resolve_admin_psid_to_manychat_contact(customer_id)
+    # Re-bind Meta PSID <-> ManyChat Contact ID before storing pause state.
+    resolved_contact_id = resolve_admin_psid_to_manychat_contact(customer_id)
+    if resolved_contact_id:
+        bind_customer_identities(customer_id, resolved_contact_id)
 
-    # A real manual Admin TEXT must pause immediately, even if the bot just replied.
-    # The short grace window is only for text-less image/attachment echoes.
+    # Manual text is authoritative. Do not let a recent bot-image grace window swallow
+    # a human Admin message; this was the critical post-V46 regression protection.
     if echo_text:
         pause_for_admin(customer_id)
-        print("MANUAL ADMIN TEXT DETECTED - BOT PAUSED:", customer_id, flush=True)
+        print(
+            "V51 MANUAL ADMIN TEXT DETECTED - BOT PAUSED:",
+            sorted(_identity_aliases(customer_id) or {customer_id}),
+            flush=True,
+        )
         return
 
+    # Text-less image/attachment echoes need the historical grace-window check because
+    # bot product-image messages may not have a useful text fingerprint.
     if _manychat_echo_ignore_active(customer_id):
-        print("MANYCHAT IMAGE/ATTACHMENT ECHO IGNORED:", customer_id, flush=True)
+        print("V51 MANYCHAT IMAGE/ATTACHMENT ECHO IGNORED:", customer_id, flush=True)
         return
 
     pause_for_admin(customer_id)
-    print("MANUAL ADMIN OUTGOING DETECTED - BOT PAUSED:", customer_id, flush=True)
+    print(
+        "V51 MANUAL ADMIN OUTGOING DETECTED - BOT PAUSED:",
+        sorted(_identity_aliases(customer_id) or {customer_id}),
+        flush=True,
+    )
 
 def new_order_session():
     return {
