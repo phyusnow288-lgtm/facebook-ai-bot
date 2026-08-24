@@ -28,6 +28,7 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
+BOT_VERSION = "V50_SAFE_DUAL_ADMIN_TAKEOVER_SHEET_FIRST_NO_DATA_LOSS"
 ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 POST_ORDER_ACK_TTL_SECONDS = int(os.environ.get("POST_ORDER_ACK_TTL_SECONDS", "86400"))
 
@@ -3733,6 +3734,57 @@ def lock_facebook_account_name(session, account_name):
     return session
 
 
+def _truthy_admin_flag(value):
+    """Accept common boolean/string values for an explicit human takeover signal."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().casefold() in {
+        "1", "true", "yes", "on", "admin", "human", "takeover", "pause", "paused"
+    }
+
+
+def is_explicit_admin_takeover_payload(data):
+    """Fallback Admin signal for ManyChat/external-request integrations.
+
+    Existing Meta is_echo detection remains the primary path. This fallback is
+    intentionally additive: it does nothing unless the incoming request explicitly
+    identifies itself as an Admin/human takeover, so buyer traffic cannot pause the bot.
+    """
+    if not isinstance(data, dict):
+        return False
+    for key in (
+        "admin_takeover", "admin_pause", "human_takeover", "human_pause",
+        "pause_bot", "admin_manual_reply", "is_admin_reply",
+    ):
+        if key in data and _truthy_admin_flag(data.get(key)):
+            return True
+    action = str(data.get("action", "") or data.get("event", "") or "").strip().casefold()
+    return action in {
+        "admin_takeover", "admin_pause", "human_takeover", "human_pause",
+        "pause_bot", "admin_manual_reply",
+    }
+
+
+def handle_explicit_admin_takeover(data):
+    """Pause a contact from an explicit ManyChat/admin signal; no customer reply."""
+    contact_id = str(
+        data.get("contact_id", "")
+        or data.get("customer_id", "")
+        or data.get("subscriber_id", "")
+        or data.get("psid", "")
+        or ""
+    ).strip()
+    if not contact_id:
+        print("V50 EXPLICIT ADMIN TAKEOVER REJECTED: NO CONTACT ID", flush=True)
+        return manychat_response([])
+    _manychat_identity_from_payload(data, contact_id)
+    pause_for_admin(contact_id)
+    print("V50 EXPLICIT ADMIN TAKEOVER - BOT PAUSED:", contact_id, flush=True)
+    return manychat_response([])
+
+
 def handle_manychat_request(data):
     """
     ManyChat body:
@@ -4404,6 +4456,12 @@ def webhook():
 
     print("=== WEBHOOK POST RECEIVED ===", flush=True)
     print(data, flush=True)
+
+    # V50 dual-path Admin takeover. Meta message_echoes remains the primary path;
+    # an explicit ManyChat/external-request signal is a safe fallback when Meta does
+    # not deliver the outgoing echo. This check MUST happen before buyer processing.
+    if isinstance(data, dict) and is_explicit_admin_takeover_payload(data):
+        return handle_explicit_admin_takeover(data), 200
 
     # ManyChat Dynamic Block request.
     if isinstance(data, dict) and "message" in data and "contact_id" in data:
