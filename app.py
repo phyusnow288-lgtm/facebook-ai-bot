@@ -5,7 +5,7 @@
 # multi-code, multi-photo, product image/detail/price, order and Telegram logic.
 # ON/OFF commands are intentionally NOT restored.
 # =========================
-BOT_BUILD = "V52_SAFE_ADMIN_PAUSE_ALIAS_SYNC_NO_DATA_LOSS"
+BOT_BUILD = "V53_SAFE_SHEET_FIRST_TWO_STRIKE_ADMIN_DELIVERY_NO_DATA_LOSS"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -38,7 +38,7 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
-BOT_VERSION = "V50_SAFE_DUAL_ADMIN_TAKEOVER_SHEET_FIRST_NO_DATA_LOSS"
+BOT_VERSION = "V53_SAFE_SHEET_FIRST_TWO_STRIKE_ADMIN_DELIVERY_NO_DATA_LOSS"
 ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 POST_ORDER_ACK_TTL_SECONDS = int(os.environ.get("POST_ORDER_ACK_TTL_SECONDS", "86400"))
 
@@ -2428,8 +2428,37 @@ def new_order_session():
         "ad_product_code": "",
         "quantity_confirmed": False,
         "_account_name_locked": False,
+        # V53: first unresolved buyer message asks which product; a second
+        # consecutive unresolved message hands off to Admin and pauses this customer.
+        "_awaiting_product_clarification": False,
     }
 
+
+
+def clear_product_clarification(session):
+    if isinstance(session, dict):
+        session["_awaiting_product_clarification"] = False
+    return session
+
+
+def unresolved_product_should_handoff(session):
+    """Two-strike unresolved-product rule.
+
+    First unresolved buyer message => ask which product.
+    Second consecutive unresolved message => Admin handoff + customer pause.
+    Any recognized catalog/order progress clears the flag.
+    """
+    if not isinstance(session, dict):
+        return False
+    if session.get("_awaiting_product_clarification"):
+        session["_awaiting_product_clarification"] = False
+        return True
+    session["_awaiting_product_clarification"] = True
+    return False
+
+
+def post_order_delivery_time_message():
+    return "Deli အပ်ပြီး ရန်ကုန်မြို့တွင်း ၃ ရက်မှ ၅ ရက်၊ နယ်မြို့များ ၄ ရက်မှ ၁၀ ရက်အတွင်း ပစ္စည်းလေးရောက်မှာပါရှင်။"
 
 
 def get_order_session(sender_id):
@@ -3849,7 +3878,8 @@ def handle_manychat_request(data):
     - No quantity supplied => defaults to 1 item.
     - Buyer name always comes from Facebook/ManyChat Full Name.
     - Burmese/English/mixed text or image address + phone completion => buyer confirmation + Telegram.
-    - Unknown/non-shopping/unresolved => ask exactly which product; do not pause.
+    - First unknown/non-shopping/unresolved => ask exactly which product.
+    - Second consecutive unresolved buyer message => Admin handoff + pause this customer.
     - Exact duplicate ManyChat input => no second customer reply.
     - Completed order => Telegram is queued once with retry + duplicate suppression.
     """
@@ -3963,10 +3993,19 @@ def handle_manychat_request(data):
             flush=True,
         )
         if not valid_candidates_now:
+            previous_pending = bool(session.get("_awaiting_product_clarification"))
             reset_order_context_for_unknown_product(contact_id, account_name)
+            session = get_order_session(contact_id)
+            session["_awaiting_product_clarification"] = previous_pending
+            if unresolved_product_should_handoff(session):
+                pause_for_admin(contact_id)
+                return done(manychat_text("ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"))
             return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
         # Mixed valid+invalid input: process only Sheet-backed products below.
         # Invalid tokens are never added to the order session.
+
+    if valid_candidates_now:
+        clear_product_clarification(session)
 
     # Explicit human/Admin request only.
     if wants_admin(message):
@@ -4149,7 +4188,10 @@ def handle_manychat_request(data):
                     mark_order_completed(contact_id)
                     ORDER_SESSIONS[contact_id] = new_order_session()
                     lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
-                    return done(manychat_text(buyer_text))
+                    return done(manychat_response([
+                        {"type": "text", "text": buyer_text},
+                        {"type": "text", "text": post_order_delivery_time_message()},
+                    ]))
 
                 # Do not erase the session when Telegram configuration is missing.
                 return done(manychat_text(
@@ -4220,6 +4262,9 @@ def handle_manychat_request(data):
     if not product and context_product:
         code, product = context_code, context_product
         recognized_from_ad = True
+
+    if product:
+        clear_product_clarification(session)
 
     # A customer image that identifies a catalog product is a PRODUCT QUERY, not
     # an order screenshot. V20 treated every incoming image as order intent and
@@ -4320,6 +4365,9 @@ def handle_manychat_request(data):
     # Generic "လိုချင်ပါတယ်" / "Can I make a purchase?" with no product known:
     # never hand off to Admin and never guess a product.
     if generic_order and not product and not last_product_ready and not active_order:
+        if unresolved_product_should_handoff(session):
+            pause_for_admin(contact_id)
+            return done(manychat_text("ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"))
         return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
 
     order_intent = (
@@ -4329,6 +4377,9 @@ def handle_manychat_request(data):
         or (extract_explicit_quantity(message) is not None and last_product_ready)
         or (image_has_order_details and last_product_ready)
     )
+    if order_intent or last_product_ready:
+        clear_product_clarification(session)
+
     if active_order and not order_intent:
         print("V49 ACTIVE ORDER + NON-ORDER TEXT - DO NOT REPEAT ADDRESS PROMPT:", message, flush=True)
 
@@ -4414,7 +4465,10 @@ def handle_manychat_request(data):
             mark_order_completed(contact_id)
             ORDER_SESSIONS[contact_id] = new_order_session()
             lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
-            return done(manychat_text(buyer_text))
+            return done(manychat_response([
+                {"type": "text", "text": buyer_text},
+                {"type": "text", "text": post_order_delivery_time_message()},
+            ]))
 
         # Keep the session when Telegram configuration is missing.
         return done(manychat_text(
@@ -4429,12 +4483,18 @@ def handle_manychat_request(data):
     # Admin pause.  Otherwise one failed vision attempt makes every later image/code
     # A failed vision attempt must not make later image/code messages silent.
     if incoming_image_urls:
-        print("UNRESOLVED IMAGE - BOT REMAINS ACTIVE", flush=True)
+        print("UNRESOLVED IMAGE", flush=True)
         clear_recent_customer_images(contact_id, incoming_image_urls)
+        if unresolved_product_should_handoff(session):
+            pause_for_admin(contact_id)
+            return done(manychat_text("ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"))
         return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
 
     greeting = simple_greeting(message)
     if greeting:
+        if unresolved_product_should_handoff(session):
+            pause_for_admin(contact_id)
+            return done(manychat_text("ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"))
         return done(manychat_text(greeting))
 
     # Preserve the long-standing shop rule: if the buyer is clearly talking
@@ -4447,12 +4507,18 @@ def handle_manychat_request(data):
         "ယူ", "မှာ", "ဝယ်", "order", "buy", "want", "item", "product",
     )
     if any(word in low_unknown for word in productish_words):
-        print("UNRESOLVED PRODUCT TEXT - ASK WHICH PRODUCT", flush=True)
+        print("UNRESOLVED PRODUCT TEXT", flush=True)
+        if unresolved_product_should_handoff(session):
+            pause_for_admin(contact_id)
+            return done(manychat_text("ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"))
         return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
 
-    # Ordinary unknown buyer text is NOT an Admin takeover. Ask which product
-    # instead of pausing the bot. Explicit Admin requests were handled above.
-    print("UNKNOWN BUYER TEXT - ASK WHICH PRODUCT", flush=True)
+    # V53 simplified routing: first unresolved message asks which product;
+    # a second consecutive unresolved message hands off to Admin and pauses.
+    print("UNKNOWN BUYER TEXT", flush=True)
+    if unresolved_product_should_handoff(session):
+        pause_for_admin(contact_id)
+        return done(manychat_text("ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"))
     return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
 
 
@@ -4596,9 +4662,18 @@ def webhook():
             meta_valid_candidates = [c for c in meta_candidates if c in PRODUCTS]
             meta_invalid_candidates = [c for c in meta_candidates if c not in PRODUCTS]
             if meta_invalid_candidates and not meta_valid_candidates:
+                previous_pending = bool(session.get("_awaiting_product_clarification"))
                 reset_order_context_for_unknown_product(sender_id)
-                send_facebook_text(sender_id, "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။")
+                session = get_order_session(sender_id)
+                session["_awaiting_product_clarification"] = previous_pending
+                if unresolved_product_should_handoff(session):
+                    handoff_to_admin(sender_id)
+                else:
+                    send_facebook_text(sender_id, "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။")
                 continue
+
+            if meta_valid_candidates:
+                clear_product_clarification(session)
 
             # ---------------------------------
             # 1) DIRECT CODE
@@ -4635,6 +4710,9 @@ def webhook():
             # ---------------------------------
             if not product and text:
                 code, product = ai_find_product_from_text(text)
+
+            if product:
+                clear_product_clarification(session)
 
             # ---------------------------------
             # EXPLICIT ADMIN REQUEST
@@ -4676,10 +4754,13 @@ def webhook():
             generic_order = generic_purchase_intent(text)
 
             if generic_order and not product and not last_product_ready and not active_order:
-                send_facebook_text(
-                    sender_id,
-                    "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။",
-                )
+                if unresolved_product_should_handoff(session):
+                    handoff_to_admin(sender_id)
+                else:
+                    send_facebook_text(
+                        sender_id,
+                        "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။",
+                    )
                 continue
 
             order_intent = (
@@ -4688,6 +4769,9 @@ def webhook():
                 or (last_product_ready and looks_like_order_progress(text, session))
                 or (extract_explicit_quantity(text) is not None and last_product_ready)
             )
+            if order_intent or last_product_ready:
+                clear_product_clarification(session)
+
             if active_order and not order_intent:
                 print("V49 META ACTIVE ORDER + NON-ORDER TEXT - NO REPEATED PROMPT:", text, flush=True)
 
@@ -4741,6 +4825,10 @@ def webhook():
                             sender_id,
                             buyer_order_confirmation(session),
                         )
+                        send_facebook_text(
+                            sender_id,
+                            post_order_delivery_time_message(),
+                        )
                         mark_order_completed(sender_id)
                         ORDER_SESSIONS[sender_id] = new_order_session()
                     else:
@@ -4759,15 +4847,21 @@ def webhook():
             greeting = simple_greeting(text)
 
             if greeting:
-                send_facebook_text(sender_id, greeting)
+                if unresolved_product_should_handoff(session):
+                    handoff_to_admin(sender_id)
+                else:
+                    send_facebook_text(sender_id, greeting)
                 continue
 
             # ---------------------------------
-            # TRULY UNKNOWN / NON-PRODUCT
-            # V49: unknown buyer text is NOT a human takeover. Keep the bot active
-            # and ask which Sheet-backed product the buyer wants.
+            # V53 TWO-STRIKE UNKNOWN / NON-PRODUCT
+            # First unresolved message asks which product; second consecutive
+            # unresolved message hands off to Admin and pauses this customer.
             # ---------------------------------
-            send_facebook_text(sender_id, "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။")
+            if unresolved_product_should_handoff(session):
+                handoff_to_admin(sender_id)
+            else:
+                send_facebook_text(sender_id, "ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။")
 
     return "EVENT_RECEIVED", 200
 
