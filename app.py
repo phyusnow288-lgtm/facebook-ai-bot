@@ -5,7 +5,7 @@
 # multi-code, multi-photo, product image/detail/price, order and Telegram logic.
 # ON/OFF commands are intentionally NOT restored.
 # =========================
-BOT_BUILD = "V51_SAFE_RESTORE_PRE_V46_ADMIN_PAUSE_NO_DATA_LOSS"
+BOT_BUILD = "V52_SAFE_ADMIN_PAUSE_ALIAS_SYNC_NO_DATA_LOSS"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -1999,10 +1999,32 @@ def bind_customer_identities(*ids):
             ad_product_code = candidate
             break
 
+    # V52: carry an existing Admin-pause window across newly correlated IDs.
+    # Meta manual replies are keyed by PSID, while ManyChat buyer requests can be
+    # keyed by Contact ID. If the alias is learned after the Admin reply, failing
+    # to copy this state makes the bot resume for the same customer.
+    active_admin_pause_until = 0
+    for cid in merged:
+        active_admin_pause_until = max(
+            active_admin_pause_until,
+            float(ADMIN_PAUSE_UNTIL.get(cid, 0) or 0),
+        )
+
     for cid in merged:
         CUSTOMER_ID_ALIASES[cid] = set(merged - {cid})
         if ad_product_code:
             get_order_session(cid)["ad_product_code"] = ad_product_code
+        if active_admin_pause_until > now_ts():
+            ADMIN_PAUSE_UNTIL[cid] = active_admin_pause_until
+
+    if active_admin_pause_until > now_ts():
+        print(
+            "V52 ADMIN PAUSE SYNCED ACROSS CUSTOMER IDS:",
+            sorted(merged),
+            "UNTIL",
+            active_admin_pause_until,
+            flush=True,
+        )
     print("CUSTOMER IDS BOUND:", sorted(merged), flush=True)
 
 
