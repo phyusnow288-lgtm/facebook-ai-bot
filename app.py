@@ -1,11 +1,10 @@
 
 # =========================
-# V51 BUILD MARKER
-# Restores the pre-V46 Admin pause path while preserving V50 Sheet-first,
-# multi-code, multi-photo, product image/detail/price, order and Telegram logic.
-# ON/OFF commands are intentionally NOT restored.
+# V56 FINAL AUDITED BUILD
+# Protected V54 baseline + scoped reliability fixes only.
+# Existing Admin pause, explicit-code, order, Telegram and delivery flows preserved.
 # =========================
-BOT_BUILD = "V53_SAFE_SHEET_FIRST_TWO_STRIKE_ADMIN_DELIVERY_NO_DATA_LOSS"
+BOT_BUILD = "V56_FINAL_AUDITED_STABLE"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -19,8 +18,6 @@ import threading
 from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, request
-
-BOT_VERSION = "V49-SAFE-SHEET-FIRST-ADMIN-ORDER-FLOW-NO-DATA-LOSS"
 
 app = Flask(__name__)
 
@@ -38,9 +35,10 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
-BOT_VERSION = "V53_SAFE_SHEET_FIRST_TWO_STRIKE_ADMIN_DELIVERY_NO_DATA_LOSS"
+BOT_VERSION = "V56_FINAL_AUDITED_STABLE"
 ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 POST_ORDER_ACK_TTL_SECONDS = int(os.environ.get("POST_ORDER_ACK_TTL_SECONDS", "86400"))
+POST_ORDER_AUTO_STOP_SECONDS = int(os.environ.get("POST_ORDER_AUTO_STOP_SECONDS", "1800"))
 
 DEFAULT_YANGON_DELIVERY = int(os.environ.get("YANGON_DELIVERY", "5000"))
 DEFAULT_OTHER_DELIVERY = int(os.environ.get("OTHER_DELIVERY", "7500"))
@@ -634,7 +632,7 @@ def extract_order_fields_from_image(image_url, caption=""):
                 "Return ONLY one JSON object in this exact shape:\n"
                 '{'
                 '"name":"","address":"","phone":"","delivery_area":"",'
-                '"items":[{"code":"0001","quantity":1}]'
+                '"items":[]'
                 '}\n'
                 'delivery_area must be "yangon", "other", or "". '
                 "Use Yangon for Yangon addresses such as Tarmwe/Tamwe/Thingangyun. "
@@ -657,7 +655,13 @@ def extract_order_fields_from_image(image_url, caption=""):
     )
 
     result = parse_json_answer(answer)
-    return result if isinstance(result, dict) else {}
+    if isinstance(result, dict):
+        # Product recognition is handled by ai_find_products_from_image(). This
+        # function is only for customer/order fields, so never allow vision/OCR
+        # to inject a catalog item into the basket.
+        result["items"] = []
+        return result
+    return {}
 
 
 def merge_extracted_order_data(session, extracted):
@@ -2316,6 +2320,23 @@ def mark_order_completed(customer_id):
             POST_ORDER_COMPLETED_AT[cid] = now
 
 
+def post_order_auto_stop_active(customer_id):
+    """Silence this customer for 30 minutes after a successful Telegram order."""
+    aliases = _identity_aliases(customer_id) or {str(customer_id or "")}
+    aliases.discard("")
+    now = now_ts()
+    latest = 0.0
+    for cid in aliases:
+        ts = float(POST_ORDER_COMPLETED_AT.get(cid, 0) or 0)
+        if ts and 0 <= now - ts <= POST_ORDER_AUTO_STOP_SECONDS:
+            latest = max(latest, ts)
+    if not latest:
+        return False
+    for cid in aliases:
+        POST_ORDER_COMPLETED_AT[cid] = latest
+    return True
+
+
 def post_order_ack_active(customer_id):
     aliases = _identity_aliases(customer_id) or {str(customer_id or "")}
     aliases.discard("")
@@ -2651,9 +2672,7 @@ Return ONLY one JSON object:
   "address": "",
   "phone": "",
   "delivery_area": "",
-  "items": [
-    {{"code": "0001", "quantity": 1}}
-  ]
+  "items": []
 }}
 
 Rules:
@@ -3118,19 +3137,11 @@ def merge_order_message(sender_id, message):
                         extracted["address"] = ""
                         extracted["delivery_area"] = ""
 
-                    explicit_codes = find_codes_and_quantities(message)
-                    target_code = session.get("last_product_code")
-                    if (
-                        extract_explicit_quantity(message) is not None
-                        and not explicit_codes
-                        and target_code in PRODUCTS
-                    ):
-                        safe_items = []
-                        for item in extracted.get("items", []) or []:
-                            item_code = normalize_code(item.get("code", ""))
-                            if item_code == target_code:
-                                safe_items.append(item)
-                        extracted["items"] = safe_items
+                    # SAFETY: AI is used here only to fill customer fields. Product
+                    # selection/quantity is already handled deterministically from the
+                    # current message/session. Never allow an AI JSON example/default
+                    # (historically often 0001) to add an unrelated product.
+                    extracted["items"] = []
 
                 session = merge_extracted_order_data(session, extracted)
             except Exception as e:
@@ -3938,6 +3949,12 @@ def handle_manychat_request(data):
 
     recovered_image_urls = []
     if current_event_image_urls:
+        # ManyChat can expose only the newest attachment while Meta sibling image
+        # events arrive milliseconds apart. Give the existing correlation buffer a
+        # brief chance to collect siblings, then re-read all URLs.
+        if len(current_event_image_urls) == 1:
+            time.sleep(0.30)
+            correlate_manychat_to_meta(contact_id, message, incoming_image_url)
         for buffered_url in recent_customer_images(contact_id):
             if buffered_url not in recovered_image_urls:
                 recovered_image_urls.append(buffered_url)
@@ -3967,8 +3984,14 @@ def handle_manychat_request(data):
         print("MANYCHAT ADMIN ACTIVE - BOT SILENT:", contact_id, flush=True)
         return manychat_response([])
 
-    # After a successful order, short replies such as OK/ဟုတ်/ကျေးဇူး are terminal
-    # acknowledgements, not a new shopping request. Never ask for the product again.
+    # After a successful Telegram order + delivery-time reply, silence ALL buyer
+    # follow-ups for 30 minutes. This is independent of the Admin pause system.
+    if post_order_auto_stop_active(contact_id):
+        print("POST-ORDER 30-MIN AUTO-STOP:", contact_id, message[:120], flush=True)
+        return manychat_response([])
+
+    # Keep the older 24h acknowledgement guard as an extra safety net after the
+    # 30-minute full stop expires.
     if post_order_ack_active(contact_id) and is_post_order_ack(message) and not incoming_image_urls:
         print("POST-ORDER ACK IGNORED:", contact_id, message, flush=True)
         return manychat_response([])
@@ -4033,6 +4056,9 @@ def handle_manychat_request(data):
                 if not isinstance(extracted_piece, dict):
                     continue
                 extracted_piece["name"] = ""  # FB account name always wins.
+                # This path is for address/phone extraction after a product is already
+                # selected. Never let OCR/vision invent or append another catalog item.
+                extracted_piece["items"] = []
                 has_piece = bool(
                     str(extracted_piece.get("address", "") or "").strip()
                     or str(extracted_piece.get("phone", "") or "").strip()
@@ -4261,8 +4287,15 @@ def handle_manychat_request(data):
     if not product and message and (not generic_order or has_catalog_product_clue_text(message)):
         code, product = ai_find_product_from_text(message)
 
-    # Use optional Ad context if current message did not identify a product.
-    if not product and context_product:
+    # Ad context is a fallback only. It must never override/merge into a product
+    # the buyer has explicitly identified or already selected in this order.
+    explicit_or_active_product = bool(
+        explicit_message_items
+        or combined_explicit_items
+        or session.get("last_product_code") in PRODUCTS
+        or session.get("items")
+    )
+    if not product and context_product and not explicit_or_active_product:
         code, product = context_code, context_product
         recognized_from_ad = True
 
@@ -4647,6 +4680,10 @@ def webhook():
 
             if admin_is_active(sender_id):
                 print("ADMIN ACTIVE - BOT SILENT:", sender_id, flush=True)
+                continue
+
+            if post_order_auto_stop_active(sender_id):
+                print("POST-ORDER 30-MIN AUTO-STOP (META):", sender_id, text[:120], flush=True)
                 continue
 
             if post_order_ack_active(sender_id) and is_post_order_ack(text) and not incoming_image_urls:
