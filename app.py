@@ -4,7 +4,7 @@
 # Protected V54 baseline + scoped reliability fixes only.
 # Existing Admin pause, explicit-code, order, Telegram and delivery flows preserved.
 # =========================
-BOT_BUILD = "V56_FINAL_AUDITED_STABLE"
+BOT_BUILD = "V57_FINAL_GLOBAL_SHEET_FIRST_INFO_FIRST"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -35,7 +35,7 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
-BOT_VERSION = "V56_FINAL_AUDITED_STABLE"
+BOT_VERSION = "V57_FINAL_GLOBAL_SHEET_FIRST_INFO_FIRST"
 ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 POST_ORDER_ACK_TTL_SECONDS = int(os.environ.get("POST_ORDER_ACK_TTL_SECONDS", "86400"))
 POST_ORDER_AUTO_STOP_SECONDS = int(os.environ.get("POST_ORDER_AUTO_STOP_SECONDS", "1800"))
@@ -1775,6 +1775,22 @@ def send_product_response(recipient_id, code, product):
             'မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။'
         ),
     )
+
+
+def send_product_info_only(recipient_id, code, product):
+    """Native Meta helper: image + Sheet detail + price, without order prompt."""
+    image_url = product_image_url(product)
+    if image_url:
+        image_bytes, content_type = download_image_bytes(image_url)
+        sent = False
+        if image_bytes:
+            sent = send_facebook_image_bytes(recipient_id, image_bytes, content_type)
+        if not sent:
+            send_facebook_image_url(recipient_id, image_url)
+    detail = product_detail(product)
+    if detail:
+        send_facebook_text(recipient_id, detail)
+    send_facebook_text(recipient_id, product_reply(code, product))
 
 
 # =========================
@@ -4043,6 +4059,147 @@ def handle_manychat_request(data):
     if asks_delivery_time(message):
         return done(manychat_text(delivery_time_reply(message)))
 
+    # ================================================================
+    # V57 GLOBAL SHEET-FIRST / INFO-FIRST ROUTER (AUTHORITATIVE FRAME)
+    # ================================================================
+    # ONE RULE for every current and future Google-Sheet product:
+    #   buyer input -> catalog recognition FIRST -> send EVERY matched product's
+    #   image + Sheet detail + price FIRST -> ONLY THEN may order collection run.
+    #
+    # This applies equally to:
+    #   - single code / multi-code
+    #   - single photo / multi-photo
+    #   - product names / aliases / rich Sheet text
+    #   - mixed code + photo input
+    #   - future codes added only in Google Sheet (no Python hard-code required)
+    #
+    # IMPORTANT: if THIS inbound identifies any catalog product, we RETURN from
+    # this block after the info reply. FAST ORDER below is therefore only allowed
+    # to handle follow-up order data that contains NO current product identifier.
+
+    current_product_items = {}
+    current_product_codes = []
+    current_product_sources = set()
+
+    def _v57_add_current_product(raw_code, qty=1, source=""):
+        code_now = normalize_code(raw_code)
+        if code_now not in PRODUCTS:
+            return
+        try:
+            qty_now = max(1, int(qty or 1))
+        except Exception:
+            qty_now = 1
+        if code_now not in current_product_codes:
+            current_product_codes.append(code_now)
+        # Explicit text quantity wins over image/default quantity.
+        if code_now not in current_product_items or source in {"code", "name"}:
+            current_product_items[code_now] = qty_now
+        if source:
+            current_product_sources.add(source)
+
+    # 1) Explicit code(s) from CURRENT buyer text.  Google Sheet remains truth.
+    v57_explicit_items = find_codes_and_quantities(message)
+    for _code, _qty in v57_explicit_items.items():
+        if _code in PRODUCTS:
+            _v57_add_current_product(_code, _qty, "code")
+
+    # 2) Product names/aliases from CURRENT buyer text, including multiple names.
+    v57_named_items = find_named_products_and_quantities(message)
+    for _code, _qty in v57_named_items.items():
+        if _code in PRODUCTS:
+            _v57_add_current_product(_code, _qty, "name")
+
+    # 3) Rich Sheet-backed text match (description/model/alias fields).
+    if message:
+        _rich_code, _rich_product = find_product_by_rich_sheet_text(message)
+        if _rich_product and _rich_code in PRODUCTS:
+            _v57_add_current_product(_rich_code, 1, "sheet_text")
+
+    # 4) EVERY current/recovered photo.  Do not allow an order-image parser or
+    # FAST ORDER to consume a product photo before catalog recognition gets it.
+    v57_image_codes = []
+    if incoming_image_urls:
+        for _one_image_url in incoming_image_urls:
+            try:
+                for _matched_code in ai_find_products_from_image(_one_image_url, message):
+                    _matched_code = normalize_code(_matched_code)
+                    if _matched_code in PRODUCTS and _matched_code not in v57_image_codes:
+                        v57_image_codes.append(_matched_code)
+                        _v57_add_current_product(_matched_code, 1, "image")
+            except Exception as e:
+                print("V57 IMAGE RECOGNITION ERROR:", str(e), flush=True)
+
+    # 5) AI text recognition is only a final catalog-text helper. Bare purchase
+    # phrases never make AI guess a product.
+    v57_generic_order = generic_purchase_intent(message)
+    if (
+        not current_product_codes
+        and message
+        and (not v57_generic_order or has_catalog_product_clue_text(message))
+    ):
+        _ai_code, _ai_product = ai_find_product_from_text(message)
+        if _ai_product and _ai_code in PRODUCTS:
+            _v57_add_current_product(_ai_code, 1, "ai_text")
+
+    # 6) Advertisement context is LAST fallback only.  It can identify an initial
+    # product when buyer text/photo does not, but can never overwrite current input.
+    v57_context_code, v57_context_product = extract_product_context_from_manychat(data)
+    if not v57_context_product:
+        v57_context_code, v57_context_product = restore_meta_ad_product(contact_id)
+    if v57_context_product and v57_context_code in PRODUCTS:
+        session["ad_product_code"] = v57_context_code
+        for _ident in (_identity_aliases(contact_id) or {contact_id}):
+            get_order_session(_ident)["ad_product_code"] = v57_context_code
+        print("V57 AD PRODUCT REMEMBERED:", v57_context_code, flush=True)
+        if not current_product_codes and not session.get("items") and session.get("last_product_code") not in PRODUCTS:
+            _v57_add_current_product(v57_context_code, 1, "ad")
+
+    # If CURRENT inbound found product(s), info-first is mandatory and FAST ORDER
+    # is forbidden for this request. This is the central V57 regression fix.
+    if current_product_codes:
+        clear_product_clarification(session)
+
+        sellable_current = [
+            c for c in current_product_codes
+            if c in PRODUCTS and product_is_sellable(PRODUCTS[c])
+        ]
+        if sellable_current:
+            session["items"] = {
+                c: max(1, int(current_product_items.get(c, 1) or 1))
+                for c in sellable_current
+            }
+            session["last_product_code"] = sellable_current[-1]
+            session["quantity_confirmed"] = True
+            lock_facebook_account_name(session, account_name)
+
+        print(
+            "V57 CURRENT PRODUCTS INFO-FIRST:",
+            current_product_codes,
+            "SOURCES:", sorted(current_product_sources),
+            "ITEMS:", session.get("items", {}),
+            flush=True,
+        )
+
+        if incoming_image_urls:
+            clear_recent_customer_images(contact_id, incoming_image_urls)
+
+        # Multi-code, multi-photo, or mixed inputs: return EVERY matched item's
+        # image + detail + price in one Dynamic Content response (up to five items).
+        if len(current_product_codes) > 1:
+            return done(manychat_products_response(
+                current_product_codes,
+                include_order_prompt=bool(sellable_current),
+            ))
+
+        # Single matched product. If buyer is already expressing purchase intent,
+        # still show image/detail/price first, then ask only missing order fields.
+        one_code = current_product_codes[0]
+        one_product = PRODUCTS[one_code]
+        if product_is_sellable(one_product) and is_order_message(message):
+            missing_now = order_missing_fields(session)
+            return done(manychat_product_order_response(one_code, one_product, missing_now))
+        return done(manychat_product_response(one_code, one_product))
+
     # If a product is already selected and the buyer sends an image, first check
     # whether that image contains delivery address/phone details. This lets buyers
     # send address screenshots/photos in Burmese or English. Product-only photos
@@ -4766,6 +4923,90 @@ def webhook():
                     sender_id,
                     delivery_time_reply(text),
                 )
+                continue
+
+            # ============================================================
+            # V57 NATIVE META: SAME GLOBAL SHEET-FIRST / INFO-FIRST FRAME
+            # ============================================================
+            # The ManyChat path is primary, but native Meta delivery must obey
+            # exactly the same rule so no route can regress multi-code/photo flow.
+            meta_current_items = {}
+            meta_current_codes = []
+
+            def _v57_meta_add(raw_code, qty=1):
+                code_now = normalize_code(raw_code)
+                if code_now not in PRODUCTS:
+                    return
+                try:
+                    qty_now = max(1, int(qty or 1))
+                except Exception:
+                    qty_now = 1
+                if code_now not in meta_current_codes:
+                    meta_current_codes.append(code_now)
+                meta_current_items[code_now] = qty_now
+
+            for _code, _qty in find_codes_and_quantities(text).items():
+                if _code in PRODUCTS:
+                    _v57_meta_add(_code, _qty)
+            for _code, _qty in find_named_products_and_quantities(text).items():
+                if _code in PRODUCTS:
+                    _v57_meta_add(_code, _qty)
+
+            if text:
+                _rich_code, _rich_product = find_product_by_rich_sheet_text(text)
+                if _rich_product and _rich_code in PRODUCTS:
+                    _v57_meta_add(_rich_code, meta_current_items.get(_rich_code, 1))
+
+            if incoming_image_urls:
+                for _one_image_url in incoming_image_urls:
+                    try:
+                        for _matched_code in ai_find_products_from_image(_one_image_url, text):
+                            if normalize_code(_matched_code) in PRODUCTS:
+                                _v57_meta_add(_matched_code, 1)
+                    except Exception as e:
+                        print("V57 META IMAGE RECOGNITION ERROR:", str(e), flush=True)
+
+            _meta_generic = generic_purchase_intent(text)
+            if not meta_current_codes and text and (not _meta_generic or has_catalog_product_clue_text(text)):
+                _ai_code, _ai_product = ai_find_product_from_text(text)
+                if _ai_product and _ai_code in PRODUCTS:
+                    _v57_meta_add(_ai_code, 1)
+
+            # Stored Meta referral is a fallback only if current text/photo found none.
+            if not meta_current_codes and not session.get("items") and session.get("last_product_code") not in PRODUCTS:
+                _ad_code, _ad_product = restore_meta_ad_product(sender_id)
+                if _ad_product and _ad_code in PRODUCTS:
+                    _v57_meta_add(_ad_code, 1)
+
+            if meta_current_codes:
+                clear_product_clarification(session)
+                sellable_meta = [
+                    c for c in meta_current_codes
+                    if product_is_sellable(PRODUCTS[c])
+                ]
+                if sellable_meta:
+                    session["items"] = {
+                        c: max(1, int(meta_current_items.get(c, 1) or 1))
+                        for c in sellable_meta
+                    }
+                    session["last_product_code"] = sellable_meta[-1]
+                    session["quantity_confirmed"] = True
+
+                print(
+                    "V57 META CURRENT PRODUCTS INFO-FIRST:",
+                    meta_current_codes,
+                    "ITEMS:", session.get("items", {}),
+                    flush=True,
+                )
+
+                # Send every matched product once, then one order prompt total.
+                for _code in meta_current_codes:
+                    send_product_info_only(sender_id, _code, PRODUCTS[_code])
+                if sellable_meta:
+                    send_facebook_text(
+                        sender_id,
+                        'မှာယူလိုပါက အမည် / လိပ်စာအပြည့်အစုံ / ဖုန်းနံပါတ် ကို အပြည့်အစုံရေးပို့ပေးပါရှင်။',
+                    )
                 continue
 
             # ---------------------------------
