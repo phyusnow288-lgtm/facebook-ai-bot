@@ -4,7 +4,7 @@
 # Protected V54 baseline + scoped reliability fixes only.
 # Existing Admin pause, explicit-code, order, Telegram and delivery flows preserved.
 # =========================
-BOT_BUILD = "V57_FINAL_GLOBAL_SHEET_FIRST_INFO_FIRST"
+BOT_BUILD = "V58_DUAL_PAGE_MINGALAR_SAFE_SAME_MESSAGE_ORDER"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -31,11 +31,20 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GOOGLE_SHEET_URL = os.environ.get("GOOGLE_SHEET_URL")
 
+# V58: Mingalar Happy Shopping uses the same catalog/core bot but a separate
+# customer-facing price rule and a separate Telegram destination.  The optional
+# Mingalar bot token falls back to the existing Telegram bot token so one bot can
+# serve both groups when desired.
+MINGALAR_PAGE_NAME = os.environ.get("MINGALAR_PAGE_NAME", "Mingalar Happy Shopping").strip()
+MINGALAR_DELIVERY = int(os.environ.get("MINGALAR_DELIVERY", "6500"))
+MINGALAR_TELEGRAM_CHAT_ID = os.environ.get("MINGALAR_TELEGRAM_CHAT_ID")
+MINGALAR_TELEGRAM_BOT_TOKEN = os.environ.get("MINGALAR_TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
+
 GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
-BOT_VERSION = "V57_FINAL_GLOBAL_SHEET_FIRST_INFO_FIRST"
+BOT_VERSION = "V58_DUAL_PAGE_MINGALAR_SAFE_SAME_MESSAGE_ORDER"
 ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 POST_ORDER_ACK_TTL_SECONDS = int(os.environ.get("POST_ORDER_ACK_TTL_SECONDS", "86400"))
 POST_ORDER_AUTO_STOP_SECONDS = int(os.environ.get("POST_ORDER_AUTO_STOP_SECONDS", "1800"))
@@ -1584,7 +1593,27 @@ def product_detail(product):
 
 
 
-def product_reply(code, product):
+def normalize_page_name(value):
+    return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
+
+
+def is_mingalar_page(value):
+    return normalize_page_name(value) == normalize_page_name(MINGALAR_PAGE_NAME)
+
+
+def session_page_name(session):
+    if isinstance(session, dict) and is_mingalar_page(session.get("_page_name", "")):
+        return MINGALAR_PAGE_NAME
+    return ""
+
+
+def telegram_credentials_for_page(page_name=""):
+    if is_mingalar_page(page_name):
+        return MINGALAR_TELEGRAM_BOT_TOKEN, MINGALAR_TELEGRAM_CHAT_ID
+    return TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+
+def product_reply(code, product, page_name=""):
     name = str(get_row_value(product, "Product Name", "Name")).strip()
 
     price = parse_int_amount(get_row_value(product, "Price"), 0)
@@ -1615,6 +1644,16 @@ def product_reply(code, product):
 
     if availability == "unknown":
         return f"Code {code} {name}\nပစ္စည်းအခြေအနေကို Admin က စစ်ဆေးပေးပါမယ်ရှင်။"
+
+    # V58 Page 2 rule: show exactly one customer-facing all-in price.
+    # Snow Phyu keeps its original Yangon/Other delivery display unchanged.
+    if is_mingalar_page(page_name):
+        all_in = price + MINGALAR_DELIVERY
+        return (
+            f"Code {code} {name}\n\n"
+            f"အိမ်အရောက် အပြီးအစီး - {all_in:,} Ks\n\n"
+            "ပစ္စည်းရောက်မှ ငွေချေ (COD) ရပါတယ်ရှင်။"
+        )
 
     yangon_total = price + yangon_delivery
     other_total = price + other_delivery
@@ -1808,16 +1847,17 @@ def send_product_info_only(recipient_id, code, product):
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram_message(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def send_telegram_message(message, page_name=""):
+    telegram_token, telegram_chat_id = telegram_credentials_for_page(page_name)
+    if not telegram_token or not telegram_chat_id:
         print("TELEGRAM ENV IS MISSING", flush=True)
         return False
 
     try:
         response = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            f"https://api.telegram.org/bot{telegram_token}/sendMessage",
             json={
-                "chat_id": TELEGRAM_CHAT_ID,
+                "chat_id": telegram_chat_id,
                 "text": message,
             },
             timeout=30,
@@ -1835,20 +1875,21 @@ def send_telegram_message(message):
 
 
 
-def send_telegram_order_now(message):
+def send_telegram_order_now(message, page_name=""):
     """Send one order to Telegram synchronously with a short timeout.
 
     This path is intentionally simple and is used only after all order fields
     are already complete, so the customer order is not lost in a daemon thread.
     """
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    telegram_token, telegram_chat_id = telegram_credentials_for_page(page_name)
+    if not telegram_token or not telegram_chat_id:
         print("TELEGRAM ENV IS MISSING", flush=True)
         return False
 
     try:
         response = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            f"https://api.telegram.org/bot{telegram_token}/sendMessage",
+            json={"chat_id": telegram_chat_id, "text": message},
             timeout=5,
         )
         print("TELEGRAM ORDER STATUS:", response.status_code, flush=True)
@@ -1859,24 +1900,25 @@ def send_telegram_order_now(message):
         return False
 
 
-def _telegram_order_worker(order_key, message):
+def _telegram_order_worker(order_key, message, page_name=""):
     ok = False
     for attempt in range(1, 4):
         print(f"TELEGRAM ORDER ATTEMPT {attempt}:", order_key, flush=True)
-        if send_telegram_message(message):
+        if send_telegram_message(message, page_name=page_name):
             ok = True
             break
         time.sleep(1.5 * attempt)
     print("TELEGRAM ORDER FINAL:", order_key, "OK" if ok else "FAILED", flush=True)
 
 
-def queue_telegram_order(contact_id, message):
+def queue_telegram_order(contact_id, message, page_name=""):
     """Queue Telegram in background so ManyChat always gets its reply inside 10 seconds."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    telegram_token, telegram_chat_id = telegram_credentials_for_page(page_name)
+    if not telegram_token or not telegram_chat_id:
         print("TELEGRAM ENV IS MISSING - ORDER NOT QUEUED", flush=True)
         return False
 
-    key = f"{contact_id}|{message}"
+    key = f"{normalize_page_name(page_name)}|{contact_id}|{message}"
     now = now_ts()
     with RECENT_TELEGRAM_LOCK:
         # prune old entries
@@ -1890,7 +1932,7 @@ def queue_telegram_order(contact_id, message):
 
     threading.Thread(
         target=_telegram_order_worker,
-        args=(key, message),
+        args=(key, message, page_name),
         daemon=True,
     ).start()
     return True
@@ -2465,6 +2507,8 @@ def new_order_session():
         "ad_product_code": "",
         "quantity_confirmed": False,
         "_account_name_locked": False,
+        # V58: request source/page. Blank means the protected Snow Phyu flow.
+        "_page_name": "",
         # V53: first unresolved buyer message asks which product; a second
         # consecutive unresolved message hands off to Admin and pauses this customer.
         "_awaiting_product_clarification": False,
@@ -2996,6 +3040,34 @@ def is_order_noise_segment(text):
     return False
 
 
+
+def remove_explicit_catalog_codes_from_text(text):
+    """Remove only explicit catalog-code tokens while preserving surrounding address text.
+
+    Important: do NOT remove arbitrary 1-3 digit numbers because they may be house,
+    ward, street, or quantity numbers. Plain code removal is restricted to four digits;
+    shorter codes are removed only when the buyer explicitly writes "Code".
+    """
+    value = _western_digits(str(text or ""))
+
+    def _replace_code_word(match):
+        raw = match.group(1)
+        return " " if normalize_code(raw) in PRODUCTS else match.group(0)
+
+    value = re.sub(
+        r"(?i)\bcode\s*[:#()\-]*\s*([0-9]{1,4})\s*\)?",
+        _replace_code_word,
+        value,
+    )
+
+    def _replace_four_digit(match):
+        raw = match.group(1)
+        return " " if normalize_code(raw) in PRODUCTS else match.group(0)
+
+    value = re.sub(r"(?<![0-9])([0-9]{4})(?![0-9])", _replace_four_digit, value)
+    return re.sub(r"\s+", " ", value).strip(" /,.-")
+
+
 def extract_order_fields_locally(message, session=None):
     """Fast deterministic parser for one-shot and multi-message orders."""
     value = str(message or "").strip()
@@ -3046,11 +3118,16 @@ def extract_order_fields_locally(message, session=None):
 
     clean_parts = []
     for part in parts:
-        if find_codes_and_quantities(part):
+        # V58: a code and address often arrive in the SAME segment, e.g.
+        # "0001 သာကေတ ... 097...". Older logic discarded the whole segment
+        # whenever it contained a code, losing the address. Remove only the code
+        # token and preserve the remaining customer data.
+        part_without_code = remove_explicit_catalog_codes_from_text(part)
+        if not part_without_code:
             continue
-        if is_order_noise_segment(part):
+        if is_order_noise_segment(part_without_code):
             continue
-        clean_parts.append(part.strip(" ,.-"))
+        clean_parts.append(part_without_code.strip(" ,.-"))
     clean_parts = [p for p in clean_parts if p]
 
     # Multi-part: first non-address-looking segment is usually name.
@@ -3093,11 +3170,12 @@ def extract_order_fields_locally(message, session=None):
             pd = re.sub(r"[^\d+]", "", part)
             if result["phone"] and pd == result["phone"]:
                 continue
-            if find_codes_and_quantities(part):
+            part_without_code = remove_explicit_catalog_codes_from_text(part)
+            if not part_without_code:
                 continue
-            if is_order_noise_segment(part):
+            if is_order_noise_segment(part_without_code):
                 continue
-            leftovers.append(part)
+            leftovers.append(part_without_code)
         if leftovers:
             candidate = " / ".join(leftovers).strip()
             if candidate and candidate != current.get("name") and is_likely_delivery_address(candidate):
@@ -3259,8 +3337,9 @@ def unavailable_order_reply(code, availability):
 
 def build_telegram_order(session):
     """Build the exact compact order format used by the shop/admin."""
+    page_name = session_page_name(session)
     delivery_area = str(session.get("delivery_area", "")).strip().lower()
-    delivery_fee = delivery_fee_for_area(delivery_area)
+    delivery_fee = MINGALAR_DELIVERY if is_mingalar_page(page_name) else delivery_fee_for_area(delivery_area)
 
     name = str(session.get("name", "")).strip()
     address = str(session.get("address", "")).strip()
@@ -3290,12 +3369,25 @@ def build_telegram_order(session):
     grand_total = subtotal + delivery_fee
     items_text = " + ".join(item_parts)
 
-    if delivery_area == "yangon":
+    cod_text = "COD" if total_pcs <= 1 else f"COD {total_pcs} PCS"
+
+    if is_mingalar_page(page_name):
+        # For the common one-item order, Telegram mirrors the exact Page 2 all-in
+        # customer price. Multi-item orders still charge the fixed 6,500 only once.
+        if len(session.get("items", {})) == 1 and total_pcs == 1:
+            only_code = next(iter(session.get("items", {})))
+            product = PRODUCTS.get(only_code, {})
+            item_name = str(get_row_value(product, "Product Name", "Name")).strip()
+            return (
+                f"{name} / {address} / {phone} / "
+                f"Code {only_code} {item_name} အိမ်အရောက် အပြီးအစီး - {grand_total:,} Ks / "
+                f"စုစုပေါင်း - {grand_total:,} Ks / {cod_text}"
+            )
+        delivery_text = f"အိမ်အရောက်ပို့ခ - {delivery_fee:,} Ks"
+    elif delivery_area == "yangon":
         delivery_text = f"ရန်ကုန်ပို့ခ - {delivery_fee:,} Ks"
     else:
         delivery_text = f"နယ်ပို့ခ - {delivery_fee:,} Ks"
-
-    cod_text = "COD" if total_pcs <= 1 else f"COD {total_pcs} PCS"
 
     return (
         f"{name} / {address} / {phone} / "
@@ -3627,7 +3719,7 @@ def manychat_text(text):
     )
 
 
-def manychat_product_response(code, product):
+def manychat_product_response(code, product, page_name=""):
     messages = []
 
     image_url = manychat_product_image_url(product)
@@ -3639,7 +3731,7 @@ def manychat_product_response(code, product):
     if detail:
         messages.append({"type": "text", "text": detail})
 
-    messages.append({"type": "text", "text": product_reply(code, product)})
+    messages.append({"type": "text", "text": product_reply(code, product, page_name=page_name)})
 
     # Never invite an order for stock that is not sellable.
     if product_is_sellable(product):
@@ -3656,7 +3748,7 @@ def manychat_product_response(code, product):
 
 
 
-def manychat_products_response(codes, include_order_prompt=True):
+def manychat_products_response(codes, include_order_prompt=True, page_name=""):
     """Return every recognized product, preserving image + detail + price.
 
     ManyChat Dynamic Content accepts at most 10 messages. For 1-3 products keep
@@ -3695,7 +3787,7 @@ def manychat_products_response(codes, include_order_prompt=True):
             detail = product_detail(product)
             if detail:
                 messages.append({"type": "text", "text": detail})
-            messages.append({"type": "text", "text": product_reply(code, product)})
+            messages.append({"type": "text", "text": product_reply(code, product, page_name=page_name)})
 
         if include_order_prompt and has_sellable:
             messages.append({"type": "text", "text": order_prompt})
@@ -3711,7 +3803,7 @@ def manychat_products_response(codes, include_order_prompt=True):
                 print("PRODUCT IMAGE MISSING:", code, flush=True)
 
             detail = product_detail(product)
-            combined_text = (detail + "\n\n" if detail else "") + product_reply(code, product)
+            combined_text = (detail + "\n\n" if detail else "") + product_reply(code, product, page_name=page_name)
             if include_order_prompt and has_sellable and idx == len(normalized) - 1:
                 combined_text += "\n\n" + order_prompt
             messages.append({"type": "text", "text": combined_text})
@@ -3720,7 +3812,7 @@ def manychat_products_response(codes, include_order_prompt=True):
 
 
 
-def manychat_product_order_response(code, product, missing):
+def manychat_product_order_response(code, product, missing, page_name=""):
     """Show product info first, then ask only for still-missing order fields.
 
     Used when the buyer's *first* mention already contains an order quantity,
@@ -3737,13 +3829,32 @@ def manychat_product_order_response(code, product, missing):
     if detail:
         messages.append({"type": "text", "text": detail})
 
-    messages.append({"type": "text", "text": product_reply(code, product)})
+    messages.append({"type": "text", "text": product_reply(code, product, page_name=page_name)})
 
     prompt = order_prompt_for_missing(missing) if missing else ""
     if prompt:
         messages.append({"type": "text", "text": prompt})
 
     return manychat_response(messages)
+
+
+def manychat_append_completed_order(base_response, session):
+    """Append order confirmation after product info while respecting the 10-message limit."""
+    messages = []
+    if isinstance(base_response, dict):
+        messages = list(base_response.get("content", {}).get("messages", []) or [])
+    completion_text = buyer_order_confirmation(session) + "\n\n" + post_order_delivery_time_message()
+    if len(messages) < 10:
+        messages.append({"type": "text", "text": completion_text})
+    else:
+        # 5 products can already occupy all 10 Dynamic Content messages. Append
+        # completion to the final text message rather than dropping any product.
+        for idx in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[idx], dict) and messages[idx].get("type") == "text":
+                messages[idx] = dict(messages[idx])
+                messages[idx]["text"] = str(messages[idx].get("text", "")) + "\n\n" + completion_text
+                break
+    return manychat_response(messages[:10])
 
 
 def asks_delivery_time(text):
@@ -3917,6 +4028,8 @@ def handle_manychat_request(data):
 
     message = str(data.get("message", "") or "").strip()
     contact_id = str(data.get("contact_id", "") or "").strip()
+    raw_page_name = str(data.get("page", "") or "").strip()
+    shop_page_name = MINGALAR_PAGE_NAME if is_mingalar_page(raw_page_name) else ""
     account_name = extract_manychat_account_name(data)
     remember_manychat_identity(contact_id, account_name)
     incoming_image_urls = extract_manychat_image_urls(data, message)
@@ -3934,7 +4047,7 @@ def handle_manychat_request(data):
 
     print(
         "MANYCHAT INPUT:",
-        {"message": message, "contact_id": contact_id, "account_name": account_name, "image_url": incoming_image_url},
+        {"message": message, "contact_id": contact_id, "account_name": account_name, "image_url": incoming_image_url, "page": shop_page_name or "Snow Phyu"},
         flush=True,
     )
 
@@ -4013,6 +4126,9 @@ def handle_manychat_request(data):
         return manychat_response([])
 
     session = get_order_session(contact_id)
+    # Every Mingalar ManyChat request carries page="Mingalar Happy Shopping".
+    # Blank/other keeps the protected Snow Phyu behavior.
+    session["_page_name"] = shop_page_name
     initial_last_product_code = str(session.get("last_product_code", "") or "").strip()
 
     # Buyer name is ALWAYS the Facebook/ManyChat account name for ManyChat orders.
@@ -4180,8 +4296,96 @@ def handle_manychat_request(data):
             flush=True,
         )
 
+        # V58 SAME-INBOUND ORDER DATA PRESERVATION:
+        # A buyer may send Code/Name + address + phone in one message. V57 returned
+        # product info immediately and never allowed FAST ORDER to see those fields.
+        # Parse/merge them NOW, but only if deterministic address/phone evidence is
+        # actually present, so a bare product query remains browsing only.
+        same_inbound_has_order_fields = False
+        if message and sellable_current:
+            try:
+                same_local = extract_order_fields_locally(message, session=session)
+                same_local["name"] = ""  # Facebook/ManyChat Full Name always wins.
+                same_inbound_has_order_fields = bool(
+                    str(same_local.get("address", "") or "").strip()
+                    or str(same_local.get("phone", "") or "").strip()
+                )
+                if same_inbound_has_order_fields:
+                    session = merge_extracted_order_data(session, same_local)
+                    # AI/local fallback may fill a genuinely missing counterpart, while
+                    # the locked Facebook name and current Sheet-backed items stay intact.
+                    session = merge_order_message(contact_id, message)
+                    lock_facebook_account_name(session, account_name)
+                    session["_page_name"] = shop_page_name
+                    session = infer_delivery_area_for_complete_order(session)
+                    print("V58 SAME-INBOUND ORDER FIELDS MERGED:", same_local, flush=True)
+            except Exception as e:
+                print("V58 SAME-INBOUND ORDER MERGE ERROR:", str(e), flush=True)
+
         if incoming_image_urls:
             clear_recent_customer_images(contact_id, incoming_image_urls)
+
+        # If the same product-identifying message already completed the customer
+        # fields, send product info FIRST and then complete Telegram in this request.
+        if same_inbound_has_order_fields and sellable_current:
+            same_missing = order_missing_fields(session)
+            print("V58 SAME-INBOUND ORDER MISSING:", same_missing, flush=True)
+            if not same_missing:
+                bad_code, bad_status = first_unavailable_session_item(session)
+                if bad_code:
+                    ORDER_SESSIONS[contact_id] = new_order_session()
+                    lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
+                    ORDER_SESSIONS[contact_id]["_page_name"] = shop_page_name
+                    return done(manychat_text(unavailable_order_reply(bad_code, bad_status)))
+
+                telegram_text = build_telegram_order(session)
+                print("V58 SAME-INBOUND TELEGRAM ORDER TEXT:", telegram_text, flush=True)
+                if queue_telegram_order(contact_id, telegram_text, page_name=shop_page_name):
+                    if len(current_product_codes) > 1:
+                        info_response = manychat_products_response(
+                            current_product_codes,
+                            include_order_prompt=False,
+                            page_name=shop_page_name,
+                        )
+                    else:
+                        one_code_done = current_product_codes[0]
+                        info_response = manychat_product_order_response(
+                            one_code_done, PRODUCTS[one_code_done], [], page_name=shop_page_name
+                        )
+                    completed_response = manychat_append_completed_order(info_response, session)
+                    mark_order_completed(contact_id)
+                    ORDER_SESSIONS[contact_id] = new_order_session()
+                    lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
+                    ORDER_SESSIONS[contact_id]["_page_name"] = shop_page_name
+                    return done(completed_response)
+
+                # Telegram config failure: keep every collected field in session.
+                if len(current_product_codes) > 1:
+                    info_response = manychat_products_response(
+                        current_product_codes, include_order_prompt=False, page_name=shop_page_name
+                    )
+                else:
+                    one_code_fail = current_product_codes[0]
+                    info_response = manychat_product_order_response(
+                        one_code_fail, PRODUCTS[one_code_fail], [], page_name=shop_page_name
+                    )
+                fail_messages = list(info_response.get("content", {}).get("messages", []) or [])
+                fail_messages.append({
+                    "type": "text",
+                    "text": "အော်ဒါအချက်အလက် ရရှိပါပြီရှင်။ Admin က ဆက်လက်စစ်ဆေးပေးပါမယ်ရှင်။"
+                })
+                return done(manychat_response(fail_messages[:10]))
+
+            # Partial same-message order data: product info is still first, then ask
+            # only for the genuinely missing customer field(s).
+            if len(current_product_codes) == 1:
+                one_code_partial = current_product_codes[0]
+                return done(manychat_product_order_response(
+                    one_code_partial,
+                    PRODUCTS[one_code_partial],
+                    same_missing,
+                    page_name=shop_page_name,
+                ))
 
         # Multi-code, multi-photo, or mixed inputs: return EVERY matched item's
         # image + detail + price in one Dynamic Content response (up to five items).
@@ -4189,6 +4393,7 @@ def handle_manychat_request(data):
             return done(manychat_products_response(
                 current_product_codes,
                 include_order_prompt=bool(sellable_current),
+                page_name=shop_page_name,
             ))
 
         # Single matched product. If buyer is already expressing purchase intent,
@@ -4197,8 +4402,8 @@ def handle_manychat_request(data):
         one_product = PRODUCTS[one_code]
         if product_is_sellable(one_product) and is_order_message(message):
             missing_now = order_missing_fields(session)
-            return done(manychat_product_order_response(one_code, one_product, missing_now))
-        return done(manychat_product_response(one_code, one_product))
+            return done(manychat_product_order_response(one_code, one_product, missing_now, page_name=shop_page_name))
+        return done(manychat_product_response(one_code, one_product, page_name=shop_page_name))
 
     # If a product is already selected and the buyer sends an image, first check
     # whether that image contains delivery address/phone details. This lets buyers
@@ -4278,9 +4483,9 @@ def handle_manychat_request(data):
             missing_now = order_missing_fields(session)
             print("V46 EXPLICIT CODE ORDER INFO-FIRST:", explicit_code_value, qty_now, missing_now, flush=True)
             return done(manychat_product_order_response(
-                explicit_code_value, explicit_code_product, missing_now
+                explicit_code_value, explicit_code_product, missing_now, page_name=shop_page_name
             ))
-        return done(manychat_product_response(explicit_code_value, explicit_code_product))
+        return done(manychat_product_response(explicit_code_value, explicit_code_product, page_name=shop_page_name))
 
     # V38 global multi-name/multi-code order selection.
     # A current message explicitly naming/listing multiple products is authoritative
@@ -4365,15 +4570,17 @@ def handle_manychat_request(data):
                 if bad_code:
                     ORDER_SESSIONS[contact_id] = new_order_session()
                     lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
+                    ORDER_SESSIONS[contact_id]["_page_name"] = shop_page_name
                     return done(manychat_text(unavailable_order_reply(bad_code, bad_status)))
 
                 telegram_text = build_telegram_order(session)
                 print("V22 TELEGRAM ORDER TEXT:", telegram_text, flush=True)
-                if queue_telegram_order(contact_id, telegram_text):
+                if queue_telegram_order(contact_id, telegram_text, page_name=shop_page_name):
                     buyer_text = buyer_order_confirmation(session)
                     mark_order_completed(contact_id)
                     ORDER_SESSIONS[contact_id] = new_order_session()
                     lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
+                    ORDER_SESSIONS[contact_id]["_page_name"] = shop_page_name
                     return done(manychat_response([
                         {"type": "text", "text": buyer_text},
                         {"type": "text", "text": post_order_delivery_time_message()},
@@ -4477,17 +4684,18 @@ def handle_manychat_request(data):
         lock_facebook_account_name(session, account_name)
         print("V38 IMAGE BASKET ITEMS:", session.get("items"), flush=True)
         clear_recent_customer_images(contact_id, incoming_image_urls)
-        return done(manychat_products_response(image_codes or [code], include_order_prompt=True))
+        return done(manychat_products_response(image_codes or [code], include_order_prompt=True, page_name=shop_page_name))
 
     # A bare product code/name is browsing and refreshes the current product.
     if product and is_pure_product_query(message, code, product) and len(combined_explicit_items) <= 1:
         ORDER_SESSIONS[contact_id] = new_order_session()
         lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
+        ORDER_SESSIONS[contact_id]["_page_name"] = shop_page_name
         if product_is_sellable(product):
             ORDER_SESSIONS[contact_id]["last_product_code"] = code
         else:
             print("PRODUCT NOT SELLABLE:", code, product_status(product), flush=True)
-        return done(manychat_product_response(code, product))
+        return done(manychat_product_response(code, product, page_name=shop_page_name))
 
     if product:
         if product_is_sellable(product):
@@ -4496,7 +4704,7 @@ def handle_manychat_request(data):
             # Unavailable products can be shown, but never become an order item.
             session["last_product_code"] = ""
             session["items"] = {}
-            return done(manychat_product_response(code, product))
+            return done(manychat_product_response(code, product, page_name=shop_page_name))
 
     # V38: if the current message explicitly identifies multiple items, show every
     # item's image/detail/price once and keep all of them in the same order session.
@@ -4508,7 +4716,7 @@ def handle_manychat_request(data):
             session["last_product_code"] = sellable_multi[-1]
             session["quantity_confirmed"] = True
             lock_facebook_account_name(session, account_name)
-        return done(manychat_products_response(multi_codes, include_order_prompt=True))
+        return done(manychat_products_response(multi_codes, include_order_prompt=True, page_name=shop_page_name))
 
     # V35 GLOBAL INFO-FIRST RULE
     # Any current message that identifies a sellable product must show the product
@@ -4540,10 +4748,10 @@ def handle_manychat_request(data):
             lock_facebook_account_name(session, account_name)
             missing_now = order_missing_fields(session)
             print("V35 GLOBAL INFO FIRST + ORDER:", code, qty_now, missing_now, flush=True)
-            return done(manychat_product_order_response(code, product, missing_now))
+            return done(manychat_product_order_response(code, product, missing_now, page_name=shop_page_name))
 
         print("V35 GLOBAL INFO FIRST - PRODUCT QUERY:", code, flush=True)
-        return done(manychat_product_response(code, product))
+        return done(manychat_product_response(code, product, page_name=shop_page_name))
 
     last_product_ready = session.get("last_product_code") in PRODUCTS
 
@@ -4646,6 +4854,7 @@ def handle_manychat_request(data):
         if bad_code:
             ORDER_SESSIONS[contact_id] = new_order_session()
             lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
+            ORDER_SESSIONS[contact_id]["_page_name"] = shop_page_name
             return done(manychat_text(unavailable_order_reply(bad_code, bad_status)))
 
         telegram_text = build_telegram_order(session)
@@ -4653,11 +4862,12 @@ def handle_manychat_request(data):
 
         # Queue in background so ManyChat gets a fast valid response. The queue
         # has its own 5-minute duplicate-order protection and Telegram retries.
-        if queue_telegram_order(contact_id, telegram_text):
+        if queue_telegram_order(contact_id, telegram_text, page_name=shop_page_name):
             buyer_text = buyer_order_confirmation(session)
             mark_order_completed(contact_id)
             ORDER_SESSIONS[contact_id] = new_order_session()
             lock_facebook_account_name(ORDER_SESSIONS[contact_id], account_name)
+            ORDER_SESSIONS[contact_id]["_page_name"] = shop_page_name
             return done(manychat_response([
                 {"type": "text", "text": buyer_text},
                 {"type": "text", "text": post_order_delivery_time_message()},
@@ -4670,7 +4880,7 @@ def handle_manychat_request(data):
 
     # Product recognized from non-pure text/image.
     if product:
-        return done(manychat_product_response(code, product))
+        return done(manychat_product_response(code, product, page_name=shop_page_name))
 
     # V33: A product image that cannot be matched must NOT put this customer into
     # Admin pause.  Otherwise one failed vision attempt makes every later image/code
