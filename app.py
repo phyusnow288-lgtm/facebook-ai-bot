@@ -3,8 +3,9 @@
 # V56 FINAL AUDITED BUILD
 # Protected V54 baseline + scoped reliability fixes only.
 # Existing Admin pause, explicit-code, order, Telegram and delivery flows preserved.
+# V59: nonblocking Sheet refresh + retry replay + stable image proxy + active-order product lock.
 # =========================
-BOT_BUILD = "V58_DUAL_PAGE_MINGALAR_SAFE_SAME_MESSAGE_ORDER"
+BOT_BUILD = "V59_FINAL_STABLE_ALL_AUDITED"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -15,9 +16,10 @@ import time
 import base64
 import mimetypes
 import threading
+import hashlib
 from datetime import datetime, timezone, timedelta
 import requests
-from flask import Flask, request
+from flask import Flask, request, Response
 
 app = Flask(__name__)
 
@@ -44,7 +46,7 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
-BOT_VERSION = "V58_DUAL_PAGE_MINGALAR_SAFE_SAME_MESSAGE_ORDER"
+BOT_VERSION = "V59_FINAL_STABLE_ALL_AUDITED"
 ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 POST_ORDER_ACK_TTL_SECONDS = int(os.environ.get("POST_ORDER_ACK_TTL_SECONDS", "86400"))
 POST_ORDER_AUTO_STOP_SECONDS = int(os.environ.get("POST_ORDER_AUTO_STOP_SECONDS", "1800"))
@@ -107,6 +109,7 @@ TELEGRAM_ORDER_DEDUP_SECONDS = 300
 # Suppress the same ManyChat input being answered twice when ManyChat retries a
 # Dynamic Block request. Keyed per contact + exact input/context.
 RECENT_MANYCHAT_INPUTS = {}
+RECENT_MANYCHAT_RESPONSES = {}
 RECENT_MANYCHAT_LOCK = threading.Lock()
 MANYCHAT_INPUT_DEDUP_SECONDS = int(os.environ.get("MANYCHAT_INPUT_DEDUP_SECONDS", "30"))
 MANYCHAT_ECHO_GRACE_SECONDS = int(os.environ.get("MANYCHAT_ECHO_GRACE_SECONDS", "20"))
@@ -402,7 +405,7 @@ def _fetch_products_from_sheet():
         print("GOOGLE_SHEET_URL IS MISSING", flush=True)
         return None
 
-    response = requests.get(sheet_export_url(GOOGLE_SHEET_URL), timeout=12)
+    response = requests.get(sheet_export_url(GOOGLE_SHEET_URL), timeout=4.0)
     response.raise_for_status()
     reader = csv.DictReader(response.text.splitlines())
     products = {}
@@ -470,24 +473,49 @@ def load_products(force=False):
 
 
 def refresh_catalog_for_customer_request(source="REQUEST"):
-    """Synchronously refresh Google Sheet before deciding any customer product reply.
+    """Keep Google Sheet as source of truth without blocking live ManyChat requests.
 
-    V49 strict source-of-truth gate:
-    - code/name/photo/ad recognition must use the newest Sheet rows available now;
-    - newly-added Sheet items work without a Python edit/deploy;
-    - if refresh fails, keep the last known catalog rather than erasing working data.
+    V59 stability rule:
+    - first load is synchronous so a cold process obtains a catalog;
+    - once a catalog exists, stale data refreshes in the background;
+    - Sheet price/name/detail/image changes are picked up automatically on the
+      normal PRODUCT_REFRESH_SECONDS cadence with no Python edit/deploy;
+    - a temporary Google/network failure never erases the last working catalog.
     """
     before_codes = tuple(PRODUCTS.keys())
-    load_products(force=True)
+    load_products(force=False)
     after_codes = tuple(PRODUCTS.keys())
     print(
-        "V49 SHEET-FIRST CATALOG CHECK:",
+        "V59 SHEET-FIRST NONBLOCKING CHECK:",
         source,
         "COUNT", len(PRODUCTS),
         "CHANGED" if before_codes != after_codes else "UNCHANGED",
         flush=True,
     )
     return bool(PRODUCTS)
+
+
+_CATALOG_REFRESH_LOOP_STARTED = False
+_CATALOG_REFRESH_LOOP_LOCK = threading.Lock()
+
+
+def _catalog_refresh_loop():
+    """Refresh Sheet in the background so live customer requests never pay the network wait."""
+    while True:
+        time.sleep(max(15, PRODUCT_REFRESH_SECONDS))
+        try:
+            load_products(force=True)
+        except Exception as e:
+            print("V59 PERIODIC SHEET REFRESH WARNING:", str(e), flush=True)
+
+
+def start_catalog_refresh_loop():
+    global _CATALOG_REFRESH_LOOP_STARTED
+    with _CATALOG_REFRESH_LOOP_LOCK:
+        if _CATALOG_REFRESH_LOOP_STARTED:
+            return
+        _CATALOG_REFRESH_LOOP_STARTED = True
+    threading.Thread(target=_catalog_refresh_loop, daemon=True).start()
 
 
 # =========================
@@ -568,17 +596,29 @@ def product_image_url(product):
 
 
 
-def manychat_product_image_url(product):
-    """Return the catalog image URL directly for ManyChat/Messenger.
+def manychat_product_image_url(product, code=""):
+    """Return a stable public image URL for ManyChat/Messenger.
 
-    Google Drive share links are converted to a stable googleusercontent URL.
-    Avoid routing product images back through Render: the extra proxy/download
-    step was unnecessary and could make Dynamic Content return text while the
-    image itself failed or timed out.
+    V59 serves Sheet-backed product images through this already-live Render app.
+    This removes ManyChat's dependency on Google Drive redirect/hotlink behavior.
+    The query fingerprint changes automatically when the Sheet image URL changes,
+    so a new image is not hidden by an old Messenger/CDN cache.  Outside a Flask
+    request context we safely fall back to the direct public URL.
     """
     source = product_image_url(product)
     if not source:
         return ""
+
+    code = normalize_code(code)
+    if code:
+        try:
+            root = str(request.url_root or "").rstrip("/")
+            if root:
+                version = hashlib.sha1(source.encode("utf-8", errors="ignore")).hexdigest()[:12]
+                return f"{root}/product-image/{code}?v={version}"
+        except Exception:
+            pass
+
     return google_drive_view_url(source)
 
 
@@ -1964,21 +2004,58 @@ def manychat_input_key(data, message, contact_id, image_url):
     ])
 
 
+def _prune_manychat_request_cache(now=None):
+    now = now_ts() if now is None else now
+    for old_key, old_ts in list(RECENT_MANYCHAT_INPUTS.items()):
+        if now - old_ts > MANYCHAT_INPUT_DEDUP_SECONDS:
+            RECENT_MANYCHAT_INPUTS.pop(old_key, None)
+            RECENT_MANYCHAT_RESPONSES.pop(old_key, None)
+
+
+def cached_manychat_response(request_key):
+    if not request_key:
+        return None
+    now = now_ts()
+    with RECENT_MANYCHAT_LOCK:
+        _prune_manychat_request_cache(now)
+        item = RECENT_MANYCHAT_RESPONSES.get(request_key)
+        if not item:
+            return None
+        ts, response = item
+        if now - ts > MANYCHAT_INPUT_DEDUP_SECONDS:
+            RECENT_MANYCHAT_RESPONSES.pop(request_key, None)
+            return None
+        return response
+
+
+def cache_manychat_response(request_key, response):
+    if not request_key:
+        return response
+    now = now_ts()
+    with RECENT_MANYCHAT_LOCK:
+        _prune_manychat_request_cache(now)
+        RECENT_MANYCHAT_INPUTS[request_key] = now
+        RECENT_MANYCHAT_RESPONSES[request_key] = (now, response)
+    return response
+
+
 def is_duplicate_manychat_input(data, message, contact_id, image_url):
+    """Detect a retry but never turn it into an empty customer reply.
+
+    The completed response is replayed by handle_manychat_request(). If the first
+    attempt is still in flight and no cached response exists yet, the retry is
+    allowed to process rather than being swallowed. Telegram has its own order
+    deduplication, so this cannot create duplicate Telegram orders.
+    """
     if not contact_id:
         return False
     key = manychat_input_key(data, message, contact_id, image_url)
     now = now_ts()
     with RECENT_MANYCHAT_LOCK:
-        for old_key, old_ts in list(RECENT_MANYCHAT_INPUTS.items()):
-            if now - old_ts > MANYCHAT_INPUT_DEDUP_SECONDS:
-                RECENT_MANYCHAT_INPUTS.pop(old_key, None)
+        _prune_manychat_request_cache(now)
         old = RECENT_MANYCHAT_INPUTS.get(key)
-        if old and now - old <= MANYCHAT_INPUT_DEDUP_SECONDS:
-            print("MANYCHAT DUPLICATE INPUT SUPPRESSED:", contact_id, flush=True)
-            return True
         RECENT_MANYCHAT_INPUTS[key] = now
-    return False
+        return bool(old and now - old <= MANYCHAT_INPUT_DEDUP_SECONDS)
 
 
 
@@ -3722,7 +3799,7 @@ def manychat_text(text):
 def manychat_product_response(code, product, page_name=""):
     messages = []
 
-    image_url = manychat_product_image_url(product)
+    image_url = manychat_product_image_url(product, code)
     if image_url:
         print("MANYCHAT PUBLIC IMAGE URL:", image_url, flush=True)
         messages.append({"type": "image", "url": image_url})
@@ -3778,7 +3855,7 @@ def manychat_products_response(codes, include_order_prompt=True, page_name=""):
     if len(normalized) <= 3:
         for code in normalized:
             product = PRODUCTS[code]
-            image_url = manychat_product_image_url(product)
+            image_url = manychat_product_image_url(product, code)
             if image_url:
                 messages.append({"type": "image", "url": image_url})
             else:
@@ -3796,7 +3873,7 @@ def manychat_products_response(codes, include_order_prompt=True, page_name=""):
         # Every product gets its own image and its own detail+price text.
         for idx, code in enumerate(normalized):
             product = PRODUCTS[code]
-            image_url = manychat_product_image_url(product)
+            image_url = manychat_product_image_url(product, code)
             if image_url:
                 messages.append({"type": "image", "url": image_url})
             else:
@@ -3820,7 +3897,7 @@ def manychat_product_order_response(code, product, missing, page_name=""):
     address/phone and never showed Code / Detail / Price.
     """
     messages = []
-    image_url = manychat_product_image_url(product)
+    image_url = manychat_product_image_url(product, code)
     if image_url:
         print("MANYCHAT PUBLIC IMAGE URL:", image_url, flush=True)
         messages.append({"type": "image", "url": image_url})
@@ -4099,11 +4176,17 @@ def handle_manychat_request(data):
     # reply twice to the same contact inside the short dedup window. Include all
     # current/recovered photo URLs in the fingerprint so sibling photos survive.
     image_fingerprint = "||".join(incoming_image_urls)
+    manychat_request_key = manychat_input_key(data, message, contact_id, image_fingerprint) if contact_id else ""
     if is_duplicate_manychat_input(data, message, contact_id, image_fingerprint):
-        return manychat_response([])
+        cached = cached_manychat_response(manychat_request_key)
+        if cached is not None:
+            print("V59 MANYCHAT RETRY REPLAYED:", contact_id, flush=True)
+            return cached
+        print("V59 MANYCHAT RETRY WITHOUT CACHE - PROCESSING:", contact_id, flush=True)
 
     def done(response):
-        return finalize_manychat(contact_id, response)
+        finalized = finalize_manychat(contact_id, response)
+        return cache_manychat_response(manychat_request_key, finalized)
 
     if not contact_id:
         return manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။")
@@ -4193,6 +4276,21 @@ def handle_manychat_request(data):
     # this block after the info reply. FAST ORDER below is therefore only allowed
     # to handle follow-up order data that contains NO current product identifier.
 
+    # V59 ACTIVE-ORDER PROTECTION:
+    # Once a customer has selected a product, an address/phone follow-up must not
+    # be reinterpreted as a different product merely because the address/order
+    # sentence contains a generic alias (for example "portable").  An explicit
+    # product CODE still remains authoritative and can intentionally switch items.
+    active_order_codes = [c for c in session.get("items", {}) if c in PRODUCTS]
+    active_order_followup = bool(
+        active_order_codes
+        and message
+        and looks_like_order_details(message)
+        and not valid_candidates_now
+    )
+    if active_order_followup:
+        print("V59 ACTIVE ORDER FOLLOW-UP LOCK:", active_order_codes, flush=True)
+
     current_product_items = {}
     current_product_codes = []
     current_product_sources = set()
@@ -4220,13 +4318,13 @@ def handle_manychat_request(data):
             _v57_add_current_product(_code, _qty, "code")
 
     # 2) Product names/aliases from CURRENT buyer text, including multiple names.
-    v57_named_items = find_named_products_and_quantities(message)
+    v57_named_items = {} if active_order_followup else find_named_products_and_quantities(message)
     for _code, _qty in v57_named_items.items():
         if _code in PRODUCTS:
             _v57_add_current_product(_code, _qty, "name")
 
     # 3) Rich Sheet-backed text match (description/model/alias fields).
-    if message:
+    if message and not active_order_followup:
         _rich_code, _rich_product = find_product_by_rich_sheet_text(message)
         if _rich_product and _rich_code in PRODUCTS:
             _v57_add_current_product(_rich_code, 1, "sheet_text")
@@ -4251,6 +4349,7 @@ def handle_manychat_request(data):
     if (
         not current_product_codes
         and message
+        and not active_order_followup
         and (not v57_generic_order or has_catalog_product_clue_text(message))
     ):
         _ai_code, _ai_product = ai_find_product_from_text(message)
@@ -4950,6 +5049,12 @@ def is_duplicate_message(message_data):
 # =========================
 # ROUTES
 # =========================
+# Warm the Sheet outside customer-request latency and keep it fresh continuously.
+# If this first background attempt is still running, a true cold request can still
+# perform the bounded first load (4s max) via load_products().
+threading.Thread(target=load_products, kwargs={"force": True}, daemon=True).start()
+start_catalog_refresh_loop()
+
 @app.route("/", methods=["GET"])
 def home():
     return f"Facebook AI Bot is running! {BOT_VERSION}", 200
@@ -4966,6 +5071,30 @@ def verify_webhook():
 
     return "Verification failed", 403
 
+
+
+@app.route("/product-image/<code>", methods=["GET"])
+def product_image_proxy(code):
+    """Serve the current Google-Sheet product image from the same public app.
+
+    The route is code-driven, so changing the Sheet image never requires Python
+    edits.  A short browser/CDN cache is safe because the ManyChat URL includes a
+    source-URL fingerprint that changes automatically with the Sheet value.
+    """
+    load_products(force=False)
+    code = normalize_code(code)
+    product = PRODUCTS.get(code)
+    if not product:
+        return "Not found", 404
+
+    source_url = product_image_url(product)
+    image_bytes, content_type = download_image_bytes(source_url)
+    if not image_bytes:
+        return "Image unavailable", 404
+
+    response = Response(image_bytes, mimetype=content_type or "image/jpeg")
+    response.headers["Cache-Control"] = "public, max-age=300"
+    return response
 
 
 @app.route("/webhook", methods=["POST"])
