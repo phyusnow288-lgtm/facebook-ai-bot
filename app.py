@@ -5,7 +5,7 @@
 # Existing Admin pause, explicit-code, order, Telegram and delivery flows preserved.
 # V59: nonblocking Sheet refresh + retry replay + stable image proxy + active-order product lock.
 # =========================
-BOT_BUILD = "V59_FINAL_STABLE_ALL_AUDITED"
+BOT_BUILD = "V60_FINAL_IMAGE_DELIVERY_STABLE"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -46,7 +46,7 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
-BOT_VERSION = "V59_FINAL_STABLE_ALL_AUDITED"
+BOT_VERSION = "V60_FINAL_IMAGE_DELIVERY_STABLE"
 ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 POST_ORDER_ACK_TTL_SECONDS = int(os.environ.get("POST_ORDER_ACK_TTL_SECONDS", "86400"))
 POST_ORDER_AUTO_STOP_SECONDS = int(os.environ.get("POST_ORDER_AUTO_STOP_SECONDS", "1800"))
@@ -597,13 +597,11 @@ def product_image_url(product):
 
 
 def manychat_product_image_url(product, code=""):
-    """Return a stable public image URL for ManyChat/Messenger.
+    """Return a Messenger-friendly Sheet-backed product image URL.
 
-    V59 serves Sheet-backed product images through this already-live Render app.
-    This removes ManyChat's dependency on Google Drive redirect/hotlink behavior.
-    The query fingerprint changes automatically when the Sheet image URL changes,
-    so a new image is not hidden by an old Messenger/CDN cache.  Outside a Flask
-    request context we safely fall back to the direct public URL.
+    V60 keeps Google Sheet as the master source, but the public URL now ends in
+    .jpg and is served by this Render app with validated real image bytes.  The
+    source fingerprint changes automatically whenever the Sheet image URL changes.
     """
     source = product_image_url(product)
     if not source:
@@ -615,7 +613,7 @@ def manychat_product_image_url(product, code=""):
             root = str(request.url_root or "").rstrip("/")
             if root:
                 version = hashlib.sha1(source.encode("utf-8", errors="ignore")).hexdigest()[:12]
-                return f"{root}/product-image/{code}?v={version}"
+                return f"{root}/product-image/{code}.jpg?v={version}"
         except Exception:
             pass
 
@@ -5073,6 +5071,64 @@ def verify_webhook():
 
 
 
+
+# V60: validated image-byte cache for ManyChat/Messenger delivery.
+_PRODUCT_IMAGE_PROXY_CACHE = {}
+_PRODUCT_IMAGE_PROXY_LOCK = threading.Lock()
+
+def _download_valid_product_image(source_url):
+    """Fetch actual image bytes; never disguise a Google/HTML page as image/jpeg."""
+    source_url = str(source_url or "").strip()
+    if not source_url:
+        return None, None
+
+    cache_key = hashlib.sha1(source_url.encode("utf-8", errors="ignore")).hexdigest()
+    with _PRODUCT_IMAGE_PROXY_LOCK:
+        cached = _PRODUCT_IMAGE_PROXY_CACHE.get(cache_key)
+    if cached:
+        return cached
+
+    candidates = []
+    file_id = google_drive_file_id(source_url)
+    if file_id:
+        candidates.extend([
+            f"https://lh3.googleusercontent.com/d/{file_id}",
+            f"https://drive.google.com/uc?export=download&id={file_id}",
+        ])
+    candidates.append(source_url)
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            r = requests.get(
+                candidate,
+                timeout=12,
+                allow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            r.raise_for_status()
+            raw = r.content or b""
+            header = r.headers.get("Content-Type", "")
+            mime = _image_mime_from_bytes(raw, header)
+            if not raw or not mime or not mime.startswith("image/"):
+                print("V60 IMAGE SOURCE REJECTED (NOT REAL IMAGE):", candidate, header, len(raw), flush=True)
+                continue
+            value = (raw, mime)
+            with _PRODUCT_IMAGE_PROXY_LOCK:
+                if len(_PRODUCT_IMAGE_PROXY_CACHE) > 100:
+                    _PRODUCT_IMAGE_PROXY_CACHE.clear()
+                _PRODUCT_IMAGE_PROXY_CACHE[cache_key] = value
+            print("V60 IMAGE SOURCE OK:", mime, len(raw), candidate, flush=True)
+            return value
+        except Exception as e:
+            print("V60 IMAGE SOURCE ERROR:", candidate, str(e), flush=True)
+
+    return None, None
+
+@app.route("/product-image/<code>.jpg", methods=["GET"])
 @app.route("/product-image/<code>", methods=["GET"])
 def product_image_proxy(code):
     """Serve the current Google-Sheet product image from the same public app.
@@ -5088,12 +5144,15 @@ def product_image_proxy(code):
         return "Not found", 404
 
     source_url = product_image_url(product)
-    image_bytes, content_type = download_image_bytes(source_url)
+    image_bytes, content_type = _download_valid_product_image(source_url)
     if not image_bytes:
         return "Image unavailable", 404
 
-    response = Response(image_bytes, mimetype=content_type or "image/jpeg")
+    response = Response(image_bytes, status=200, content_type=content_type or "image/jpeg")
     response.headers["Cache-Control"] = "public, max-age=300"
+    response.headers["Content-Disposition"] = f'inline; filename="{code}.jpg"'
+    response.headers["Content-Length"] = str(len(image_bytes))
+    response.headers["X-Content-Type-Options"] = "nosniff"
     return response
 
 
