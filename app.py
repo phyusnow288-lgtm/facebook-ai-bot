@@ -3410,56 +3410,86 @@ def unavailable_order_reply(code, availability):
     return f"Code {code} {name}\nပစ္စည်းအခြေအနေကို Admin က စစ်ဆေးပေးပါမယ်ရှင်။"
 
 
+def clean_order_address_for_output(value):
+    """Keep Name / Address / Phone as the only slash-delimited customer fields.
+
+    Buyers often type slashes inside their address. Those internal slashes must not
+    appear in the final Telegram/admin order line, otherwise the address looks like
+    extra fields. Preserve the address words/numbers and normalize separators to spaces.
+    """
+    address = str(value or "").strip()
+    address = re.sub(r"[/|\n\r]+", " ", address)
+    address = re.sub(r"\s+", " ", address)
+    return address.strip(" ,.-")
+
+
 def build_telegram_order(session):
     """Build the exact compact order format used by the shop/admin."""
     page_name = session_page_name(session)
     delivery_area = str(session.get("delivery_area", "")).strip().lower()
-    delivery_fee = MINGALAR_DELIVERY if is_mingalar_page(page_name) else delivery_fee_for_area(delivery_area)
 
     name = str(session.get("name", "")).strip()
-    address = str(session.get("address", "")).strip()
+    address = clean_order_address_for_output(session.get("address", ""))
     phone = str(session.get("phone", "")).strip()
 
     item_parts = []
     subtotal = 0
     total_pcs = 0
 
+    # V61 MINGALAR FIX:
+    # Mingalar customer prices are PER-UNIT all-in prices (base + 6,500).
+    # Therefore qty 2 means all_in * 2, and mixed/multi-item orders are the sum
+    # of each item's all-in price * quantity. Never add a separate delivery fee.
+    mingalar_order = is_mingalar_page(page_name)
+
     for code, qty in session.get("items", {}).items():
         product = PRODUCTS.get(code, {})
         item_name = str(get_row_value(product, "Product Name", "Name")).strip()
-        unit_price = product_price(code)
-        item_total = unit_price * qty
-        subtotal += item_total
+        base_price = product_price(code)
         total_pcs += qty
 
-        if qty == 1:
-            item_parts.append(
-                f"Code {code} {item_name} စျေးနှုန်း - {unit_price:,} Ks"
-            )
+        if mingalar_order:
+            unit_price = base_price + MINGALAR_DELIVERY
+            item_total = unit_price * qty
+            subtotal += item_total
+
+            if qty == 1:
+                item_parts.append(
+                    f"Code {code} {item_name} အိမ်အရောက် အပြီးအစီး - {unit_price:,} Ks"
+                )
+            else:
+                item_parts.append(
+                    f"Code {code} {item_name} အိမ်အရောက် အပြီးအစီး - {unit_price:,} Ks x {qty} = {item_total:,} Ks"
+                )
         else:
-            item_parts.append(
-                f"Code {code} {item_name} စျေးနှုန်း - {unit_price:,} Ks x {qty} = {item_total:,} Ks"
-            )
+            unit_price = base_price
+            item_total = unit_price * qty
+            subtotal += item_total
 
-    grand_total = subtotal + delivery_fee
+            if qty == 1:
+                item_parts.append(
+                    f"Code {code} {item_name} စျေးနှုန်း - {unit_price:,} Ks"
+                )
+            else:
+                item_parts.append(
+                    f"Code {code} {item_name} စျေးနှုန်း - {unit_price:,} Ks x {qty} = {item_total:,} Ks"
+                )
+
     items_text = " + ".join(item_parts)
-
     cod_text = "COD" if total_pcs <= 1 else f"COD {total_pcs} PCS"
 
-    if is_mingalar_page(page_name):
-        # For the common one-item order, Telegram mirrors the exact Page 2 all-in
-        # customer price. Multi-item orders still charge the fixed 6,500 only once.
-        if len(session.get("items", {})) == 1 and total_pcs == 1:
-            only_code = next(iter(session.get("items", {})))
-            product = PRODUCTS.get(only_code, {})
-            item_name = str(get_row_value(product, "Product Name", "Name")).strip()
-            return (
-                f"{name} / {address} / {phone} / "
-                f"Code {only_code} {item_name} အိမ်အရောက် အပြီးအစီး - {grand_total:,} Ks / "
-                f"စုစုပေါင်း - {grand_total:,} Ks / {cod_text}"
-            )
-        delivery_text = f"အိမ်အရောက်ပို့ခ - {delivery_fee:,} Ks"
-    elif delivery_area == "yangon":
+    if mingalar_order:
+        grand_total = subtotal
+        return (
+            f"{name} / {address} / {phone} / "
+            f"{items_text} / "
+            f"စုစုပေါင်း - {grand_total:,} Ks / {cod_text}"
+        )
+
+    # Snow Phyu keeps the original delivery calculation unchanged.
+    delivery_fee = delivery_fee_for_area(delivery_area)
+    grand_total = subtotal + delivery_fee
+    if delivery_area == "yangon":
         delivery_text = f"ရန်ကုန်ပို့ခ - {delivery_fee:,} Ks"
     else:
         delivery_text = f"နယ်ပို့ခ - {delivery_fee:,} Ks"
