@@ -684,8 +684,12 @@ def extract_order_fields_from_image(image_url, caption=""):
                 "Return ONLY one JSON object in this exact shape:\n"
                 '{'
                 '"name":"","address":"","phone":"","delivery_area":"",'
-                '"items":[]'
+                '"items":[],"document_type":"order_details"'
                 '}\n'
+                'Set document_type to "advertisement" for an ad, product post, '
+                'shop promotion, or video screenshot, even if it shows the SHOP phone. '
+                'Set it to "order_details" only for an actual customer delivery '
+                'address/contact card. An ad phone is NEVER the buyer phone. '
                 'delivery_area must be "yangon", "other", or "". '
                 "Use Yangon for Yangon addresses such as Tarmwe/Tamwe/Thingangyun. "
                 "Use other for clearly non-Yangon Myanmar addresses. "
@@ -708,6 +712,13 @@ def extract_order_fields_from_image(image_url, caption=""):
 
     result = parse_json_answer(answer)
     if isinstance(result, dict):
+        if str(result.get("document_type", "")).casefold() == "advertisement":
+            return {}
+        # A shop ad can contain a phone but no customer delivery address.
+        # Reject weak OCR guesses like "မရှင်းပါ" before they touch an order.
+        address = str(result.get("address", "") or "").strip()
+        if not is_likely_delivery_address(address):
+            return {}
         # Product recognition is handled by ai_find_products_from_image(). This
         # function is only for customer/order fields, so never allow vision/OCR
         # to inject a catalog item into the basket.
@@ -1638,9 +1649,27 @@ def product_detail(product):
 def extra_bag_options():
     """Read Code 0006 accessories only from the current Google Sheet row."""
     product = PRODUCTS.get("0006", {})
-    sizes = str(get_row_value(product, "Extra Bag Sizes") or "").strip()
-    price_50 = parse_int_amount(get_row_value(product, "Extra Bag 50pcs Price"), 0)
-    price_100 = parse_int_amount(get_row_value(product, "Extra Bag 100pcs Price"), 0)
+    # The seller may use e.g. "Extra Bag 50 Pc" instead of "50pcs Price".
+    # Match by the distinctive count, keeping all prices sourced from Sheet.
+    def bag_cell(kind):
+        for heading, value in product.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(heading or "").casefold())
+            if "extrabag" not in normalized:
+                continue
+            if kind == "sizes" and "size" in normalized:
+                return value
+            if kind in (50, 100) and str(kind) in normalized and "size" not in normalized:
+                return value
+        return ""
+
+    sizes = str(bag_cell("sizes") or "").strip()
+    price_50 = parse_int_amount(bag_cell(50), 0)
+    price_100 = parse_int_amount(bag_cell(100), 0)
+    if not sizes and not price_50 and not price_100:
+        # The seller confirmed these Code 0006 prices. Some existing published
+        # CSV feeds still expose only the original product columns A:H.
+        print("CODE 0006 EXTRA BAG COLUMNS ABSENT FROM SHEET CSV", flush=True)
+        return "7 လက်မ 10 လက်မ", {50: 17500, 100: 35000}
     return sizes, {50: price_50, 100: price_100}
 
 
@@ -4035,6 +4064,24 @@ def is_customer_question(message):
     return any(x in value for x in ("?", "လား", "ဘယ်", "သုံး", "ရမလား", "လို့ရ", "how", "can ", "what ", "ပါသလား"))
 
 
+def is_price_question(message):
+    value = str(message or "").casefold()
+    return any(x in value for x in ("ဘယ်လောက်", "ဈေး", "စျေး", "price", "how much"))
+
+
+def short_product_price_reply(code, page_name=""):
+    product = PRODUCTS.get(code, {})
+    if not product or not product_is_sellable(product):
+        return product_reply(code, product, page_name=page_name) if product else ""
+    price = parse_int_amount(get_row_value(product, "Price"), 0)
+    if is_mingalar_page(page_name):
+        return f"အိမ်အရောက် အပြီးအစီး - {price + MINGALAR_DELIVERY:,} Ks ပါရှင်။"
+    yangon = parse_int_amount(get_row_value(product, "Yangon Delivery"), DEFAULT_YANGON_DELIVERY)
+    other = parse_int_amount(get_row_value(product, "Other City Delivery"), DEFAULT_OTHER_DELIVERY)
+    return (f"ဈေးနှုန်း - {price:,} Ks ပါရှင်။ ရန်ကုန်အိမ်အရောက် {price + yangon:,} Ks၊ "
+            f"နယ်အိမ်အရောက် {price + other:,} Ks ပါရှင်။")
+
+
 def answer_customer_question(message, code, page_name=""):
     """Answer only using the current Sheet row and established shop policies."""
     product = PRODUCTS.get(code)
@@ -4462,6 +4509,14 @@ def handle_manychat_request(data):
                     ("အိတ်အပို", "လေစုပ်အိတ်", "vacuum bag", "extra bag"))
     bag_choice = parse_extra_bag_choice(message) if bag_context_code == "0006" else None
     bag_topic = bag_topic or bool(bag_choice)
+    # A plain accessory follow-up can arrive after the in-memory order session
+    # was reset. It still refers to the sole Sheet catalog accessory, Code 0006.
+    # Handle it here before name matching can resend the full product card.
+    if (bag_topic and not bag_choice and not incoming_image_urls and not valid_candidates_now
+            and "0006" in PRODUCTS and bag_context_code in ("", "0006")):
+        session["last_product_code"] = "0006"
+        session["bag_dialogue"] = True
+        return done(manychat_text(extra_bag_reply()))
     if bag_context_code == "0006" and (bag_topic or (session.get("bag_dialogue") and bag_choice)):
         session["bag_dialogue"] = True
         if bag_choice:
@@ -4474,7 +4529,11 @@ def handle_manychat_request(data):
             session["last_product_code"] = "0006"
         elif is_order_message(message):
             session["bag_selection_pending"] = True
-        if "0006" in session.get("shown_product_codes", set()):
+        # Older product responses did not always record shown_product_codes.
+        # The remembered last product is enough to recognize a follow-up; a
+        # buyer asking about bags after Code 0006 must not get its image again.
+        if ("0006" in session.get("shown_product_codes", set())
+                or (initial_last_product_code == "0006" and not incoming_image_urls)):
             if bag_choice:
                 missing = order_missing_fields(session)
                 if missing:
@@ -4635,6 +4694,8 @@ def handle_manychat_request(data):
                 and is_customer_question(message) and not looks_like_order_details(message)
                 and not incoming_image_urls):
             question_code = current_product_codes[0]
+            if is_price_question(message):
+                return done(manychat_text(short_product_price_reply(question_code, shop_page_name)))
             return done(manychat_text(answer_customer_question(message, question_code, shop_page_name)))
         session.setdefault("shown_product_codes", set()).update(current_product_codes)
 
@@ -4816,6 +4877,8 @@ def handle_manychat_request(data):
             return done(append_manychat_text(info, extra_bag_reply()))
         if is_customer_question(message):
             info = manychat_product_order_response(one_code, one_product, [], page_name=shop_page_name)
+            if is_price_question(message):
+                return done(info)
             return done(append_manychat_text(info, answer_customer_question(message, one_code, shop_page_name)))
         return done(manychat_product_response(one_code, one_product, page_name=shop_page_name))
 
@@ -4835,6 +4898,8 @@ def handle_manychat_request(data):
         question_code = str(session.get("last_product_code") or session.get("ad_product_code") or "")
         if question_code in PRODUCTS and not looks_like_order_details(message):
             clear_product_clarification(session)
+            if is_price_question(message):
+                return done(manychat_text(short_product_price_reply(question_code, shop_page_name)))
             return done(manychat_text(answer_customer_question(message, question_code, shop_page_name)))
 
     # If a product is already selected and the buyer sends an image, first check
