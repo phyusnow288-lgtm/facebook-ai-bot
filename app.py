@@ -6,6 +6,8 @@
 # V59: nonblocking Sheet refresh + retry replay + stable image proxy + active-order product lock.
 # V60 follow-up: preserve pre-product details, verify card OCR, silence repeated
 # taps, retain ad metadata when supplied, and answer grounded product questions.
+# Sheet-backed Code 0006 extra bags and shop reply; avoid repeating the image
+# for follow-up questions about a product already shown in this conversation.
 # =========================
 BOT_BUILD = "V60_FINAL_IMAGE_DELIVERY_STABLE"
 print("BOT BUILD:", BOT_BUILD, flush=True)
@@ -1633,6 +1635,50 @@ def product_detail(product):
     ).strip()
 
 
+def extra_bag_options():
+    """Read Code 0006 accessories only from the current Google Sheet row."""
+    product = PRODUCTS.get("0006", {})
+    sizes = str(get_row_value(product, "Extra Bag Sizes") or "").strip()
+    price_50 = parse_int_amount(get_row_value(product, "Extra Bag 50pcs Price"), 0)
+    price_100 = parse_int_amount(get_row_value(product, "Extra Bag 100pcs Price"), 0)
+    return sizes, {50: price_50, 100: price_100}
+
+
+def shop_address_reply():
+    for product in PRODUCTS.values():
+        answer = str(get_row_value(product, "Shop Address Reply") or "").strip()
+        if answer:
+            return answer
+    return "ဆိုင်လိပ်စာအချက်အလက်ကို Admin က ပြန်ဖြေပေးပါမယ်ရှင်။"
+
+
+def asks_shop_address(message):
+    low = str(message or "").casefold()
+    return ("ဆိုင်" in low and any(x in low for x in ("လိပ်စာ", "ဘယ်မှာ", "တည်နေရာ", "ရှိလား", "လာဝယ်"))) or \
+           any(x in low for x in ("shop address", "store address", "physical shop", "pickup location"))
+
+
+def extra_bag_reply():
+    sizes, prices = extra_bag_options()
+    if not sizes or not all(prices.values()):
+        return "အိတ်အပို ဈေးနှုန်းကို Admin က စစ်ဆေးဖြေပေးပါမယ်ရှင်။"
+    return (f"Code 0006 အတွက် လေစုပ်အိတ်အပို {sizes} ဆိုဒ် ရှိပါတယ်ရှင်။\n"
+            f"အလုံး ၅၀ ပါ - {prices[50]:,} Ks\n"
+            f"အလုံး ၁၀၀ ပါ - {prices[100]:,} Ks\n"
+            "မှာယူလိုရင် ဆိုဒ်နဲ့ အလုံးရေကို ပြောပေးပါရှင်။")
+
+
+def parse_extra_bag_choice(message):
+    text = _western_digits(message)
+    sizes = re.findall(r"(?<!\d)(7|10)\s*(?:လက်မ|inches?|inch|\")", text, re.IGNORECASE)
+    counts = re.findall(r"(?<!\d)(50|100)\s*(?:လုံး|ခု|pcs?|ပါ)?(?!\d)", text, re.IGNORECASE)
+    sizes = list(dict.fromkeys(int(x) for x in sizes))
+    counts = list(dict.fromkeys(int(x) for x in counts))
+    if len(sizes) == 1 and len(counts) == 1:
+        return {"size": sizes[0], "count": counts[0], "packs": 1}
+    return None
+
+
 
 def normalize_page_name(value):
     return re.sub(r"\s+", " ", str(value or "").strip()).casefold()
@@ -2587,6 +2633,10 @@ def new_order_session():
         "_awaiting_product_clarification": False,
         "_pending_image_details": None,
         "_awaiting_previous_details": False,
+        "extra_bags": [],
+        "bag_dialogue": False,
+        "bag_selection_pending": False,
+        "shown_product_codes": set(),
     }
 
 
@@ -3347,6 +3397,8 @@ def order_missing_fields(session):
 
     if not session.get("items"):
         missing.append("ပစ္စည်း")
+    if session.get("bag_selection_pending"):
+        missing.append("အိတ်အပို ဆိုဒ် (၇/၁၀ လက်မ) နှင့် အရေအတွက် (၅၀/၁၀၀ လုံး)")
 
     # Do not make Yangon buyers type "ရန်ကုန်". Once core order details are
     # complete, infer_delivery_area_for_complete_order() resolves the area; an
@@ -3441,6 +3493,22 @@ def build_telegram_order(session):
                 f"Code {code} {item_name} စျေးနှုန်း - {unit_price:,} Ks x {qty} = {item_total:,} Ks"
             )
 
+    for bag in session.get("extra_bags", []):
+        pack_count = max(1, int(bag.get("packs", 1)))
+        count = int(bag["count"])
+        size = int(bag["size"])
+        _, sheet_bag_prices = extra_bag_options()
+        unit_bag_price = sheet_bag_prices.get(count, 0)
+        if not unit_bag_price:
+            raise ValueError("Code 0006 extra bag price is missing from Google Sheet")
+        bag_total = unit_bag_price * pack_count
+        subtotal += bag_total
+        total_pcs += pack_count
+        item_parts.append(
+            f"Code 0006 အိတ်အပို {size} လက်မ {count} လုံးပါ"
+            f" x {pack_count} ထုပ် - {bag_total:,} Ks"
+        )
+
     grand_total = subtotal + delivery_fee
     items_text = " + ".join(item_parts)
 
@@ -3449,7 +3517,7 @@ def build_telegram_order(session):
     if is_mingalar_page(page_name):
         # For the common one-item order, Telegram mirrors the exact Page 2 all-in
         # customer price. Multi-item orders still charge the fixed 6,500 only once.
-        if len(session.get("items", {})) == 1 and total_pcs == 1:
+        if len(session.get("items", {})) == 1 and total_pcs == 1 and not session.get("extra_bags"):
             only_code = next(iter(session.get("items", {})))
             product = PRODUCTS.get(only_code, {})
             item_name = str(get_row_value(product, "Product Name", "Name")).strip()
@@ -3972,6 +4040,12 @@ def answer_customer_question(message, code, page_name=""):
     product = PRODUCTS.get(code)
     if not product or not OPENAI_API_KEY:
         return "ဒီမေးခွန်းကို Admin က စစ်ဆေးဖြေပေးပါမယ်ရှင်။"
+    low_question = str(message or "").casefold()
+    if code == "0005" and any(x in low_question for x in
+                              ("ကား", "car", "vehicle", "အင်ဂျင်", "engine")):
+        return ("ဒီ O-ring တွေထဲမှာ ဆိုဒ်အမျိုးမျိုး ပါပါတယ်ရှင်။ "
+                "ဘယ်ကားရဲ့ ဘယ်အစိတ်အပိုင်းမှာ သုံးမလဲနဲ့ လိုတဲ့ O-ring ဆိုဒ်ကို "
+                "ပြောပေးပါရှင်။ ကိုက်မကိုက်ကို စစ်ပြီးမှ အတည်ပြုပေးပါမယ်။")
     # Exclude image URLs and internal/ad columns; no unrelated catalog rows.
     facts = {str(k): str(v)[:1200] for k, v in product.items()
              if v not in (None, "") and not any(x in str(k).casefold()
@@ -3994,7 +4068,7 @@ def answer_customer_question(message, code, page_name=""):
         }, ensure_ascii=False)},
     ], max_tokens=180, temperature=0)
     answer = str(response or "").strip()
-    if not answer or answer.upper().startswith("UNKNOWN"):
+    if not answer or re.search(r"\bUNKNOWN\b", answer, re.IGNORECASE):
         return "ဒီမေးခွန်းကို Admin က စစ်ဆေးဖြေပေးပါမယ်ရှင်။"
     return answer[:900]
 
@@ -4374,6 +4448,51 @@ def handle_manychat_request(data):
     if valid_candidates_now:
         clear_product_clarification(session)
 
+    if asks_shop_address(message):
+        return done(manychat_text(shop_address_reply()))
+
+    bag_ad_code, _bag_ad_product = extract_product_context_from_manychat(data)
+    if not _bag_ad_product:
+        bag_ad_code, _bag_ad_product = restore_meta_ad_product(contact_id)
+    bag_context_code = (
+        "0006" if "0006" in valid_candidates_now else
+        str(session.get("last_product_code") or session.get("ad_product_code") or bag_ad_code or "")
+    )
+    bag_topic = any(word in str(message or "").casefold() for word in
+                    ("အိတ်အပို", "လေစုပ်အိတ်", "vacuum bag", "extra bag"))
+    bag_choice = parse_extra_bag_choice(message) if bag_context_code == "0006" else None
+    bag_topic = bag_topic or bool(bag_choice)
+    if bag_context_code == "0006" and (bag_topic or (session.get("bag_dialogue") and bag_choice)):
+        session["bag_dialogue"] = True
+        if bag_choice:
+            sizes, prices = extra_bag_options()
+            if not sizes or not prices.get(bag_choice["count"]):
+                return done(manychat_text(extra_bag_reply()))
+            session["extra_bags"] = [bag_choice]
+            session["bag_selection_pending"] = False
+            session["items"].setdefault("0006", 1)
+            session["last_product_code"] = "0006"
+        elif is_order_message(message):
+            session["bag_selection_pending"] = True
+        if "0006" in session.get("shown_product_codes", set()):
+            if bag_choice:
+                missing = order_missing_fields(session)
+                if missing:
+                    return done(manychat_text(
+                        f"{bag_choice['size']} လက်မ {bag_choice['count']} လုံးပါ အိတ်အပိုကို ထည့်ထားပါပြီရှင်။\n"
+                        + order_prompt_for_missing(missing)))
+                order_text = build_telegram_order(session)
+                if queue_telegram_order(contact_id, order_text, page_name=shop_page_name):
+                    reply = buyer_order_confirmation(session)
+                    remember_confirmed_details(contact_id, session)
+                    mark_order_completed(contact_id)
+                    ORDER_SESSIONS[contact_id] = new_order_session()
+                    return done(manychat_response([
+                        {"type": "text", "text": reply},
+                        {"type": "text", "text": post_order_delivery_time_message()},
+                    ]))
+            return done(manychat_text(extra_bag_reply()))
+
     # Preserve details sent before the product. A phone or clear address is an
     # order field even when no catalog item has yet been identified.
     if message and not valid_candidates_now and not incoming_image_urls and not session.get("items"):
@@ -4511,6 +4630,13 @@ def handle_manychat_request(data):
     # is forbidden for this request. This is the central V57 regression fix.
     if current_product_codes:
         clear_product_clarification(session)
+        already_shown = session.get("shown_product_codes", set())
+        if (len(current_product_codes) == 1 and current_product_codes[0] in already_shown
+                and is_customer_question(message) and not looks_like_order_details(message)
+                and not incoming_image_urls):
+            question_code = current_product_codes[0]
+            return done(manychat_text(answer_customer_question(message, question_code, shop_page_name)))
+        session.setdefault("shown_product_codes", set()).update(current_product_codes)
 
         sellable_current = [
             c for c in current_product_codes
@@ -4681,7 +4807,13 @@ def handle_manychat_request(data):
                 return done(append_manychat_text(info,
                     f"အရင်ပို့ခဲ့တဲ့ လိပ်စာ {old['address']} / ဖုန်း {old['phone']} ကိုပဲ သုံးမလားရှင်။ "
                     "သုံးမယ်ဆို «မှန်ပါတယ်»၊ ပြောင်းမယ်ဆို လိပ်စာ / ဖုန်းအသစ် ပို့ပေးပါရှင်။"))
-            return done(manychat_product_order_response(one_code, one_product, missing_now, page_name=shop_page_name))
+            reply = manychat_product_order_response(one_code, one_product, missing_now, page_name=shop_page_name)
+            if one_code == "0006" and bag_topic:
+                reply = append_manychat_text(reply, extra_bag_reply())
+            return done(reply)
+        if one_code == "0006" and bag_topic:
+            info = manychat_product_order_response(one_code, one_product, [], page_name=shop_page_name)
+            return done(append_manychat_text(info, extra_bag_reply()))
         if is_customer_question(message):
             info = manychat_product_order_response(one_code, one_product, [], page_name=shop_page_name)
             return done(append_manychat_text(info, answer_customer_question(message, one_code, shop_page_name)))
@@ -5194,6 +5326,13 @@ def handle_manychat_request(data):
             pause_for_admin(contact_id)
             return done(manychat_text("ဒီမေးခွန်းကို Admin က ဆက်လက်ဖြေကြားပေးပါမယ်ရှင်။"))
         return done(manychat_text("ဘယ်ပစ္စည်းလေး အလိုရှိပါလဲရှင်။"))
+
+    if str(message or "").strip().casefold() in ("ok", "okay", "ဟုတ်ကဲ့", "ဟုတ်ပါတယ်"):
+        active_code = session.get("last_product_code")
+        if active_code in PRODUCTS:
+            clear_product_clarification(session)
+            return done(manychat_text(
+                f"ဟုတ်ကဲ့ရှင်။ Code {active_code} အကြောင်း ထပ်သိချင်တာရှိရင် မေးလို့ရပါတယ်ရှင်။"))
 
     greeting = simple_greeting(message)
     if greeting:
