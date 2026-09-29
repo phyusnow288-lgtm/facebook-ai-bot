@@ -9,7 +9,7 @@
 # Sheet-backed Code 0006 extra bags and shop reply; avoid repeating the image
 # for follow-up questions about a product already shown in this conversation.
 # =========================
-BOT_BUILD = "V60_FINAL_IMAGE_DELIVERY_STABLE"
+BOT_BUILD = "V62_FINAL_MH_PRICE_ADDRESS_V60_PRESERVED"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -50,7 +50,7 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
-BOT_VERSION = "V60_FINAL_IMAGE_DELIVERY_STABLE"
+BOT_VERSION = "V62_FINAL_MH_PRICE_ADDRESS_V60_PRESERVED"
 ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 POST_ORDER_ACK_TTL_SECONDS = int(os.environ.get("POST_ORDER_ACK_TTL_SECONDS", "86400"))
 POST_ORDER_AUTO_STOP_SECONDS = int(os.environ.get("POST_ORDER_AUTO_STOP_SECONDS", "1800"))
@@ -3491,14 +3491,23 @@ def unavailable_order_reply(code, availability):
     return f"Code {code} {name}\nပစ္စည်းအခြေအနေကို Admin က စစ်ဆေးပေးပါမယ်ရှင်။"
 
 
+def clean_order_address_for_output(value):
+    """Keep internal address slashes from becoming extra order fields."""
+    address = str(value or "").strip()
+    address = re.sub(r"[/|\n\r]+", " ", address)
+    address = re.sub(r"\s+", " ", address)
+    return address.strip(" ,.-")
+
+
 def build_telegram_order(session):
     """Build the exact compact order format used by the shop/admin."""
     page_name = session_page_name(session)
     delivery_area = str(session.get("delivery_area", "")).strip().lower()
-    delivery_fee = MINGALAR_DELIVERY if is_mingalar_page(page_name) else delivery_fee_for_area(delivery_area)
+    mingalar_order = is_mingalar_page(page_name)
+    delivery_fee = MINGALAR_DELIVERY if mingalar_order else delivery_fee_for_area(delivery_area)
 
     name = str(session.get("name", "")).strip()
-    address = str(session.get("address", "")).strip()
+    address = clean_order_address_for_output(session.get("address", ""))
     phone = str(session.get("phone", "")).strip()
 
     item_parts = []
@@ -3508,12 +3517,22 @@ def build_telegram_order(session):
     for code, qty in session.get("items", {}).items():
         product = PRODUCTS.get(code, {})
         item_name = str(get_row_value(product, "Product Name", "Name")).strip()
-        unit_price = product_price(code)
+        base_price = product_price(code)
+        unit_price = base_price + MINGALAR_DELIVERY if mingalar_order else base_price
         item_total = unit_price * qty
         subtotal += item_total
         total_pcs += qty
 
-        if qty == 1:
+        if mingalar_order:
+            if qty == 1:
+                item_parts.append(
+                    f"Code {code} {item_name} အိမ်အရောက် အပြီးအစီး - {unit_price:,} Ks"
+                )
+            else:
+                item_parts.append(
+                    f"Code {code} {item_name} အိမ်အရောက် အပြီးအစီး - {unit_price:,} Ks x {qty} = {item_total:,} Ks"
+                )
+        elif qty == 1:
             item_parts.append(
                 f"Code {code} {item_name} စျေးနှုန်း - {unit_price:,} Ks"
             )
@@ -3543,19 +3562,14 @@ def build_telegram_order(session):
 
     cod_text = "COD" if total_pcs <= 1 else f"COD {total_pcs} PCS"
 
-    if is_mingalar_page(page_name):
-        # For the common one-item order, Telegram mirrors the exact Page 2 all-in
-        # customer price. Multi-item orders still charge the fixed 6,500 only once.
-        if len(session.get("items", {})) == 1 and total_pcs == 1 and not session.get("extra_bags"):
-            only_code = next(iter(session.get("items", {})))
-            product = PRODUCTS.get(only_code, {})
-            item_name = str(get_row_value(product, "Product Name", "Name")).strip()
-            return (
-                f"{name} / {address} / {phone} / "
-                f"Code {only_code} {item_name} အိမ်အရောက် အပြီးအစီး - {grand_total:,} Ks / "
-                f"စုစုပေါင်း - {grand_total:,} Ks / {cod_text}"
-            )
-        delivery_text = f"အိမ်အရောက်ပို့ခ - {delivery_fee:,} Ks"
+    if mingalar_order:
+        # Mingalar all-in prices already include delivery per unit.
+        grand_total = subtotal
+        return (
+            f"{name} / {address} / {phone} / "
+            f"{items_text} / "
+            f"စုစုပေါင်း - {grand_total:,} Ks / {cod_text}"
+        )
     elif delivery_area == "yangon":
         delivery_text = f"ရန်ကုန်ပို့ခ - {delivery_fee:,} Ks"
     else:
