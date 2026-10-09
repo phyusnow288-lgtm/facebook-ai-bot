@@ -120,6 +120,7 @@ async def main():
         await client.connect()
         if not await client.is_user_authorized():
             raise RuntimeError('Cloud Telegram session is not authorized; run local setup again.')
+        await client.get_dialogs()
         print('Cloud Telegram connector connected.', flush=True)
         while not stop.is_set():
             for config, source in sources:
