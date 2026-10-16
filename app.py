@@ -5,12 +5,13 @@
 # Existing Admin pause, explicit-code, order, Telegram and delivery flows preserved.
 # V59: nonblocking Sheet refresh + retry replay + stable image proxy + active-order product lock.
 # =========================
-BOT_BUILD = "V62_FINAL_MINGALAR_AI_REPLY_PRICE_SAFE"
+BOT_BUILD = "V63_CATALOG_DETAIL_DELIVERY_SAFE"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
 import re
 import csv
+import io
 import json
 import time
 import base64
@@ -46,7 +47,7 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
-BOT_VERSION = "V62_FINAL_MINGALAR_AI_REPLY_PRICE_SAFE"
+BOT_VERSION = "V63_CATALOG_DETAIL_DELIVERY_SAFE"
 ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 POST_ORDER_ACK_TTL_SECONDS = int(os.environ.get("POST_ORDER_ACK_TTL_SECONDS", "86400"))
 POST_ORDER_AUTO_STOP_SECONDS = int(os.environ.get("POST_ORDER_AUTO_STOP_SECONDS", "1800"))
@@ -156,9 +157,10 @@ def parse_int_amount(value, default=0):
 
 
 def get_row_value(row, *keys):
+    normalized = {re.sub(r"[\s_]+", "", str(k).replace("\ufeff", "")).casefold(): v for k, v in row.items()}
     for key in keys:
-        value = row.get(key)
-        if value not in (None, ""):
+        value = normalized.get(re.sub(r"[\s_]+", "", key).casefold())
+        if value is not None and str(value).strip():
             return value
     return ""
 
@@ -338,7 +340,7 @@ def _image_match_cache_key(image_url):
 
 
 def _get_cached_image_match(image_url):
-    key = _image_match_cache_key(image_url)
+    key = _catalog_revision() + ":" + _image_match_cache_key(image_url)
     if not key:
         return None
     now = now_ts()
@@ -353,7 +355,7 @@ def _get_cached_image_match(image_url):
 
 
 def _set_cached_image_match(image_url, codes):
-    key = _image_match_cache_key(image_url)
+    key = _catalog_revision() + ":" + _image_match_cache_key(image_url)
     if not key:
         return
     with IMAGE_MATCH_CACHE_LOCK:
@@ -407,7 +409,7 @@ def _fetch_products_from_sheet():
 
     response = requests.get(sheet_export_url(GOOGLE_SHEET_URL), timeout=4.0)
     response.raise_for_status()
-    reader = csv.DictReader(response.text.splitlines())
+    reader = csv.DictReader(io.StringIO(response.content.decode("utf-8-sig")))
     products = {}
     for raw_row in reader:
         # Normalize Google Sheet headers once. Stray spaces/BOMs in headers were
@@ -418,8 +420,35 @@ def _fetch_products_from_sheet():
             row[key] = value
         code = normalize_code(get_row_value(row, "Code", "code", "CODE"))
         if code:
+            if code in products:
+                raise ValueError("Duplicate catalog code: " + code)
             products[code] = row
+    if not products:
+        raise ValueError("Empty catalog rejected; retaining previous catalog")
     return products
+
+
+def _catalog_revision(products=None):
+    return hashlib.sha256(json.dumps(PRODUCTS if products is None else products, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+def _install_catalog(products):
+    global PRODUCTS
+    changed = {code for code in PRODUCTS if PRODUCTS.get(code) != products.get(code)}
+    PRODUCTS = products
+    if not changed:
+        return
+    # Never carry the old product selection into a replacement with the same code.
+    for session in list(ORDER_SESSIONS.values()):
+        if changed.intersection(session.get("items", {})) or session.get("last_product_code") in changed:
+            session["items"] = {}
+            session["last_product_code"] = ""
+            session["quantity_confirmed"] = False
+    for name in ("IMAGE_MATCH_CACHE", "RECENT_MANYCHAT_RESPONSES", "RECENT_MANYCHAT_INPUTS"):
+        cache = globals().get(name)
+        if isinstance(cache, dict):
+            cache.clear()
+    print("CATALOG CHANGED; OLD SELECTIONS INVALIDATED:", sorted(changed), flush=True)
 
 
 def _background_product_refresh():
@@ -427,7 +456,7 @@ def _background_product_refresh():
     try:
         products = _fetch_products_from_sheet()
         if products is not None:
-            PRODUCTS = products
+            _install_catalog(products)
             LAST_PRODUCT_REFRESH = now_ts()
             print("PRODUCTS LOADED:", len(PRODUCTS), flush=True)
             print("PRODUCT CODES:", list(PRODUCTS.keys()), flush=True)
@@ -455,7 +484,7 @@ def load_products(force=False):
         try:
             products = _fetch_products_from_sheet()
             if products is not None:
-                PRODUCTS = products
+                _install_catalog(products)
                 LAST_PRODUCT_REFRESH = now_ts()
                 print("PRODUCTS LOADED:", len(PRODUCTS), flush=True)
                 print("PRODUCT CODES:", list(PRODUCTS.keys()), flush=True)
@@ -1627,7 +1656,7 @@ def _mingalar_safe_product_detail(value):
     # Treat each explicit line as a unit. If old pricing is embedded in the
     # same line as a description, omit that line rather than risk sending a
     # contradictory price to a customer.
-    parts = re.split(r"\n+", text)
+    parts = re.split(r"\n+|[;；]", text)
     safe_parts = []
     stale_price_or_delivery = re.compile(
         r"(?i)(?:"
@@ -1643,7 +1672,14 @@ def _mingalar_safe_product_detail(value):
         if not part:
             continue
         if stale_price_or_delivery.search(part):
-            continue
+            # Remove monetary clauses, preserving specification text before them.
+            marker = re.search(r"(?:ဈေးနှုန်း|စျေးနှုန်း|ရောင်းဈေး|ရောင်းစျေး|ပို့ခ|ပို့ဆောင်ခ|အိမ်အရောက်\s*အပြီးအစီး|\bprice\b|delivery\s*(?:fee|charge|cost))", part, re.I)
+            if marker:
+                part = part[:marker.start()].strip(" /၊,-:—")
+            elif re.fullmatch(r"[\d, .]+\s*(?:Ks|ကျပ်)", part, re.I):
+                part = ""
+            if not part:
+                continue
         safe_parts.append(part)
     return "\n".join(safe_parts).strip()
 
@@ -2033,6 +2069,7 @@ def manychat_input_key(data, message, contact_id, image_url):
                 except Exception:
                     context_bits.append(f"{key}={value}")
     return "|".join([
+        _catalog_revision(),
         str(contact_id or "").strip(),
         str(message or "").strip(),
         str(image_url or "").strip(),
@@ -2941,16 +2978,15 @@ def detect_delivery_area_from_text(value):
         "တွံတေး", "twantay",
         "ကျောက်မြောင်း", "kyaukmyaung",
     )
-    if any(word in low for word in yangon_words):
-        return "yangon"
+    yangon_match = any(word in low for word in yangon_words)
 
     # Explicit non-Yangon places. This list intentionally contains common
     # destination cities; AI can still recognize less-common ones.
     other_words = (
-        "နယ်", "မန္တလေး", "mandalay", "နေပြည်တော်", "naypyidaw", "nay pyi taw",
+        "မန္တလေး", "mandalay", "နေပြည်တော်", "naypyidaw", "nay pyi taw",
         "ပဲခူး", "bago", "မော်လမြိုင်", "mawlamyine", "မော်လမြိုင်မြို့",
         "တောင်ကြီး", "taunggyi", "မကွေး", "magway", "စစ်ကိုင်း", "sagaing",
-        "ပုသိမ်", "pathein", "ပြည်", "pyay", "မုံရွာ", "monywa",
+        "ပုသိမ်", "pathein", "ပြည်မြို့", "pyay", "မုံရွာ", "monywa",
         "မိတ္ထီလာ", "meiktila", "မြင်းခြံ", "myingyan", "ကျောက်ဆည်", "kyaukse",
         "မြိတ်", "myeik", "ထားဝယ်", "dawei", "ကော့သောင်း", "kawthaung",
         "ဘားအံ", "hpa-an", "hpaan", "မြဝတီ", "myawaddy", "tachileik", "တာချီလိတ်",
@@ -2984,6 +3020,10 @@ def detect_delivery_area_from_text(value):
     )
     if any(word in low for word in other_region_words):
         return "other"
+    if yangon_match:
+        return "yangon"
+    if low in {"နယ်", "other", "other city"}:
+        return "other"
 
     # A literal city marker such as "...မြို့" (but not only "မြို့နယ်") is
     # usually how up-country buyers identify their town.
@@ -3011,6 +3051,8 @@ def infer_delivery_area_for_complete_order(session):
     if not address:
         return session
 
+    if session.get("_delivery_confirmed_for") == address and session.get("delivery_area") in {"yangon", "other"}:
+        return session
     detected = detect_delivery_area_from_text(address)
     if detected:
         session["delivery_area"] = detected
@@ -3022,8 +3064,8 @@ def infer_delivery_area_for_complete_order(session):
         and session.get("phone")
         and session.get("items")
     ):
-        session["delivery_area"] = "yangon"
-        print("DELIVERY AREA DEFAULTED TO YANGON:", address, flush=True)
+        session["delivery_area"] = ""
+        print("DELIVERY AREA NEEDS CONFIRMATION:", address, flush=True)
 
     return session
 
@@ -3319,6 +3361,11 @@ def is_quantity_only_message(text):
 
 def merge_order_message(sender_id, message):
     session = get_order_session(sender_id)
+    area_reply = str(message or "").strip().lower()
+    if session.get("address") and area_reply in {"ရန်ကုန်", "ရန်ကုန်ပါ", "ရန်ကုန်ပါရှင်", "yangon", "နယ်", "နယ်ပါ", "နယ်ပါရှင်", "other"}:
+        session["delivery_area"] = "yangon" if area_reply.startswith(("ရန်ကုန်", "yangon")) else "other"
+        session["_delivery_confirmed_for"] = session["address"]
+        return session
     explicit_qty = extract_explicit_quantity(message)
 
     if not is_quantity_only_message(message):
@@ -3386,9 +3433,8 @@ def order_missing_fields(session):
     if not session.get("items"):
         missing.append("ပစ္စည်း")
 
-    # Do not make Yangon buyers type "ရန်ကုန်". Once core order details are
-    # complete, infer_delivery_area_for_complete_order() resolves the area; an
-    # unknown complete address defaults to Yangon by the shop rule.
+    if not session.get("delivery_area") and not is_mingalar_page(session_page_name(session)):
+        missing.append("ရန်ကုန်/နယ်")
     return missing
 
 
@@ -4032,7 +4078,7 @@ def delivery_time_reply(text):
     )
 
     other_words = (
-        "နယ်", "မန္တလေး", "နေပြည်တော်", "ပဲခူး", "မော်လမြိုင်",
+        "မန္တလေး", "နေပြည်တော်", "ပဲခူး", "မော်လမြိုင်",
         "တောင်ကြီး", "မကွေး", "စစ်ကိုင်း", "ပုသိမ်", "ပြည်",
         "mandalay", "naypyidaw", "bago", "mawlamyine",
     )
@@ -4145,6 +4191,17 @@ def handle_explicit_admin_takeover(data):
     pause_for_admin(contact_id)
     print("V50 EXPLICIT ADMIN TAKEOVER - BOT PAUSED:", contact_id, flush=True)
     return manychat_response([])
+
+
+def shop_policy_answer(text):
+    low = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if any(word in low for word in ("ဆိုင်လိပ်စာ", "ဆိုင်ဘယ်", "ဆိုင်ကဘယ်", "ဆိုင်ရှိလား", "ဆိုင်ဖွင့်", "ဆိုင်ဖွင့်", "shop address", "where is your shop")):
+        return "ဆိုင်မဖွင့်ထားပါဘူး အွန်လိုင်းအရောင်းသီးသန့်ပါ အိမ်ရောက်ငွေချေစနစ်နဲ့ပဲ ရောင်းပါတယ်။"
+    if asks_delivery_time(low):
+        return delivery_time_reply(low)
+    if any(word in low for word in ("ငွေကြိုလွှဲ", "အိမ်ရောက်ငွေချေ", "cash on delivery")) or low in {"cod", "cod ရလား", "cod ရလားရှင်"}:
+        return "တစ်နိုင်ငံလုံး အိမ်အရောက် COD စနစ်ဖြင့် မှာယူနိုင်ပါတယ်ရှင်။ ပစ္စည်းရောက်မှ ငွေချေရပါမယ်။"
+    return ""
 
 
 def handle_manychat_request(data):
@@ -4261,6 +4318,10 @@ def handle_manychat_request(data):
     if admin_is_active(contact_id):
         print("MANYCHAT ADMIN ACTIVE - BOT SILENT:", contact_id, flush=True)
         return manychat_response([])
+
+    policy_answer = shop_policy_answer(message)
+    if policy_answer and not incoming_image_urls and not explicit_catalog_code_candidates(message):
+        return done(manychat_text(policy_answer))
 
     # After a successful Telegram order + delivery-time reply, silence ALL buyer
     # follow-ups for 30 minutes. This is independent of the Admin pause system.
@@ -5303,6 +5364,11 @@ def webhook():
 
             if admin_is_active(sender_id):
                 print("ADMIN ACTIVE - BOT SILENT:", sender_id, flush=True)
+                continue
+
+            policy_answer = shop_policy_answer(text)
+            if policy_answer and not incoming_image_urls and not explicit_catalog_code_candidates(text):
+                send_facebook_text(sender_id, policy_answer)
                 continue
 
             if post_order_auto_stop_active(sender_id):
