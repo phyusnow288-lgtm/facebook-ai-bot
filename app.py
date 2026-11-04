@@ -5,7 +5,7 @@
 # Existing Admin pause, explicit-code, order, Telegram and delivery flows preserved.
 # V59: nonblocking Sheet refresh + retry replay + stable image proxy + active-order product lock.
 # =========================
-BOT_BUILD = "V68_CURRENT_SHEET_KNOWLEDGE"
+BOT_BUILD = "V71_SHEET_ONLY_ADDRESS_SAFE"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -49,7 +49,7 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
-BOT_VERSION = "V68_CURRENT_SHEET_KNOWLEDGE"
+BOT_VERSION = "V71_SHEET_ONLY_ADDRESS_SAFE"
 ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 POST_ORDER_ACK_TTL_SECONDS = int(os.environ.get("POST_ORDER_ACK_TTL_SECONDS", "86400"))
 POST_ORDER_AUTO_STOP_SECONDS = int(os.environ.get("POST_ORDER_AUTO_STOP_SECONDS", "1800"))
@@ -436,17 +436,19 @@ def _catalog_revision(products=None):
 
 def _install_catalog(products):
     global PRODUCTS
-    changed = {code for code in PRODUCTS if PRODUCTS.get(code) != products.get(code)}
+    changed = {code for code in set(PRODUCTS) | set(products)
+               if PRODUCTS.get(code) != products.get(code)}
     PRODUCTS = products
     if not changed:
         return
     # Never carry the old product selection into a replacement with the same code.
     for session in list(ORDER_SESSIONS.values()):
-        if changed.intersection(session.get("items", {})) or session.get("last_product_code") in changed:
+        if changed.intersection(session.get("items", {})) or session.get("last_product_code") in changed or session.get("ad_product_code") in changed:
             session["items"] = {}
             session["last_product_code"] = ""
+            session.pop("ad_product_code", None)
             session["quantity_confirmed"] = False
-    for name in ("IMAGE_MATCH_CACHE", "RECENT_MANYCHAT_RESPONSES", "RECENT_MANYCHAT_INPUTS"):
+    for name in ("IMAGE_MATCH_CACHE", "RECENT_MANYCHAT_RESPONSES", "RECENT_MANYCHAT_INPUTS", "META_AD_CONTEXT"):
         cache = globals().get(name)
         if isinstance(cache, dict):
             cache.clear()
@@ -3117,7 +3119,7 @@ def is_likely_delivery_address(value):
     # township/city.  A genuinely structured address or address+phone can pass.
     question_tokens = (
         "လား", "လဲ", "ဘယ်", "ဘယ်လောက်", "ရမလား", "ရှိလား", "ရှိသေးလား",
-        "ပို့ခ", "စျေး", "ဈေး", "အသုံးပြု", "ဘယ်လို", "အော်ဒါတင်ပေးမှာလား",
+        "ပို့ခ", "အသုံးပြု", "ဘယ်လို", "အော်ဒါတင်ပေးမှာလား",
         "အော်ဒါတင်ပေးမလား", "how much", "price", "delivery fee",
         "can i", "can you", "do you", "is it", "how to", "what", "where",
         "available", "in stock", "order?", "?",
@@ -3286,6 +3288,16 @@ def extract_order_fields_locally(message, session=None):
             continue
         clean_parts.append(part_without_code.strip(" ,.-"))
     clean_parts = [p for p in clean_parts if p]
+
+    # A typed recipient name before phone/address must not leak into address
+    # when the Facebook account name is already locked. Require a full contact
+    # message and an independently recognizable following address.
+    if (current.get("_account_name_locked") and result["phone"]
+            and len(clean_parts) >= 2
+            and len(clean_parts[0]) <= 80
+            and not is_likely_delivery_address(clean_parts[0])
+            and is_likely_delivery_address(" / ".join(clean_parts[1:]))):
+        clean_parts = clean_parts[1:]
 
     # Multi-part: first non-address-looking segment is usually name.
     if clean_parts:
@@ -4207,55 +4219,21 @@ def shop_policy_answer(text):
 
 
 
-# Product knowledge is editable data, independent of bot/UI code.
-PRODUCT_KNOWLEDGE_PATH = os.environ.get(
-    "PRODUCT_KNOWLEDGE_PATH", str(Path(__file__).with_name("product_knowledge.json")))
-
-def _knowledge_name(value):
-    return re.sub(r"[\s_\-]+", "", unicodedata.normalize("NFKC", str(value or "")).casefold())
-
+# Product facts come exclusively from the current Sheet row. Local archives are
+# intentionally ignored, including when a Sheet cell is cleared or renamed.
 def product_knowledge_facts(code, product):
-    """Only this item's verified data; never reuse facts after a code swap.
-
-    Dedicated Sheet knowledge columns take precedence over archived supplements.
-    Commercial facts (price/stock/delivery) remain in the existing current-Sheet path.
-    """
-    fields = ("Knowledge", "Product Knowledge", "Specifications", "Usage", "Included Items",
-              "Sizes", "Colors", "Color Selection", "Compatibility", "Cautions", "Warranty", "FAQ")
+    excluded = {"missing details", "review only", "internal notes", "admin notes"}
     current = {}
-    for field in fields:
-        value = str(get_row_value(product, field) or "").strip()
+    for key, value in (product or {}).items():
+        field = str(key or "").strip()
+        normalized = re.sub(r"[_\s]+", " ", field).casefold()
+        if not field or normalized in excluded or field.startswith("_"):
+            continue
+        value = "" if value is None else str(value).strip()
         if value:
             current[field] = value
-    result = {"current_sheet_knowledge": current, "verified_supplement": [], "verified_faq": []}
-    try:
-        with open(PRODUCT_KNOWLEDGE_PATH, encoding="utf-8") as handle:
-            data = json.load(handle)
-        if data.get("schema_version") != 1 or not isinstance(data.get("products"), list):
-            return result
-        name = _knowledge_name(get_row_value(product, "Product Name", "Name", "product_name"))
-        for record in data["products"]:
-            if not isinstance(record, dict) or str(record.get("code", "")) != str(code):
-                continue
-            aliases = [_knowledge_name(alias) for alias in record.get("identity_aliases", []) if isinstance(alias, str)]
-            if not name or not any(len(alias) >= 3 and alias in name for alias in aliases):
-                print("KNOWLEDGE IDENTITY MISMATCH:", code, flush=True)
-                return result
-            result["verified_supplement"] = [
-                {"id": fact["id"], "text": fact["text"]}
-                for fact in record.get("approved_facts", [])
-                if isinstance(fact, dict) and isinstance(fact.get("text"), str) and fact.get("id")
-            ]
-            result["verified_faq"] = [
-                {"question": faq["question"], "answer": faq["answer"]}
-                for faq in record.get("faq", [])
-                if isinstance(faq, dict) and isinstance(faq.get("question"), str) and isinstance(faq.get("answer"), str)
-            ]
-            break
-    except (OSError, ValueError, TypeError, AttributeError) as error:
-        # Missing/bad knowledge must never stop code/image/order responses.
-        print("PRODUCT KNOWLEDGE UNAVAILABLE:", type(error).__name__, flush=True)
-    return result
+    return {"current_sheet_knowledge": current,
+            "verified_supplement": [], "verified_faq": []}
 
 
 def customer_service_reply(text, session):
@@ -4344,8 +4322,8 @@ def customer_service_reply(text, session):
     answer = openai_chat([
         {"role": "system", "content":
             "You answer customer product questions for a Myanmar online shop. "
-            "Use ONLY the supplied current Sheet facts and verified product knowledge. "
-            "All current Sheet fields, including product_detail and dedicated knowledge columns, override archived supplement facts when they conflict. "
+            "Use ONLY the supplied current Sheet row. "
+            "There are no archived supplements. Blank or removed Sheet values are unknown; never recall old facts. "
             "Current Sheet price_and_availability is the ONLY source for prices, delivery and stock. "
             "Do not infer availability of a color, size, or a color-choice policy from a product photo. "
             "Use semantic meaning; the question does not need to exactly match a saved FAQ. "
@@ -4356,7 +4334,7 @@ def customer_service_reply(text, session):
             "Do not request name/address/phone, create an order, or claim an action was done. "
             "For Mingalar never expose a separate delivery charge; use the supplied all-in price. "
             "Return JSON only: {\"answer\":\"...\",\"needs_admin\":false}. "
-            "If the Sheet AND verified knowledge do not answer the question return {\"answer\":\"\",\"needs_admin\":true}."},
+            "If the current Sheet does not answer the question return {\"answer\":\"\",\"needs_admin\":true}."},
         {"role": "user", "content": json.dumps({"page": session_page_name(session) or "Snow Phyu",
                                                 "facts": facts, "question": str(text)}, ensure_ascii=False)},
     ], max_tokens=900, temperature=0)
@@ -5858,781 +5836,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
     )
-{
-  "schema_version": 1,
-  "updated_on": "2026-11-04",
-  "status": "V68_current_sheet_synced_not_deployed",
-  "pricing_source": "Current live product Sheet only. This knowledge file contains no sell prices, fees, stock counts or promotions.",
-  "review_rule": "Only approved_facts and current Sheet dedicated knowledge fields go to customer AI; review_only and missing_details never become facts.",
-  "products": [
-    {
-      "code": "0001",
-      "product_key": "sand-blasting-gun",
-      "name": "Sand Blasting Gun (သဲမှုတ်စက်)",
-      "identity_aliases": [
-        "Sand Blasting Gun (သဲမှုတ်စက်)",
-        "sand blasting gun",
-        "sandblasting gun",
-        "သဲမှုတ်"
-      ],
-      "approved_facts": [
-        {
-          "id": "0001-SHEET",
-          "text": "သံချေး၊ အညစ်အကြေးနှင့် အဟောင်းမျက်နှာပြင်များဖယ်ရှားရန်သုံးသော Sand Blasting Gun။ Air Compressor နှင့်တွဲသုံးနိုင်သည်။ လေဝင်ပေါက် 1/4\"၊ လေဖိအား 90 PSI။ သဲကြမ်း/Abrasive Media ကိုအသုံးပြုရန်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "Compressor လိုသလား",
-        "လေဝင်ပေါက်ဆိုဒ်က ဘယ်လောက်လဲ"
-      ],
-      "missing_details": [
-        "compressor airflow requirement label / included abrasive media"
-      ],
-      "review_only": [
-        {
-          "text": "Current Sheet says700 CFM; verify label before compressor-sizing advice.",
-          "reason": "Suspicious airflow entry retained in source; no invented correction."
-        }
-      ],
-      "faq": [
-        {
-          "question": "Compressor လိုသလား",
-          "answer": "Air Compressor နှင့် တွဲသုံးရသော သဲမှုတ်သေနတ်ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "လေဝင်ပေါက်ဆိုဒ်က ဘယ်လောက်လဲ",
-          "answer": "လေဝင်ပေါက် 1/4 inch ပါရှင်။ Sheet မှာ လေဖိအား 90 PSI ဟု ဖော်ပြထားပါတယ်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0002",
-      "product_key": "metal-sheet-cutter-head",
-      "name": "Metal Sheet Cutter Head (သတ္တုချပ်ဖြတ်စက်)",
-      "identity_aliases": [
-        "Metal Sheet Cutter Head (သတ္တုချပ်ဖြတ်စက်)",
-        "metal sheet cutter",
-        "သတ္တုချပ်ဖြတ်"
-      ],
-      "approved_facts": [
-        {
-          "id": "0002-SHEET",
-          "text": "Electric Drill သိုမဟုတ် Battery Drill နှင့်ချိတ်ဆက်၍ သတ္တုချပ်များဖြတ်နိုင်သော Metal Sheet Cutter Head။ 0.8mm အထူအထိဖြတ်နိုင်သည်။ Cutter Head, Wrench, Hex Wrench, Handle နှင့် Adapter များပါဝင်သည်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "Battery Drill နဲ့ သုံးလို့ရလား",
-        "ဘယ်လောက်ထူတာ ဖြတ်နိုင်လဲ",
-        "ဘာတွေပါလဲ"
-      ],
-      "missing_details": [
-        "metal-specific cutting limits / drill compatibility"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "Battery Drill နဲ့ သုံးလို့ရလား",
-          "answer": "Electric Drill သို့မဟုတ် Battery Drill နဲ့ ချိတ်ဆက်သုံးနိုင်ပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘယ်လောက်ထူတာ ဖြတ်နိုင်လဲ",
-          "answer": "Sheet အရ သတ္တုချပ် 0.8 mm အထူအထိ ဖြတ်နိုင်ပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘာတွေပါလဲ",
-          "answer": "Cutter Head၊ Wrench၊ Hex Wrench၊ Handle နဲ့ Adapter များ ပါဝင်ပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0003",
-      "product_key": "boxer-5pack-2xl",
-      "name": "အမျိုးသားဝတ် Boxer အတွင်းခံဘောင်းဘီ (၅ ထည်စုံ)",
-      "identity_aliases": [
-        "အမျိုးသားဝတ် Boxer အတွင်းခံဘောင်းဘီ (၅ ထည်စုံ)",
-        "boxer",
-        "ဘောက်ဆာ",
-        "အတွင်းခံ"
-      ],
-      "approved_facts": [
-        {
-          "id": "0003-SHEET",
-          "text": "အမျိုးသားဝတ် Boxer အတွင်းခံဘောင်းဘီ။ ပေါင်တိုဒီဇိုင်း၊ ခါးပတ်ပြားအကျယ်နှင့် ဆွဲသားဖြစ်ပါသည်။ ဆိုဒ်တစ်မျိုးတည်း — 2XL (တံဆိပ်ပါ 180/100)။ ၅ ထည်တစ်စုံ။ ရရှိနိုင်သောအရောင်များ — အနီ၊ အမဲ၊ အဝါ၊ ခဲဖြူ၊ ခဲမဲ၊ အစိမ်း။ ခါးဆိုဒ် ၂၈ မှ ၃၈ လက်မအထိ ဝတ်နိုင်ပါသည်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "ဘယ်နှထည်ပါလဲ",
-        "Size ဘာလဲ၊ ဆိုဒ်ရွေးလို့ရလား",
-        "ဘယ်ဒီဇိုင်းလဲ",
-        "ဘာအရောင်တွေရှိလဲ",
-        "အသားက ဘာသားလဲ၊ ဆွဲသားလား",
-        "ခါးဆိုဒ် ဘယ်လောက်အထိ ဝတ်လို့ရလဲ"
-      ],
-      "missing_details": [
-        "အရောင်ရွေးခွင့် ရ/မရ"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "ဘယ်နှထည်ပါလဲ",
-          "answer": "၅ ထည်တစ်စုံပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "Size ဘာလဲ၊ ဆိုဒ်ရွေးလို့ရလား",
-          "answer": "ဆိုဒ်တစ်မျိုးတည်း 2XL ပါရှင်။ တံဆိပ်ပေါ်မှာ 180/100 လို့ ဖော်ပြထားပါတယ်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘယ်ဒီဇိုင်းလဲ",
-          "answer": "ပေါင်တိုဒီဇိုင်း၊ ခါးပတ်ပြားအကျယ်နဲ့ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘာအရောင်တွေရှိလဲ",
-          "answer": "အနီ၊ အမဲ၊ အဝါ၊ ခဲဖြူ၊ ခဲမဲ၊ အစိမ်း ရှိပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "အသားက ဘာသားလဲ၊ ဆွဲသားလား",
-          "answer": "ဆွဲသားပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ခါးဆိုဒ် ဘယ်လောက်အထိ ဝတ်လို့ရလဲ",
-          "answer": "ခါးဆိုဒ် ၂၈ မှ ၃၈ လက်မအထိ ဝတ်လို့ရပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0004",
-      "product_key": "aluminum-mini-vise",
-      "name": "အလူမီနီယံ Mini Vise Clamp (မီနီဗိုက်စ်ခုံ)",
-      "identity_aliases": [
-        "အလူမီနီယံ Mini Vise Clamp (မီနီဗိုက်စ်ခုံ)",
-        "mini vise",
-        "mini vice",
-        "ဗိုက်စ်",
-        "မီနီဗိုက်"
-      ],
-      "approved_facts": [
-        {
-          "id": "0004-SHEET",
-          "text": "အသေးစားပစ္စည်းများကိုကိုင်ထား၍ ပြုပြင်ခြင်း၊ ထွင်းထုခြင်း၊ ကော်ကပ်ခြင်းနှင့် DIY လုပ်ငန်းများအတွက် Aluminum Mini Vise Clamp။ မေးရိုးအဖွင့် 30mm၊ ကုပ်တပ်နိုင်သောအနက် 40mm၊ အရွယ်အစား 9×9cm။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "ဘယ်အတွက်သုံးလဲ",
-        "ဆိုဒ်ဘယ်လောက်လဲ"
-      ],
-      "missing_details": [
-        "mounting range"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "ဘယ်အတွက်သုံးလဲ",
-          "answer": "အသေးစားပစ္စည်းကို ထိန်းထားပြီး ပြုပြင်၊ ထွင်းထု၊ ကော်ကပ်ခြင်းနဲ့ DIY လုပ်ငန်းများမှာ သုံးနိုင်ပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဆိုဒ်ဘယ်လောက်လဲ",
-          "answer": "မေးရိုးအဖွင့် 30mm၊ ကုပ်တပ်နိုင်သောအနက် 40mm၊ အရွယ်အစား 9×9cm ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0005",
-      "product_key": "oring-225pcs",
-      "name": "O-Ring ပြုပြင်ရေးကိရိယာ 225 PCS",
-      "identity_aliases": [
-        "O-Ring ပြုပြင်ရေးကိရိယာ 225 PCS",
-        "o-ring",
-        "oring",
-        "o ring",
-        "အိုရင်း"
-      ],
-      "approved_facts": [
-        {
-          "id": "0005-SHEET",
-          "text": "စက်ပစ္စည်း၊ ရေစုပ်စက်၊ Air Compressor၊ ဆိုင်ကယ်၊ ကားပြုပြင်ရေးအတွက် O-Ring Set။ 225 PCS ပါဝင်ပြီး လူသုံးများသော Size 18 မျိုးပါဝင်သည်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "ဘယ်နှခုပါလဲ",
-        "ဘာအတွက်သုံးလဲ"
-      ],
-      "missing_details": [
-        "exact18 ring-size list / ring material/fluid compatibility"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "ဘယ်နှခုပါလဲ",
-          "answer": "225 PCS ပါရှင်။ လူသုံးများသော Size 18 မျိုး ပါဝင်ပါတယ်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘာအတွက်သုံးလဲ",
-          "answer": "စက်ပစ္စည်း၊ ရေစုပ်စက်၊ Air Compressor၊ ဆိုင်ကယ်နဲ့ ကားပြုပြင်ရေးအတွက် O-Ring Set ပါရှင်။ အတိအကျကိုက်မကိုက်တော့ လိုအပ်တဲ့ ring ဆိုဒ်နဲ့ တိုက်စစ်ရပါမယ်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0006",
-      "product_key": "vacuum-sealer",
-      "name": "Vacuum Sealer အစားအစာ လေစုပ်အိတ်ပိတ်စက်",
-      "identity_aliases": [
-        "Vacuum Sealer အစားအစာ လေစုပ်အိတ်ပိတ်စက်",
-        "vacuum sealer",
-        "လေစုပ်",
-        "လေစုပ်အိတ်ပိတ်"
-      ],
-      "approved_facts": [
-        {
-          "id": "0006-SHEET",
-          "text": "Vacuum Sealer အစားအစာ လေစုပ်လေလုံပိတ်စက်။ အသား၊ ငါး၊ ဟင်းသီးဟင်းရွက်၊ အခြောက်အခြမ်း၊ အခွံမာသီးနှင့် အစားအစာမျိုးစုံကို အိတ်ထဲမှ လေစုပ်ထုတ်ပြီး လေလုံအောင် ပိတ်ပေးနိုင်ပါသည်။ 6 လက်မ × 10 လက်မ Vacuum အိတ် 10 အိတ် ပါဝင်ပါသည်။ ရိုးရိုးအိတ် သိုမဟုတ် အခြားအိတ်များဖြင့် အသုံးပြု၍မရပါ။ စက်အတွက် သတ်မှတ်ထားသော Vacuum အိတ်ဖြင့်သာ အသုံးပြုရပါမည်။\nအပို Vacuum အိတ်ဆိုဒ်များ — 7 လက်မ၊ 10 လက်မ",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "အိတ်ပါလား",
-        "ရိုးရိုးအိတ်နဲ့ရလား",
-        "အပိုအိတ်ဆိုဒ် ဘာရလဲ",
-        "ဘာတွေထုပ်လို့ရလဲ"
-      ],
-      "missing_details": [
-        "wet/liquid-food operating limits / voltage/power"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "အိတ်ပါလား",
-          "answer": "6 လက်မ × 10 လက်မ Vacuum အိတ် 10 အိတ် ပါဝင်ပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ရိုးရိုးအိတ်နဲ့ရလား",
-          "answer": "ရိုးရိုးအိတ်နဲ့ မရပါရှင်။ စက်အတွက် သတ်မှတ်ထားတဲ့ Vacuum အိတ်နဲ့ပဲ သုံးရပါမယ်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "အပိုအိတ်ဆိုဒ် ဘာရလဲ",
-          "answer": "အပိုအိတ် 7 လက်မနဲ့ 10 လက်မ ဆိုဒ်တွေ ဆိုင်စာရင်းမှာ ရှိပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘာတွေထုပ်လို့ရလဲ",
-          "answer": "Sheet မှာ အသား၊ ငါး၊ ဟင်းသီးဟင်းရွက်၊ အခြောက်အခြမ်းနဲ့ အခွံမာသီးတို့ကို ဖော်ပြထားပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0007",
-      "product_key": "master-socket-24",
-      "name": "24 မျိုးပါ Socket လက်ကိုင်ဘောက်အစုံ (1/2″ Drive)",
-      "identity_aliases": [
-        "24 မျိုးပါ Socket လက်ကိုင်ဘောက်အစုံ (1/2″ Drive)",
-        "master socket",
-        "socket set",
-        "မာစတာဆော့ကတ်",
-        "socket",
-        "ဆော့ကတ်"
-      ],
-      "approved_facts": [
-        {
-          "id": "0007-SHEET",
-          "text": "ကားပြင်၊ စက်ပြင်နှင့် အိမ်သုံးပြုပြင်ရေးအတွက် အသုံးပြုနိုင်သော Socket Set ဖြစ်ပါသည်။ Socket ခေါင်း 18 မျိုးနှင့် Ratchet လက်ကိုင်၊ အတို/အရှည် ဆက်တံ၊ T လက်ကိုင်၊ အဆစ်ဆက်ခေါင်း စသည့် ဆက်စပ်ပစ္စည်းများအပါအဝင် စုစုပေါင်း 24 မျိုးပါဝင်ပါသည်။ သံဘူးဖြင့် စနစ်တကျ သိမ်းဆည်းသယ်ဆောင်နိုင်ပါသည်။\r\nပါဝင်သော Socket ဆိုဒ်များ —\r\n\r\n8mm / 10mm / 11mm / 12mm / 13mm / 14mm / 15mm / 16mm / 17mm / 18mm / 19mm / 20mm / 21mm / 22mm / 24mm / 27mm / 30mm / 32mm",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "Socket ဘယ်ဆိုဒ်တွေပါလဲ",
-        "9mm ပါလား",
-        "Drive ဆိုဒ် ဘယ်လောက်လဲ",
-        "ဘာတွေပါလဲ"
-      ],
-      "missing_details": [
-        "impact-driver compatibility"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "Socket ဘယ်ဆိုဒ်တွေပါလဲ",
-          "answer": "8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 27, 30, 32 mm ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "9mm ပါလား",
-          "answer": "ဖော်ပြထားတဲ့ Socket ဆိုဒ်စာရင်းမှာ 9mm မပါပါဘူးရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "Drive ဆိုဒ် ဘယ်လောက်လဲ",
-          "answer": "1/2 inch Drive ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘာတွေပါလဲ",
-          "answer": "Socket ခေါင်း 18 မျိုး၊ Ratchet၊ အတို/အရှည် ဆက်တံ၊ T လက်ကိုင်၊ အဆစ်ဆက်ခေါင်း စတဲ့ပစ္စည်းများအပါအဝင် စုစုပေါင်း 24 မျိုးပါ Set ဖြစ်ပါတယ်ရှင်။ သံဘူးနဲ့ သိမ်းဆည်းနိုင်ပါတယ်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0008",
-      "product_key": "920-flame-gun",
-      "name": "920 Flame Gun",
-      "identity_aliases": [
-        "920 Flame Gun",
-        "920 flame",
-        "920 မီး",
-        "မီးမှုတ်သေနတ်920"
-      ],
-      "approved_facts": [
-        {
-          "id": "0008-SHEET",
-          "text": "ဘက်စုံသုံး 920 Flame Gun။ Electronic Ignition ပါဝင်ပြီး BBQ၊ အသားကင်၊ မုန့်ဖုတ်၊ ကြေးနီ/ငွေဂဟေဆော်ခြင်း၊ ဥယျာဉ်နှင့် ပြုပြင်ရေးလုပ်ငန်းများတွင်အသုံးပြုနိုင်သည်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "မီးခြစ်လိုလား",
-        "ဘာတွေသုံးလို့ရလဲ"
-      ],
-      "missing_details": [
-        "fuel compatibility / gas canister included / temperature rating"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "မီးခြစ်လိုလား",
-          "answer": "Electronic Ignition ပါဝင်ပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘာတွေသုံးလို့ရလဲ",
-          "answer": "BBQ၊ အသားကင်၊ မုန့်ဖုတ်၊ ကြေးနီ/ငွေဂဟေဆော်ခြင်း၊ ဥယျာဉ်နဲ့ ပြုပြင်ရေးလုပ်ငန်းများမှာ အသုံးပြုနိုင်ကြောင်း Sheet မှာ ဖော်ပြထားပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0009",
-      "product_key": "cyber-sonic-amplifier",
-      "name": "Cyber Sonic နားကြားအကူကိရိယာ",
-      "identity_aliases": [
-        "Cyber Sonic နားကြားအကူကိရိယာ",
-        "hearing amplifier",
-        "cyber sonic",
-        "နားကြား"
-      ],
-      "approved_facts": [
-        {
-          "id": "0009-SHEET",
-          "text": "အကြားအာရုံအားနည်းသူများအတွက် Cyber Sonic Hearing Amplifier။ အသံအတိုးအကျယ်ချိန်ညှိနိုင်ပြီး Ear Tips 3 မျိုးပါဝင်သည်။ LR44 Battery အသုံးပြုသည်။ အလေးချိန် 11g၊ အရွယ်အစား 40×40×12mm။\nအသံချဲ့ကူညီရန်သာဖြစ်ပြီး လုံးဝနားမကြားသူအတွက် မဟုတ်ပါ။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "ဘယ်ဘက်ထရီသုံးလဲ",
-        "အသံချိန်လို့ရလား",
-        "ဆိုဒ်နဲ့အလေးချိန်",
-        "လုံးဝနားမကြားသူ သုံးလို့ရလား"
-      ],
-      "missing_details": [
-        "battery included / runtime"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "ဘယ်ဘက်ထရီသုံးလဲ",
-          "answer": "LR44 Battery သုံးပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "အသံချိန်လို့ရလား",
-          "answer": "အသံအတိုးအကျယ် ချိန်ညှိနိုင်ပါတယ်ရှင်။ Ear Tips 3 မျိုး ပါဝင်ပါတယ်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဆိုဒ်နဲ့အလေးချိန်",
-          "answer": "40×40×12mm၊ အလေးချိန် 11g ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "လုံးဝနားမကြားသူ သုံးလို့ရလား",
-          "answer": "ဒီပစ္စည်းက ကြားနိုင်စွမ်း အနည်းငယ်ရှိသေးသူအတွက် အသံချဲ့ကူညီပေးတာပါရှင်။ လုံးဝမကြားသူအတွက် ရတယ်လို့ မပြောနိုင်ပါဘူး။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0010",
-      "product_key": "extension-cable-20m",
-      "name": "20 မီတာ ပါဝါပလပ် / Extension Cable",
-      "identity_aliases": [
-        "20 မီတာ ပါဝါပလပ် / Extension Cable",
-        "extension cable",
-        "extension cord",
-        "မီးကြိုး",
-        "ပလပ်ကြိုး"
-      ],
-      "approved_facts": [
-        {
-          "id": "0010-SHEET",
-          "text": "20 မီတာ (65.5 ပေ) Extension Cable။ 3-Pin Socket 2 ပေါက် + 2-Pin Socket 2 ပေါက်၊ Pure Copper၊ Cable Size 2×1.5mm²၊ အများဆုံး 10A / 2500W အထိအသုံးပြုနိုင်သည်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "ဘယ်လောက်ရှည်လဲ",
-        "ပေါက်ဘယ်နှပေါက်ပါလဲ",
-        "ဘယ်လောက်ဝပ်ထိလဲ",
-        "ကြေးကြိုးလား"
-      ],
-      "missing_details": [
-        "voltage / appliance-specific compatibility / reel use conditions"
-      ],
-      "review_only": [
-        {
-          "text": "Archived16A/3600W is superseded; use current10A/2500W.",
-          "reason": "Current Sheet overrides old conversation data."
-        }
-      ],
-      "faq": [
-        {
-          "question": "ဘယ်လောက်ရှည်လဲ",
-          "answer": "20 မီတာ၊ 65.5 ပေ ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ပေါက်ဘယ်နှပေါက်ပါလဲ",
-          "answer": "3-Pin ပေါက် ၂ ပေါက်နဲ့ 2-Pin ပေါက် ၂ ပေါက် ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘယ်လောက်ဝပ်ထိလဲ",
-          "answer": " အများဆုံး 10A / 2500W ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ကြေးကြိုးလား",
-          "answer": "Pure Copper၊ Cable Size 2×1.5mm² ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0011",
-      "product_key": "silicone-cupping-12",
-      "name": "စီလီကွန် စုပ်ခွက် 12 Cups Set",
-      "identity_aliases": [
-        "စီလီကွန် စုပ်ခွက် 12 Cups Set",
-        "silicone cupping",
-        "cupping",
-        "ဆီလီကွန်ခွက်"
-      ],
-      "approved_facts": [
-        {
-          "id": "0011-SHEET",
-          "text": "အိမ်တွင် စုပ်ခွက်နှိပ်နယ်ရန်အသုံးပြုနိုင်သော Silicone 12 Cups Set။ စုပ်ခွက် 12 ခု၊ ဂိုင်းတံ 1 ချောင်းနှင့် အသုံးပြုနည်းလမ်းညွှန်ပါဝင်သည်။ ABS + Silicone၊ အလေးချိန် 196g။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "ဘယ်နှခွက်ပါလဲ",
-        "ဘာသားလဲ"
-      ],
-      "missing_details": [
-        "cup diameters / manufacturer cautions"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "ဘယ်နှခွက်ပါလဲ",
-          "answer": "စုပ်ခွက် 12 ခု၊ ဂိုင်းတံ 1 ချောင်းနဲ့ အသုံးပြုနည်းလမ်းညွှန် ပါဝင်ပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘာသားလဲ",
-          "answer": "ABS + Silicone ပါရှင်။ အလေးချိန် 196g လို့ ဖော်ပြထားပါတယ်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0012",
-      "product_key": "waterproof-tape",
-      "name": "Waterproof Tape (ရေစိုခံတိပ်)",
-      "identity_aliases": [
-        "Waterproof Tape (ရေစိုခံတိပ်)",
-        "waterproof tape",
-        "water proof tape",
-        "butyl tape",
-        "ရေစိုခံတိပ်"
-      ],
-      "approved_facts": [
-        {
-          "id": "0012-SHEET",
-          "text": "Waterproof Tape (2 လက်မ) × 5Y (15 ပေ)။ အိမ်မိုးယို၊ အက်ကြောင်း၊ သွပ်မိုး၊ ရေပိုက်နှင့် ရေယိုစိမ့်နိုင်သောနေရာများတွင်အသုံးပြုနိုင်သည်။ 120°C အပူနှင့် -40°C အအေးအထိခံနိုင်သည်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "အလျားအနံဘယ်လောက်လဲ",
-        "ဘယ်မှာသုံးလို့ရလဲ",
-        "အပူအအေးဘယ်လောက်ခံလဲ"
-      ],
-      "missing_details": [
-        "surface preparation / thickness / material"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "အလျားအနံဘယ်လောက်လဲ",
-          "answer": "အနံ 2 လက်မ၊ အလျား 5 Yard (15 ပေ) ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘယ်မှာသုံးလို့ရလဲ",
-          "answer": "အိမ်မိုးယို၊ အက်ကြောင်း၊ သွပ်မိုး၊ ရေပိုက်နဲ့ ရေယိုစိမ့်နိုင်တဲ့နေရာများမှာ သုံးနိုင်ကြောင်း Sheet မှာ ဖော်ပြထားပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "အပူအအေးဘယ်လောက်ခံလဲ",
-          "answer": "Sheet မှာ -40°C မှ 120°C အထိ ခံနိုင်ကြောင်း ဖော်ပြထားပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0013",
-      "product_key": "portable-electronic-scale",
-      "name": "Portable Electronic Scale",
-      "identity_aliases": [
-        "Portable Electronic Scale",
-        "portable electronic scale",
-        "portable scale",
-        "hanging scale",
-        "ချိန်ခွင်",
-        "ဒစ်ဂျစ်တယ်ချိန်"
-      ],
-      "approved_facts": [
-        {
-          "id": "0013-SHEET",
-          "text": "Portable Electronic Scale။ 50 kg အထိ၊ ပိဿာချိန် ၃၀ အထိ ချိန်နိုင်သည်။ 0–10Kg တွင် 5g တိကျမှု၊ 10–50Kg တွင် 10g တိကျမှု။ LCD Display၊ TARE Function၊ UNIT kg/g/lb/oz ပါဝင်သည်။ အိမ်သုံး၊ Online Shop နှင့် ခရီးဆောင်အိတ်ချိန်ရန်အသုံးပြုနိုင်သည်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "ဘယ်နှကီလို၊ ဘယ်နှပိဿာအထိ ချိန်လို့ရလဲ",
-        "တိကျမှုဘယ်လောက်လဲ",
-        "ယူနစ်ပြောင်းလို့ရလား"
-      ],
-      "missing_details": [
-        "battery type"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "ဘယ်နှကီလို၊ ဘယ်နှပိဿာအထိ ချိန်လို့ရလဲ",
-          "answer": "50 kg အထိ၊ ပိဿာချိန် ၃၀ အထိ ချိန်လို့ရပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "တိကျမှုဘယ်လောက်လဲ",
-          "answer": "0–10Kg မှာ 5g၊ 10–50Kg မှာ 10g လို့ ဖော်ပြထားပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ယူနစ်ပြောင်းလို့ရလား",
-          "answer": "kg / viss / lb / oz ယူနစ်တွေ ပါဝင်ပါတယ်ရှင်။ TARE Function နဲ့ LCD Display ပါရှိပါတယ်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0014",
-      "product_key": "led-floodlight-4panel-ip66",
-      "name": "LED Flood Light 4 Panel",
-      "identity_aliases": [
-        "LED Flood Light 4 Panel",
-        "LED Flood Light 4 Panel",
-        "led flood light",
-        "led floodlight",
-        "4 panel",
-        "led မီး"
-      ],
-      "approved_facts": [
-        {
-          "id": "0014-SHEET",
-          "text": "LED Flood Light 4 Panel။ အရွယ်အစား 8.5 × 6.5 လက်မ။ အိမ်၊ ဆိုင်၊ ဂိုဒေါင်နှင့် အလုပ်ရုံများတွင် မီးအလင်းရောင်အတွက် အသုံးပြုနိုင်သည်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "အရွယ်အစား ဘယ်လောက်လဲ",
-        "မီးပြားဘယ်နှပြားလဲ"
-      ],
-      "missing_details": [
-        "power source / ဆိုလာလား / voltage / wattage / battery/runtime / warranty"
-      ],
-      "review_only": [
-        {
-          "text": "ရေစိုခံမှု မသေချာပါ။ IP66 နှင့် ရေစိုခံဟု မဖော်ပြရန်။",
-          "reason": "User correction 2026-11-04"
-        }
-      ],
-      "faq": [
-        {
-          "question": "အရွယ်အစား ဘယ်လောက်လဲ",
-          "answer": "8.5 × 6.5 လက်မ ရှိပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "မီးပြားဘယ်နှပြားလဲ",
-          "answer": "4 Panel၊ မီးပြား ၄ ပြားပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0015",
-      "product_key": "arrow-magnet-set",
-      "name": "Arrow Welding Magnet Set",
-      "identity_aliases": [
-        "Arrow Welding Magnet Set",
-        "arrow magnet",
-        "welding magnet",
-        "မြားသံလိုက်",
-        "ဂဟေသံလိုက်"
-      ],
-      "approved_facts": [
-        {
-          "id": "0015-SHEET",
-          "text": "Arrow Welding Magnet Set 6 Pieces။ 25 LBS Magnet 4 ခု + 10 LBS Magnet 2 ခု၊ 3 လက်မအရွယ်အစား။ 45°၊ 90°၊ 135° ထောင့်များတွင် သံတုံးများကိုထိန်းထား၍ Welding/Fabrication လုပ်ငန်းများတွင်အသုံးပြုနိုင်သည်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "ဘယ်နှခုပါလဲ",
-        "ဘယ်ထောင့်တွေထိန်းလို့ရလဲ",
-        "ဆိုဒ်ဘယ်လောက်လဲ"
-      ],
-      "missing_details": [
-        "manufacturer use cautions"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "ဘယ်နှခုပါလဲ",
-          "answer": "6 Pieces ပါရှင်။ 25 LBS Magnet 4 ခုနဲ့ 10 LBS Magnet 2 ခုပါ။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘယ်ထောင့်တွေထိန်းလို့ရလဲ",
-          "answer": "45°၊ 90°၊ 135° ထောင့်တွေမှာ သံတုံးကို ထိန်းထားပြီး Welding/Fabrication လုပ်ငန်းများမှာ သုံးနိုင်ပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဆိုဒ်ဘယ်လောက်လဲ",
-          "answer": "3 လက်မအရွယ်အစားလို့ ဖော်ပြထားပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0016",
-      "product_key": "chain-breaker",
-      "name": "Chain Breaker (ကွင်းဆက်ဖြုတ်စက်)",
-      "identity_aliases": [
-        "Chain Breaker (ကွင်းဆက်ဖြုတ်စက်)",
-        "chain breaker",
-        "ချိန်းဖြတ်",
-        "ချိန်းဖြုတ်"
-      ],
-      "approved_facts": [
-        {
-          "id": "0016-SHEET",
-          "text": "ဆိုင်ကယ်၊ စက်ဘီးနှင့် စက်မှုလုပ်ငန်းသုံး Roller Chain များအတွက် Chain Breaker။ Chain Pin ဖယ်ရှား၍ အရှည်ချိန်ညှိနိုင်သည်။ ခိုင်ခံ့သောသံမဏိဖြင့်ပြုလုပ်ထားပြီး Workshop နှင့် စက်ပြင်လုပ်ငန်းများအတွက်အသုံးပြုနိုင်သည်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "ဘာလုပ်ပေးတာလဲ",
-        "ဘယ်ချိန်းတွေအတွက်လဲ"
-      ],
-      "missing_details": [
-        "exact chain-size compatibility / included spare pins"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "ဘာလုပ်ပေးတာလဲ",
-          "answer": "Chain Pin ကို ဖယ်ရှားပြီး ချိန်းအရှည် ချိန်ညှိဖို့ သုံးတဲ့ ကိရိယာပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘယ်ချိန်းတွေအတွက်လဲ",
-          "answer": "Sheet မှာ ဆိုင်ကယ်၊ စက်ဘီးနဲ့ စက်မှုလုပ်ငန်းသုံး Roller Chain များအတွက် လို့ ဖော်ပြထားပါတယ်ရှင်။ အတိအကျကိုက်ဖို့ ချိန်းဆိုဒ်ကို ထပ်စစ်ဖို့လိုပါတယ်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    },
-    {
-      "code": "0017",
-      "product_key": "rat-glue-5cards",
-      "name": " ကြွက်ကပ်ကော် 5 ကဒ်",
-      "identity_aliases": [
-        " ကြွက်ကပ်ကော် 5 ကဒ်",
-        "ကြွက်ကပ်ကော် 5 ကဒ်",
-        "rat glue",
-        "rat glue board",
-        "ကြွက်ကော်"
-      ],
-      "approved_facts": [
-        {
-          "id": "0017-SHEET",
-          "text": "ကြွက်များကို ကပ်ဖမ်းရန်အသုံးပြုသော Mouse Glue Trap ဖြစ်ပါတယ်။ အိမ်၊ ဆိုင်၊ ဂိုဒေါင်၊ မီးဖိုချောင်နှင့် ကြွက်ဝင်ရောက်တတ်သောနေရာများတွင် အသုံးပြုနိုင်ပြီး အသုံးပြုရလွယ်ကူပါတယ်။",
-          "source": "Current Google Sheet and user corrections 2026-11-04"
-        }
-      ],
-      "faq_topics": [
-        "ဘယ်နှကဒ်ပါလဲ",
-        "ဘယ်မှာသုံးလို့ရလဲ"
-      ],
-      "missing_details": [
-        "card dimensions / manufacturer cautions"
-      ],
-      "review_only": [],
-      "faq": [
-        {
-          "question": "ဘယ်နှကဒ်ပါလဲ",
-          "answer": "5 ကဒ်ပါရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        },
-        {
-          "question": "ဘယ်မှာသုံးလို့ရလဲ",
-          "answer": "အိမ်၊ ဆိုင်၊ ဂိုဒေါင်၊ မီးဖိုချောင်နဲ့ ကြွက်ဝင်ရောက်တတ်တဲ့နေရာတွေမှာ ကြွက်ကို ကပ်ဖမ်းဖို့ သုံးနိုင်ပါတယ်ရှင်။",
-          "source": "Current Google Sheet 2026-11-04"
-        }
-      ]
-    }
-  ],
-  "source_sheet_url": "https://docs.google.com/spreadsheets/d/1JmtHU6uzx_VATwsGwf289eMS96-KfbuhZ9s0LdJPYRg/edit"
-}
