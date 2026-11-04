@@ -5857,7 +5857,8 @@ if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=port,
-    ){
+    )
+{
   "schema_version": 1,
   "updated_on": "2026-11-04",
   "status": "V68_current_sheet_synced_not_deployed",
