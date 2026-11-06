@@ -5,7 +5,7 @@
 # Existing Admin pause, explicit-code, order, Telegram and delivery flows preserved.
 # V59: nonblocking Sheet refresh + retry replay + stable image proxy + active-order product lock.
 # =========================
-BOT_BUILD = "V71_SHEET_ONLY_ADDRESS_SAFE"
+BOT_BUILD = "V72_MH_ALL_IN_PRICE_SAFE"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -1714,7 +1714,23 @@ def normalize_page_name(value):
 
 
 def is_mingalar_page(value):
-    return normalize_page_name(value) == normalize_page_name(MINGALAR_PAGE_NAME)
+    return normalize_page_name(value) in {
+        normalize_page_name(MINGALAR_PAGE_NAME), "mh", "mingalar",
+        "mingalar happy", "mingalar happy shopping",
+    }
+
+
+def manychat_page_name(data):
+    # Explicit page identity wins; an omitted field must not erase a known MH
+    # session. The dedicated endpoint also identifies first-time MH customers.
+    if request.path.rstrip("/") == "/webhook/mh":
+        return MINGALAR_PAGE_NAME
+    for key in ("page", "page_name", "shop_page_name"):
+        value = str(data.get(key, "") or "").strip()
+        if value:
+            return MINGALAR_PAGE_NAME if is_mingalar_page(value) else ""
+    contact_id = str(data.get("contact_id", "") or "").strip()
+    return session_page_name(ORDER_SESSIONS.get(contact_id, {}))
 
 
 def session_page_name(session):
@@ -4283,7 +4299,7 @@ def customer_service_reply(text, session):
         return None
     question_words = ("လား", "လဲ", "ဘယ်", "သလား", "ရနိုင်", "ရမလား", "ဆိုဒ်", "အရွယ်",
                       "အရောင်", "ရေစို", "မိုးရေ", "size", "color", "colour", "how", "what",
-                      "waterproof", "water resistant", "price", "?", "？")
+                      "waterproof", "water resistant", "price", "ဈေး", "စျေး", "ပို့ခ", "ပို့ဆောင်ခ", "?", "？")
     if not any(word in low for word in question_words):
         return None
     named_code, named_product = find_product_by_name(text)
@@ -4299,6 +4315,12 @@ def customer_service_reply(text, session):
             if is_mingalar_page(session_page_name(session)):
                 return "ဖော်ပြထားတဲ့ဈေးက အိမ်အရောက် အပြီးအစီးဈေးပါရှင်။", False
         return "ဘယ်ပစ္စည်းအကြောင်း မေးတာလဲရှင်။ Code သို့မဟုတ် ပုံလေး ပို့ပေးပါရှင်။", False
+    # Pricing uses the same page-specific calculation as the initial reply.
+    # Raw Sheet FAQs may contain Snow prices and must never override MH totals.
+    price_words = ("ဈေး", "စျေး", "price", "ဘယ်လောက်", "ပို့ခ", "ပို့ဆောင်ခ",
+                   "delivery fee", "shipping", "အပြီးအစီး")
+    if any(word in low for word in price_words):
+        return product_reply(code, product, page_name=session_page_name(session)), False
     # Read an explicit rating from the current Sheet rather than asking AI to
     # rediscover it. Do not infer submersion or any unsupported usage guarantee.
     knowledge = product_knowledge_facts(code, product)
@@ -4370,8 +4392,7 @@ def handle_manychat_request(data):
 
     message = str(data.get("message", "") or "").strip()
     contact_id = str(data.get("contact_id", "") or "").strip()
-    raw_page_name = str(data.get("page", "") or "").strip()
-    shop_page_name = MINGALAR_PAGE_NAME if is_mingalar_page(raw_page_name) else ""
+    shop_page_name = manychat_page_name(data)
     account_name = extract_manychat_account_name(data)
     remember_manychat_identity(contact_id, account_name)
     incoming_image_urls = extract_manychat_image_urls(data, message)
@@ -4478,8 +4499,7 @@ def handle_manychat_request(data):
         return manychat_response([])
 
     session = get_order_session(contact_id)
-    # Every Mingalar ManyChat request carries page="Mingalar Happy Shopping".
-    # Blank/other keeps the protected Snow Phyu behavior.
+    # Keep the resolved page across requests, including omitted page fields.
     session["_page_name"] = shop_page_name
     initial_last_product_code = str(session.get("last_product_code", "") or "").strip()
 
@@ -5434,6 +5454,7 @@ def product_image_proxy(code):
     return response
 
 
+@app.route("/webhook/mh", methods=["POST"])
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json(silent=True)
