@@ -5,7 +5,7 @@
 # Existing Admin pause, explicit-code, order, Telegram and delivery flows preserved.
 # V59: nonblocking Sheet refresh + retry replay + stable image proxy + active-order product lock.
 # =========================
-BOT_BUILD = "V72_MH_ALL_IN_PRICE_SAFE"
+BOT_BUILD = "V73_MH_FOLLOWUP_PRICE_SAFE"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -49,7 +49,7 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 PRODUCT_REFRESH_SECONDS = int(os.environ.get("PRODUCT_REFRESH_SECONDS", "60"))
-BOT_VERSION = "V71_SHEET_ONLY_ADDRESS_SAFE"
+BOT_VERSION = BOT_BUILD
 ADMIN_PAUSE_MINUTES = int(os.environ.get("ADMIN_PAUSE_MINUTES", "30"))
 POST_ORDER_ACK_TTL_SECONDS = int(os.environ.get("POST_ORDER_ACK_TTL_SECONDS", "86400"))
 POST_ORDER_AUTO_STOP_SECONDS = int(os.environ.get("POST_ORDER_AUTO_STOP_SECONDS", "1800"))
@@ -1646,6 +1646,22 @@ def product_is_sellable(product):
     return product_availability(product) == "in_stock"
 
 
+_MH_PRICE_OR_FEE = re.compile(
+    r"ဈေး|စျေး|ပို့ခ|ပို့ဆောင်ခ|ပို့ဆောင်စရိတ်|ရန်ကုန်ပို့|နယ်ပို့|အပြီးအစီး|"
+    r"\b(?:price|shipping|deli)\b|delivery\s*(?:fee|charge|cost)|"
+    r"\d[\d,. ]*\s*(?:ks\b|mmk\b|ကျပ်)|"
+    r"\d{1,3}(?:[,， ]\d{3})+|(?<!\d)\d{5,}(?!\d)|"
+    r"(?:တစ်|နှစ်|သုံး|လေး|ငါး|ခြောက်|ခုနစ်|ရှစ်|ကိုး|ဆယ်|[\d])"
+    r"\s*(?:ထောင်|သောင်း|သိန်း|သန်း)", re.I
+)
+
+_MH_PRICE_CONFIRMATION = re.compile(
+    r"(?:(?:ထောင်|သောင်း|သိန်း|သန်း)(?:ခွဲ)?\s*(?:လား|လဲ|ဟုတ်)|"
+    r"(?:[\d,，]{4,}|\d\s*(?:k|ထောင်|သောင်း|သိန်း))"
+    r"\s*(?:ks|mmk|ကျပ်)?\s*(?:လား|လဲ|ဟုတ်|နော်|[?？]|$))", re.I
+)
+
+
 def _mingalar_safe_product_detail(value):
     """Remove stale price/shipping copy from catalog descriptions for Mingalar.
 
@@ -1662,29 +1678,10 @@ def _mingalar_safe_product_detail(value):
     # contradictory price to a customer.
     parts = re.split(r"\n+|[;；]", text)
     safe_parts = []
-    stale_price_or_delivery = re.compile(
-        r"(?i)(?:"
-        r"ဈေးနှုန်း|စျေးနှုန်း|ရောင်းဈေး|ရောင်းစျေး|အပြီးအစီး|"
-        r"ပို့ခ|ပို့ဆောင်ခ|ရန်ကုန်ပို့|နယ်ပို့|မြို့များ|အခြားမြို့|"
-        r"delivery\s*(?:fee|charge|cost)|shipping\s*(?:fee|cost)|"
-        r"\bprice\b|\b(?:yangon|other\s*cities)\b|"
-        r"\d[\d,]*\s*(?:ks|ကျပ်)"
-        r")"
-    )
     for part in parts:
         part = part.strip(" \t\r\n•·-")
-        if not part:
-            continue
-        if stale_price_or_delivery.search(part):
-            # Remove monetary clauses, preserving specification text before them.
-            marker = re.search(r"(?:ဈေးနှုန်း|စျေးနှုန်း|ရောင်းဈေး|ရောင်းစျေး|ပို့ခ|ပို့ဆောင်ခ|အိမ်အရောက်\s*အပြီးအစီး|\bprice\b|delivery\s*(?:fee|charge|cost))", part, re.I)
-            if marker:
-                part = part[:marker.start()].strip(" /၊,-:—")
-            elif re.fullmatch(r"[\d, .]+\s*(?:Ks|ကျပ်)", part, re.I):
-                part = ""
-            if not part:
-                continue
-        safe_parts.append(part)
+        if part and not _MH_PRICE_OR_FEE.search(part):
+            safe_parts.append(part)
     return "\n".join(safe_parts).strip()
 
 
@@ -1728,7 +1725,10 @@ def manychat_page_name(data):
     for key in ("page", "page_name", "shop_page_name"):
         value = str(data.get(key, "") or "").strip()
         if value:
-            return MINGALAR_PAGE_NAME if is_mingalar_page(value) else ""
+            if is_mingalar_page(value):
+                return MINGALAR_PAGE_NAME
+            if normalize_page_name(value) in {"sn", "sp", "snow phyu", "snow phyu online shopping"}:
+                return ""
     contact_id = str(data.get("contact_id", "") or "").strip()
     return session_page_name(ORDER_SESSIONS.get(contact_id, {}))
 
@@ -2090,6 +2090,7 @@ def manychat_input_key(data, message, contact_id, image_url):
                     context_bits.append(f"{key}={value}")
     return "|".join([
         _catalog_revision(),
+        manychat_page_name(data) if isinstance(data, dict) else "",
         str(contact_id or "").strip(),
         str(message or "").strip(),
         str(image_url or "").strip(),
@@ -4237,7 +4238,7 @@ def shop_policy_answer(text):
 
 # Product facts come exclusively from the current Sheet row. Local archives are
 # intentionally ignored, including when a Sheet cell is cleared or renamed.
-def product_knowledge_facts(code, product):
+def product_knowledge_facts(code, product, page_name=""):
     excluded = {"missing details", "review only", "internal notes", "admin notes"}
     current = {}
     for key, value in (product or {}).items():
@@ -4246,6 +4247,10 @@ def product_knowledge_facts(code, product):
         if not field or normalized in excluded or field.startswith("_"):
             continue
         value = "" if value is None else str(value).strip()
+        if is_mingalar_page(page_name):
+            if _MH_PRICE_OR_FEE.search(normalized) or "delivery" in normalized or "shipping" in normalized:
+                continue
+            value = _mingalar_safe_product_detail(value)
         if value:
             current[field] = value
     return {"current_sheet_knowledge": current,
@@ -4260,6 +4265,9 @@ def customer_service_reply(text, session):
     """
     low = re.sub(r"\s+", " ", str(text or "").strip().lower())
     compact = low.replace(" ", "")
+    page_name = session_page_name(session)
+    mingalar = is_mingalar_page(page_name)
+    price_confirmation = mingalar and bool(_MH_PRICE_CONFIRMATION.search(low))
     if not low:
         return None
     complaints = (
@@ -4300,7 +4308,7 @@ def customer_service_reply(text, session):
     question_words = ("လား", "လဲ", "ဘယ်", "သလား", "ရနိုင်", "ရမလား", "ဆိုဒ်", "အရွယ်",
                       "အရောင်", "ရေစို", "မိုးရေ", "size", "color", "colour", "how", "what",
                       "waterproof", "water resistant", "price", "ဈေး", "စျေး", "ပို့ခ", "ပို့ဆောင်ခ", "?", "？")
-    if not any(word in low for word in question_words):
+    if not price_confirmation and not any(word in low for word in question_words):
         return None
     named_code, named_product = find_product_by_name(text)
     if named_product and named_code != code:
@@ -4319,11 +4327,11 @@ def customer_service_reply(text, session):
     # Raw Sheet FAQs may contain Snow prices and must never override MH totals.
     price_words = ("ဈေး", "စျေး", "price", "ဘယ်လောက်", "ပို့ခ", "ပို့ဆောင်ခ",
                    "delivery fee", "shipping", "အပြီးအစီး")
-    if any(word in low for word in price_words):
+    if price_confirmation or any(word in low for word in price_words):
         return product_reply(code, product, page_name=session_page_name(session)), False
     # Read an explicit rating from the current Sheet rather than asking AI to
     # rediscover it. Do not infer submersion or any unsupported usage guarantee.
-    knowledge = product_knowledge_facts(code, product)
+    knowledge = product_knowledge_facts(code, product, page_name=page_name)
     detail = product_detail(product, page_name=session_page_name(session))
     detail += "\n" + "\n".join(fact["text"] for fact in knowledge["verified_supplement"])
     detail += "\n" + "\n".join(knowledge["current_sheet_knowledge"].values())
@@ -4364,7 +4372,10 @@ def customer_service_reply(text, session):
     if (not isinstance(parsed, dict) or parsed.get("needs_admin") is not False
             or not isinstance(parsed.get("answer"), str) or not parsed["answer"].strip()):
         return "ဒီမေးခွန်းအတွက် အချက်အလက်ကို Admin က စစ်ဆေးပြီး ဖြေကြားပေးပါမယ်ရှင်။", True
-    return parsed["answer"].strip(), False
+    reply = parsed["answer"].strip()
+    if mingalar and _MH_PRICE_OR_FEE.search(reply):
+        return product_reply(code, product, page_name=page_name), False
+    return reply, False
 
 
 def handle_manychat_request(data):
