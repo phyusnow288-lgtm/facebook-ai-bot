@@ -5,7 +5,7 @@
 # Existing Admin pause, explicit-code, order, Telegram and delivery flows preserved.
 # V59: nonblocking Sheet refresh + retry replay + stable image proxy + active-order product lock.
 # =========================
-BOT_BUILD = "V73_MH_FOLLOWUP_PRICE_SAFE"
+BOT_BUILD = "V74_PAGE_PRICES_FROM_SHEET"
 print("BOT BUILD:", BOT_BUILD, flush=True)
 
 import os
@@ -41,7 +41,6 @@ GOOGLE_SHEET_URL = os.environ.get("GOOGLE_SHEET_URL")
 # Mingalar bot token falls back to the existing Telegram bot token so one bot can
 # serve both groups when desired.
 MINGALAR_PAGE_NAME = os.environ.get("MINGALAR_PAGE_NAME", "Mingalar Happy Shopping").strip()
-MINGALAR_DELIVERY = int(os.environ.get("MINGALAR_DELIVERY", "6500"))
 MINGALAR_TELEGRAM_CHAT_ID = os.environ.get("MINGALAR_TELEGRAM_CHAT_ID")
 MINGALAR_TELEGRAM_BOT_TOKEN = os.environ.get("MINGALAR_TELEGRAM_BOT_TOKEN") or TELEGRAM_BOT_TOKEN
 
@@ -1748,7 +1747,7 @@ def telegram_credentials_for_page(page_name=""):
 def product_reply(code, product, page_name=""):
     name = str(get_row_value(product, "Product Name", "Name")).strip()
 
-    price = parse_int_amount(get_row_value(product, "Price"), 0)
+    price = product_price_from_row(product, page_name)
 
     yangon_delivery = parse_int_amount(
         get_row_value(product, "Yangon Delivery", "YangonDelivery"),
@@ -1780,10 +1779,11 @@ def product_reply(code, product, page_name=""):
     # V58 Page 2 rule: show exactly one customer-facing all-in price.
     # Snow Phyu keeps its original Yangon/Other delivery display unchanged.
     if is_mingalar_page(page_name):
-        all_in = price + MINGALAR_DELIVERY
+        if price <= 0:
+            return unavailable_order_reply(code, "price_missing")
         return (
             f"Code {code} {name}\n\n"
-            f"အိမ်အရောက် အပြီးအစီး - {all_in:,} Ks\n\n"
+            f"အိမ်အရောက် အပြီးအစီး - {price:,} Ks\n\n"
             "ပစ္စည်းရောက်မှ ငွေချေ (COD) ရပါတယ်ရှင်။"
         )
 
@@ -3488,9 +3488,9 @@ def order_prompt_for_missing(missing):
 
 
 
-def product_price(code):
-    product = PRODUCTS.get(code, {})
-    return parse_int_amount(get_row_value(product, "Price"), 0)
+def product_price_from_row(product, page_name=""):
+    column = "MH Price" if is_mingalar_page(page_name) else "Price"
+    return parse_int_amount(get_row_value(product, column), 0)
 
 
 def delivery_fee_for_area(area):
@@ -3512,12 +3512,17 @@ def first_unavailable_session_item(session):
         availability = product_availability(product)
         if availability != "in_stock":
             return code, availability
+        page_name = session_page_name(session)
+        if is_mingalar_page(page_name) and product_price_from_row(product, page_name) <= 0:
+            return code, "price_missing"
     return "", ""
 
 
 def unavailable_order_reply(code, availability):
     product = PRODUCTS.get(code, {})
     name = str(get_row_value(product, "Product Name", "Name")).strip()
+    if availability == "price_missing":
+        return f"Code {code} {name}\nအိမ်အရောက်ဈေးကို Admin က စစ်ဆေးပေးပါမယ်ရှင်။"
     if availability == "coming":
         return f"Code {code} {name}\nလက်ရှိ ပစ္စည်းမရောက်သေးပါရှင်။"
     if availability == "out":
@@ -3551,22 +3556,18 @@ def build_telegram_order(session):
     subtotal = 0
     total_pcs = 0
 
-    # V61 MINGALAR FIX:
-    # Mingalar customer prices are PER-UNIT all-in prices (base + 6,500).
-    # Therefore qty 2 means all_in * 2, and mixed/multi-item orders are the sum
-    # of each item's all-in price * quantity. Never add a separate delivery fee.
+    # The Sheet's MH Price already includes delivery for each unit.
     mingalar_order = is_mingalar_page(page_name)
 
     for code, qty in session.get("items", {}).items():
         product = PRODUCTS.get(code, {})
         item_name = str(get_row_value(product, "Product Name", "Name")).strip()
-        base_price = product_price(code)
+        unit_price = product_price_from_row(product, page_name)
+        item_total = unit_price * qty
+        subtotal += item_total
         total_pcs += qty
 
         if mingalar_order:
-            unit_price = base_price + MINGALAR_DELIVERY
-            item_total = unit_price * qty
-            subtotal += item_total
 
             if qty == 1:
                 item_parts.append(
@@ -3577,10 +3578,6 @@ def build_telegram_order(session):
                     f"Code {code} {item_name} အိမ်အရောက် အပြီးအစီး - {unit_price:,} Ks x {qty} = {item_total:,} Ks"
                 )
         else:
-            unit_price = base_price
-            item_total = unit_price * qty
-            subtotal += item_total
-
             if qty == 1:
                 item_parts.append(
                     f"Code {code} {item_name} စျေးနှုန်း - {unit_price:,} Ks"
