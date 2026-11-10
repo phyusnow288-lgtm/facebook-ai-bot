@@ -5480,7 +5480,8 @@ def webhook():
 
     print("=== WEBHOOK POST RECEIVED ===", flush=True)
     if isinstance(data, dict):
-        g.voucher_key = str(data.pop("voucher_key", "") or "")
+        body_voucher_key = str(data.pop("voucher_key", "") or "")
+        g.voucher_key = request.headers.get("X-Voucher-Key", "") or body_voucher_key
     print(data, flush=True)
 
     # V50 dual-path Admin takeover. Meta message_echoes remains the primary path;
