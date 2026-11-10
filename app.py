@@ -4265,6 +4265,9 @@ def product_knowledge_facts(code, product, page_name=""):
             "verified_supplement": [], "verified_faq": []}
 
 
+ADDRESS_WITHOUT_PRODUCT_REPLY = "လိပ်စာအချက်အလက် ရရှိပါပြီရှင်။ မှာယူမယ့်ပစ္စည်းရဲ့ Code သို့မဟုတ် ပုံလေး ပို့ပေးပါရှင်။"
+
+
 def customer_service_reply(text, session):
     """Return (reply, handoff) or None; retain validated orphan order details.
 
@@ -4306,7 +4309,7 @@ def customer_service_reply(text, session):
         local["name"] = ""  # Preserve the Facebook account name.
         local["items"] = []  # An address must never guess a product.
         merge_extracted_order_data(session, local)
-        return "လိပ်စာအချက်အလက် ရရှိပါပြီရှင်။ မှာယူမယ့်ပစ္စည်းရဲ့ Code သို့မဟုတ် ပုံလေး ပို့ပေးပါရှင်။", False
+        return ADDRESS_WITHOUT_PRODUCT_REPLY, False
     policy = shop_policy_answer(text)
     if policy:
         return policy, False
@@ -4489,9 +4492,20 @@ def handle_manychat_request(data):
     if is_duplicate_manychat_input(data, message, contact_id, image_fingerprint):
         cached = cached_manychat_response(manychat_request_key)
         if cached is not None:
-            print("V59 MANYCHAT RETRY REPLAYED:", contact_id, flush=True)
-            return cached
-        print("V59 MANYCHAT RETRY WITHOUT CACHE - PROCESSING:", contact_id, flush=True)
+            existing_session = ORDER_SESSIONS.get(contact_id, {})
+            selected_codes = [existing_session.get("last_product_code"), *existing_session.get("items", {})]
+            has_sellable_product = any(code in PRODUCTS and product_is_sellable(PRODUCTS[code])
+                                       for code in selected_codes)
+            stale_address_reply = has_sellable_product and any(
+                item.get("text") == ADDRESS_WITHOUT_PRODUCT_REPLY
+                for item in cached.get("content", {}).get("messages", [])
+            )
+            if not stale_address_reply:
+                print("V59 MANYCHAT RETRY REPLAYED:", contact_id, flush=True)
+                return cached
+            print("MANYCHAT ADDRESS RETRY WITH PRODUCT - REPROCESSING", flush=True)
+        else:
+            print("V59 MANYCHAT RETRY WITHOUT CACHE - PROCESSING:", contact_id, flush=True)
 
     def done(response):
         finalized = finalize_manychat(contact_id, response)
