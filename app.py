@@ -18,11 +18,12 @@ import base64
 import mimetypes
 import threading
 import hashlib
+import hmac
 import unicodedata
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import requests
-from flask import Flask, request, Response
+from flask import Flask, request, Response, g
 
 app = Flask(__name__)
 
@@ -1979,7 +1980,7 @@ def send_product_info_only(recipient_id, code, product):
 # =========================
 # TELEGRAM
 # =========================
-def send_telegram_message(message, page_name=""):
+def send_telegram_message(message, page_name="", voucher_subscriber=None):
     telegram_token, telegram_chat_id = telegram_credentials_for_page(page_name)
     if not telegram_token or not telegram_chat_id:
         print("TELEGRAM ENV IS MISSING", flush=True)
@@ -1996,9 +1997,18 @@ def send_telegram_message(message, page_name=""):
         )
 
         print("TELEGRAM STATUS:", response.status_code, flush=True)
-        print("TELEGRAM RESPONSE:", response.text, flush=True)
-
-        return response.status_code == 200
+        if response.status_code != 200:
+            return False
+        result = response.json()
+        if not result.get("ok"):
+            return False
+        if voucher_subscriber:
+            try:
+                register_voucher_route(telegram_chat_id, result["result"]["message_id"], message, voucher_subscriber)
+            except (requests.RequestException, KeyError, ValueError):
+                # Telegram already accepted the order. A routing failure must never duplicate it.
+                print("VOUCHER ROUTE NOT SAVED", flush=True)
+        return True
 
     except Exception as e:
         print("TELEGRAM ERROR:", str(e), flush=True)
@@ -2032,11 +2042,11 @@ def send_telegram_order_now(message, page_name=""):
         return False
 
 
-def _telegram_order_worker(order_key, message, page_name=""):
+def _telegram_order_worker(order_key, message, page_name="", voucher_subscriber=None):
     ok = False
     for attempt in range(1, 4):
         print(f"TELEGRAM ORDER ATTEMPT {attempt}:", order_key, flush=True)
-        if send_telegram_message(message, page_name=page_name):
+        if send_telegram_message(message, page_name=page_name, voucher_subscriber=voucher_subscriber):
             ok = True
             break
         time.sleep(1.5 * attempt)
@@ -2062,9 +2072,10 @@ def queue_telegram_order(contact_id, message, page_name=""):
             return True
         RECENT_TELEGRAM_ORDERS[key] = now
 
+    voucher_subscriber = verified_voucher_subscriber(contact_id, page_name)
     threading.Thread(
         target=_telegram_order_worker,
-        args=(key, message, page_name),
+        args=(key, message, page_name, voucher_subscriber),
         daemon=True,
     ).start()
     return True
@@ -5468,6 +5479,8 @@ def webhook():
     data = request.get_json(silent=True)
 
     print("=== WEBHOOK POST RECEIVED ===", flush=True)
+    if isinstance(data, dict):
+        g.voucher_key = str(data.pop("voucher_key", "") or "")
     print(data, flush=True)
 
     # V50 dual-path Admin takeover. Meta message_echoes remains the primary path;
@@ -5858,8 +5871,140 @@ def webhook():
     return "EVENT_RECEIVED", 200
 
 
+# Messenger vouchers are opt-in and use independently authenticated page routes.
+VOUCHER_PAGES = {
+    "d4a3f384-4153-44f7-b010-08eacd86d1da": ("SP", "Snow Phyu Online Shopping"),
+    "ed5c5a8c-052b-5ce6-80bc-4d0e77df0bfe": ("MH", "Mingalar Happy Shopping"),
+}
+
+
+def voucher_mode():
+    return os.environ.get("VOUCHER_MODE", "off").strip().lower()
+
+
+def voucher_database_configured():
+    return (
+        os.environ.get("VOUCHER_SUPABASE_URL", "").startswith("https://")
+        and bool(os.environ.get("VOUCHER_SUPABASE_SERVICE_ROLE_KEY"))
+    )
+
+
+def verified_voucher_subscriber(contact_id, page_name):
+    if voucher_mode() not in ("test", "live") or not voucher_database_configured():
+        return None
+    page = "MH" if is_mingalar_page(page_name) else "SP"
+    expected = os.environ.get(f"VOUCHER_{page}_WEBHOOK_KEY", "")
+    other_page = "SP" if page == "MH" else "MH"
+    provided = getattr(g, "voucher_key", "")
+    if (len(expected) < 32 or expected == os.environ.get(f"VOUCHER_{other_page}_WEBHOOK_KEY")
+            or not provided.isascii() or not expected.isascii()
+            or not hmac.compare_digest(provided, expected)):
+        return None
+    if not re.fullmatch(r"[1-9][0-9]{0,18}", contact_id):
+        return None
+    subscriber = int(contact_id)
+    if subscriber >= 2**63:
+        return None
+    if voucher_mode() == "test" and str(subscriber) != os.environ.get(f"VOUCHER_{page}_TEST_CONTACT_ID"):
+        return None
+    return subscriber
+
+
+def voucher_database(method, path, payload, prefer=None):
+    base = os.environ["VOUCHER_SUPABASE_URL"].rstrip("/")
+    key = os.environ["VOUCHER_SUPABASE_SERVICE_ROLE_KEY"]
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    if prefer:
+        headers["Prefer"] = prefer
+    response = requests.request(method, f"{base}/rest/v1/{path}", json=payload, headers=headers,
+                                timeout=10, allow_redirects=False)
+    if not 200 <= response.status_code < 300:
+        raise requests.HTTPError(f"Voucher database HTTP {response.status_code}")
+    return response.json() if response.content else None
+
+
+def register_voucher_route(chat_id, message_id, message, subscriber):
+    voucher_database("POST", "messenger_voucher_routes?on_conflict=chat_id,message_id", {
+        "chat_id": int(chat_id), "message_id": int(message_id), "subscriber_id": subscriber,
+        "text_hash": hashlib.md5(message.encode("utf-8")).hexdigest(),
+    }, prefer="resolution=ignore-duplicates,return=minimal")
+
+
+def voucher_text(shop, day, body):
+    items = body.get("items") or []
+    if not items:
+        raise ValueError("Missing voucher items")
+    lines = [
+        shop, "အော်ဒါ ဘောက်ချာ",
+        f"Order No. {body['order_no']}",
+        f"နေ့စွဲ — {day}",
+        f"အမည် — {body.get('name') or '—'}",
+        "",
+    ]
+    lines.extend(f"{item['code']} {item['name']} × {item['qty']}" for item in items)
+    lines += [
+        "",
+        f"စုစုပေါင်း — {body['total']:,} Ks",
+        f"ပစ္စည်းရောက်မှ ပေးရန် (COD) — {body['cod']:,} Ks",
+        "မှာယူအားပေးလို့ ကျေးဇူးတင်ပါတယ်ရှင်။",
+    ]
+    message = "\n".join(lines)
+    if len(message.encode("utf-16-le")) // 2 > 2000:
+        raise ValueError("Voucher exceeds message length")
+    return message
+
+
+def dispatch_messenger_voucher(job):
+    page, shop = VOUCHER_PAGES[job["business_id"]]
+    subscriber = job["subscriber_id"]
+    if voucher_mode() == "test" and str(subscriber) != os.environ.get(f"VOUCHER_{page}_TEST_CONTACT_ID"):
+        return "review"
+    token = os.environ.get(f"VOUCHER_{page}_MANYCHAT_API_KEY", "")
+    other_page = "SP" if page == "MH" else "MH"
+    if not token or token == os.environ.get(f"VOUCHER_{other_page}_MANYCHAT_API_KEY"):
+        return "review"
+    message = voucher_text(shop, job["order_day"], job["body"])
+    response = requests.post("https://api.manychat.com/fb/sending/sendContent",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"subscriber_id": subscriber, "data": {"version": "v2", "content": {
+            "messages": [{"type": "text", "text": message}],
+        }}},
+        timeout=15, allow_redirects=False)
+    if response.status_code >= 500:
+        return "review"  # Provider acceptance may be uncertain. Never retry automatically.
+    if not 200 <= response.status_code < 300:
+        return "failed"
+    return "sent" if response.json().get("status") == "success" else "review"
+
+
+def run_voucher_worker():
+    print("MESSENGER VOUCHER WORKER", voucher_mode(), flush=True)
+    while True:
+        try:
+            job = voucher_database("POST", "rpc/claim_messenger_voucher", {})
+            if job:
+                try:
+                    status = dispatch_messenger_voucher(job)
+                except (requests.RequestException, KeyError, ValueError, TypeError):
+                    status = "review"
+                voucher_database("PATCH",
+                    f"messenger_voucher_outbox?order_id=eq.{job['order_id']}&status=eq.sending",
+                    {"status": status, "updated_at": datetime.now(timezone.utc).isoformat()})
+                print("VOUCHER", job["order_id"], status, flush=True)
+                continue
+        except (requests.RequestException, KeyError, ValueError, TypeError) as error:
+            print("VOUCHER WORKER", type(error).__name__, flush=True)
+        time.sleep(5)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+
+    if voucher_mode() in ("test", "live"):
+        if not voucher_database_configured():
+            print("VOUCHER WORKER DISABLED: Supabase configuration missing", flush=True)
+        else:
+            threading.Thread(target=run_voucher_worker, daemon=True).start()
 
     app.run(
         host="0.0.0.0",
