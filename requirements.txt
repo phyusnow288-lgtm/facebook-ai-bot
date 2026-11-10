@@ -1,2 +1,3 @@
 flask
 requests
+Pillow>=12.2,<14
