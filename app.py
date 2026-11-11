@@ -746,10 +746,22 @@ def extract_order_fields_from_image(image_url, caption=""):
     return {}
 
 
+def delivery_area_only_reply(value):
+    """Recognize short delivery-region answers independently of the address."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[\s.,။၊!]+", "", text)
+    if text in {"yangon", "ရန်ကုန်", "ရန်ကုန်ပါ", "ရန်ကုန်ရှင်", "ရန်ကုန်ပါရှင်"}:
+        return "yangon"
+    if text in {"other", "နယ်", "နယ်ပါ", "နယ်ရှင်", "နယ်ပါရှင်"}:
+        return "other"
+    return ""
+
+
 def merge_extracted_order_data(session, extracted):
     if not isinstance(extracted, dict):
         return session
 
+    region_answer = delivery_area_only_reply(extracted.get("address"))
     for field in ("name", "address", "phone", "delivery_area"):
         value = str(extracted.get(field, "") or "").strip()
         if not value:
@@ -758,7 +770,13 @@ def merge_extracted_order_data(session, extracted):
         # Never let typed text, OCR, or AI overwrite that locked name.
         if field == "name" and session.get("_account_name_locked"):
             continue
+        if field == "address" and region_answer:
+            continue
         session[field] = value
+
+    if region_answer and session.get("address"):
+        session["delivery_area"] = region_answer
+        session["_delivery_confirmed_for"] = session["address"]
 
     extracted_items = extracted.get("items", []) or []
 
@@ -3198,6 +3216,8 @@ def looks_like_order_progress(message, session=None):
         return True
 
     session = session or {}
+    if delivery_area_only_reply(value):
+        return bool(session.get("address"))
     # With ManyChat the buyer name comes from the Facebook account, so do not
     # treat arbitrary chat as a name/address. Only location-looking text advances
     # the order; ambiguous text can still be classified by the AI order parser.
@@ -3269,6 +3289,10 @@ def extract_order_fields_locally(message, session=None):
         "items": [],
     }
     if not value:
+        return result
+    area_reply = delivery_area_only_reply(value)
+    if area_reply:
+        result["delivery_area"] = area_reply
         return result
 
     # Phone: support both Western and Myanmar digits, without swallowing quantity text.
@@ -3405,10 +3429,12 @@ def is_quantity_only_message(text):
 
 def merge_order_message(sender_id, message):
     session = get_order_session(sender_id)
-    area_reply = str(message or "").strip().lower()
-    if session.get("address") and area_reply in {"ရန်ကုန်", "ရန်ကုန်ပါ", "ရန်ကုန်ပါရှင်", "yangon", "နယ်", "နယ်ပါ", "နယ်ပါရှင်", "other"}:
-        session["delivery_area"] = "yangon" if area_reply.startswith(("ရန်ကုန်", "yangon")) else "other"
-        session["_delivery_confirmed_for"] = session["address"]
+    area_reply = delivery_area_only_reply(message)
+    if area_reply:
+        address = session.get("address")
+        if address and not delivery_area_only_reply(address):
+            session["delivery_area"] = area_reply
+            session["_delivery_confirmed_for"] = address
         return session
     explicit_qty = extract_explicit_quantity(message)
 
@@ -3468,7 +3494,7 @@ def order_missing_fields(session):
     if not session.get("name"):
         missing.append("အမည်")
 
-    if not session.get("address"):
+    if not session.get("address") or delivery_area_only_reply(session["address"]):
         missing.append("လိပ်စာအပြည့်အစုံ")
 
     if not session.get("phone"):
@@ -3562,7 +3588,12 @@ def build_telegram_order(session):
     delivery_area = str(session.get("delivery_area", "")).strip().lower()
 
     name = str(session.get("name", "")).strip()
-    address = clean_order_address_for_output(session.get("address", ""))
+    raw_address = session.get("address", "")
+    address = clean_order_address_for_output(raw_address)
+    if (address and session.get("_delivery_confirmed_for") == raw_address
+            and delivery_area == "yangon"
+            and not re.search(r"ရန်ကုန်|\byangon\b", address, flags=re.IGNORECASE)):
+        address += " Yangon"
     phone = str(session.get("phone", "")).strip()
 
     item_parts = []
